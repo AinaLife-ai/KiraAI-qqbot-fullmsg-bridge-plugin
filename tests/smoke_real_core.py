@@ -12,7 +12,9 @@ nickname the LLM will actually see.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import pathlib
 import sys
 import time
 import traceback
@@ -47,13 +49,16 @@ def check(name, cond, extra=""):
         print(f"  FAIL {name} {extra}")
 
 
-def gm(msg_id="MSG1", content="大家早上好", mentions=None, uid="UID1", username="小明"):
+def gm(msg_id="MSG1", content="大家早上好", mentions=None, uid="UID1", username="小明",
+       attachments=None, **extra):
     return {"op": 0, "s": 7, "t": "GROUP_MESSAGE_CREATE", "id": "EVT1", "d": {
         "id": msg_id,
         "author": {"id": uid, "member_openid": uid, "member_role": "member",
                    "username": username, "bot": False},
         "content": content, "group_openid": "GRP_OPENID_1", "message_type": 0,
         **({"mentions": mentions} if mentions is not None else {}),
+        **({"attachments": attachments} if attachments is not None else {}),
+        **extra,
     }}
 
 
@@ -76,7 +81,11 @@ def c2c(msg_id="MSG3", content="在吗", uid="UOPENID9", username="小红"):
 
 async def main():
     print("=" * 72)
-    print("QQ Official bridge v1.1.0 — smoke test (real KiraAI core + real botpy)")
+    try:
+        _v = json.loads((pathlib.Path(PLUGIN_DIR) / "manifest.json").read_text(encoding="utf-8"))["version"]
+    except Exception:
+        _v = "?"
+    print(f"QQ Official bridge v{_v} — smoke test (real KiraAI core + real botpy)")
     print("=" * 72)
 
     import importlib.util
@@ -280,6 +289,20 @@ async def main():
     # ---- 9. 默认路径（at_grace=0）：跨事件重复绝不丢唤醒，且可观测 ----
     cfg0 = dict(cfg)
     cfg0["section_basic"] = dict(cfg["section_basic"], at_grace_seconds=0)
+    # 给 client 挂一个假的 api，用来观察 message_reference 是否被注入
+    sent_calls = []
+
+    class _RecorderAPI:
+        async def post_group_message(self, **kw):
+            sent_calls.append(dict(kw))
+            return {"id": "ROBOT1.0_sent", "ext_info": {"ref_idx": "REFIDX_sent=="}}
+
+        async def post_c2c_message(self, **kw):
+            sent_calls.append(dict(kw))
+            return {"id": "ROBOT1.0_sent2", "ext_info": {"ref_idx": "REFIDX_sent2=="}}
+
+    client.api = _RecorderAPI()
+
     plugin0 = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)
     await plugin0.initialize()
     await asyncio.sleep(0.05)
@@ -465,6 +488,101 @@ async def main():
     parsers["group_message_create"]({"op": 0, "s": 41, "t": "GROUP_MESSAGE_CREATE", "id": "EVQ3", "d": quoted_other})
     evs = await drain(0.4)
     check("引用别人的消息不算唤醒", len(evs) == 1 and evs[0].message.is_mentioned is False, str(len(evs)))
+
+    # ---- 13. 机器人也能「引用回复」（message_reference / REFIDX） ----
+    while not bus.empty():
+        bus.get_nowait()
+    # ① 收到一条带 msg_idx 的消息 -> 插件应记住"引用它要用哪个 REFIDX"
+    parsers["group_message_create"]({
+        "op": 0, "s": 50, "t": "GROUP_MESSAGE_CREATE", "id": "EVREF",
+        "d": {"id": "MSG_REF1", "author": {"member_openid": "UID1", "username": "小明"},
+              "content": "引用我试试", "group_openid": "GRP_OPENID_1", "message_type": 0,
+              "message_scene": {"source": "default",
+                                "ext": ["msg_idx=REFIDX_quoted==", "auth_token=x"]}}})
+    evs = await drain(0.4)
+    check("带 msg_idx 的消息正常投递", len(evs) == 1, str(len(evs)))
+    if evs:
+        display = str(evs[0].message.message_id)
+        sid = str(evs[0].session.sid)
+        check("插件记住了它的 REFIDX", plugin0._ref_idx.get((sid, display)) == "REFIDX_quoted==",
+              str(dict(plugin0._ref_idx)))
+        from core.chat.message_elements import Reply as _RealReply, Text as _RealText
+        chain = [_RealReply(display), _RealText("引用测试")]
+        check("链里有显式 Reply 时能解析出 REFIDX",
+              plugin0._quote_ref_for(adapter, "GRP_OPENID_1", chain, True) == "REFIDX_quoted==")
+        check("没有显式 Reply 时不返回引用（避免每条都挂引用）",
+              plugin0._quote_ref_for(adapter, "GRP_OPENID_1", [_RealText("普通回复")], True) is None)
+
+    # ② api 层注入：设置 contextvar 后调用，应带上 message_reference
+    sent_calls.clear()
+    token = plugin_main._QUOTE_REF.set("REFIDX_quoted==")
+    try:
+        await client.api.post_group_message(group_openid="GRP_OPENID_1", msg_type=0, content="hi")
+    finally:
+        plugin_main._QUOTE_REF.reset(token)
+    check("★ 带上 message_reference（官方要求的 REFIDX）",
+          sent_calls and sent_calls[0].get("message_reference") == {"message_id": "REFIDX_quoted=="},
+          str(sent_calls[:1]))
+
+    sent_calls.clear()
+    token = plugin_main._QUOTE_REF.set("REFIDX_sent==")
+    try:
+        await client.api.post_group_message(group_openid="GRP_OPENID_1", msg_type=0, content="hi2")
+    finally:
+        plugin_main._QUOTE_REF.reset(token)
+    check("机器人自己发的消息也记下了 ref_idx（以后能引用自己发过的消息）",
+          any(k[0].endswith("GRP_OPENID_1") and k[1].startswith("qqo-") for k in plugin0._ref_idx),
+          str(list(plugin0._ref_idx)[:3]))
+
+    sent_calls.clear()
+    await client.api.post_group_message(group_openid="GRP_OPENID_1", msg_type=0, content="noquote")
+    check("没有引用意图时不注入 message_reference",
+          sent_calls and "message_reference" not in sent_calls[0], str(sent_calls[:1]))
+
+    # ---- 14. 发出的 @ 是真 @（<qqbot-at-user id="..." />） ----
+    from core.chat.message_elements import At as _At2, Text as _Text2
+    encoded = adapter._text_content([_At2("9CD54739CC9BAA46B93243088802DC72", "周武"), _Text2("哥ww")])
+    check("★ 发出的 @ 是平台标记（不是纯文本 @昵称）",
+          encoded == '<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />哥ww', encoded)
+    encoded2 = adapter._text_content([_Text2("hi"), _At2("all", "全体成员")])
+    check("pid=all 退化成文本（平台不支持 @全体）",
+          "qqbot-at-user" not in encoded2, encoded2)
+
+    # ---- 15. 富内容归一化（真实适配器渲染） ----
+    while not bus.empty():
+        bus.get_nowait()
+    # ① 语音 + 平台自带 ASR → 直接用文字
+    parsers["group_message_create"](gm(msg_id="VOICE1", content="", attachments=[
+        {"content_type": "voice", "url": "http://x/a.silk",
+         "voice_wav_url": "http://x/a.wav", "asr_refer_text": "这是语音内容"}]))
+    evs = await drain(0.4)
+    if evs:
+        text = chain_repr(evs[0].message.chain)
+        check("★ 语音用平台自带 ASR（不再跑本地 STT）", "[语音: 这是语音内容]" in text, text)
+        check("不再生成音频元素（避免重复识别）",
+              not any(type(e).__name__ == "Record" for e in evs[0].message.chain), text)
+
+    while not bus.empty():
+        bus.get_nowait()
+    # ② 结构化卡片
+    parsers["group_message_create"](gm(msg_id="ARK1", content="", message_type=3, ark_data={
+        "ark_name": "图文卡片", "ark_type": "feed", "fields": {"title": "某个帖子", "desc": "看看这个"}}))
+    evs = await drain(0.4)
+    if evs:
+        text = chain_repr(evs[0].message.chain)
+        check("★ 结构化卡片不再变成 [Unsupported message]",
+              "卡片" in text and "某个帖子" in text and "Unsupported" not in text, text)
+
+    while not bus.empty():
+        bus.get_nowait()
+    # ③ 表情标记
+    import base64 as _b64
+    _ext = _b64.b64encode(json.dumps({"text": "微笑"}).encode()).decode()
+    parsers["group_message_create"](gm(msg_id="FACE1", content=f'<faceType=6, faceId="0", ext="{_ext}"> 你好'))
+    evs = await drain(0.4)
+    if evs:
+        text = chain_repr(evs[0].message.chain)
+        check("★ 表情标记解码成可读文字", "[表情: 微笑]" in text and "faceType" not in text, text)
 
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)

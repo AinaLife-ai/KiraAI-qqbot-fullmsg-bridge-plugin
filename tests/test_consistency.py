@@ -111,9 +111,18 @@ check("消息路径上没有同步写文件", "open(" not in re.sub(r'""".*?"""'
 check("build_event 调用被 try 包裹", "构造事件失败" in main_py)
 check("handler 静默兜住异常（不抛回 botpy）", "绝不把异常抛回 botpy" in main_py)
 check("自我身份按适配器隔离", "self._self_ident = {}" in main_py)
-check("AT 标记正则限定为字母数字 id", 'AT_MARKUP_RE = re.compile(r"<@([0-9A-Za-z]{8,})>")' in bridge_py)
+check("AT 标记正则限定为字母数字 id（两种形态都覆盖）",
+      'AT_MARKUP_RE = re.compile(' in bridge_py
+      and '[0-9A-Za-z]{8,}' in bridge_py
+      and 'qqbot-at-user' in bridge_py)
+check("发送侧 @ 用平台标记（不是纯文本 @昵称）", "qqbot-at-user id=" in bridge_py)
 check("@ 解析有短路保护（无 <@ 直接返回）", '"<@" not in' in bridge_py)
 check("At 元素渲染保留 pid（不退回只显示昵称）", "At(oid, label) if label else At(oid)" in bridge_py)
+
+check("发送链路补丁的门控包含全部三个开关（防配置互相关掉功能）",
+      "self.proactive_enabled or self.quote_reply or self.send_at_mention" in main_py)
+check("发出的 @ 会校验 pid 合法性（避免发出坏标记）", "pid.isalnum()" in main_py)
+check("富内容归一化对脏 message_type 有兜底", "except (TypeError, ValueError):\n            _mtype = 0" in bridge_py)
 
 print()
 print("PASSED" if not FAILS else f"{len(FAILS)} 项失败：{FAILS}")
