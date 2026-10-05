@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.6
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.7
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -312,8 +312,8 @@ python3 tests/run_tests.py
 |---|---|---|
 | `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
 | `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
-| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **165/165** |
-| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **77/77** |
+| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **171/171** |
+| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **79/79** |
 
 ```bash
 # 冒烟需要真实源码路径（找不到会自动跳过）
@@ -341,6 +341,22 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.1.7</b> — 正文里模型自己写的 @ 标记也会被归一化</summary>
+
+**@ 为什么还是一串文本？**
+上一版只改了**At 元素**的输出形态，但群里那串 `<qqbot-at-user … />` 其实还有**第二个来源：模型在模仿** ——
+历史里已经出现过这个标记，模型就会在正文里照样写一份。它是普通字符串、不是 At 元素，于是被原样发了出去。
+
+⇒ 现在**发出的正文**里任何 `<qqbot-at-user id="…" />` / `<@…>` 都会按 `at_markup_style` 归一化，
+首次命中时打一条 INFO（方便确认来源到底是谁）。
+
+**其它**
+- REFIDX 解析更宽容（URL 编码 / 引号 / 多余空格 / 字典形式都能取到）
+- 启动日志新增 `@标记形态=`，一眼看出当前生效的配置
+
+</details>
+
+<details>
 <summary><b>v1.1.6</b> — @ 标记形态可配 + 引用语音可读 + 引用诊断</summary>
 
 **@ 标记形态**

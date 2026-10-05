@@ -733,6 +733,16 @@ def test_at_markup():
     nq2, notes_q2 = B.normalize_rich_body(q_card)
     check("引用元素里的卡片也被渲染", "卡片" in str(nq2["msg_elements"][0].get("content")), str(notes_q2))
 
+    # ---- 模型自己写进正文的 @ 标记（它只是在模仿历史）----
+    llm_new = '<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />哥ww'
+    fixed, did = B.normalize_outgoing_markup(llm_new, "legacy")
+    check("★ 模型写的 new 形态标记会被改成本配置的形态",
+          did and fixed == "<@9CD54739CC9BAA46B93243088802DC72>哥ww", fixed)
+    fixed2, did2 = B.normalize_outgoing_markup(llm_new, "new")
+    check("本来就是这个形态时不改动（避免无谓改动）", not did2, fixed2)
+    plain, did3 = B.normalize_outgoing_markup("哥ww 香香又到啦", "legacy")
+    check("普通文本不动", not did3 and plain == "哥ww 香香又到啦", plain)
+
     class _BoomClient:
         @property
         def robot(self):

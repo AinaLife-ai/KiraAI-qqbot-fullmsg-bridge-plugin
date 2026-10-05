@@ -74,6 +74,7 @@ from qqbot_bridge import (
     collect_self_identity,
     extract_msg_idx,
     extract_sent_ref_idx,
+    normalize_outgoing_markup,
     inject_live_parser,
     install_class_parser,
     normalize_body,
@@ -179,6 +180,7 @@ class QQOfficialGroupBridge(BasePlugin):
         self._ref_diag_done = False
         self._ref_miss = 0
         self._quote_miss_logged = False
+        self._llm_markup_logged = False
         self._last_proactive = {}
         #: 仅用于日志观测（今日主动消息条数），不做任何限制——配额由官方判
         self._proactive_day = ""
@@ -195,12 +197,13 @@ class QQOfficialGroupBridge(BasePlugin):
         if self.enabled:
             logger.info(
                 "[QQBOT-BRIDGE] v%s 已启动：全量群消息=开；统一@消息=%s；统一单聊=%s；"
-                "@事件等待窗口=%.1fs（0=默认不等待）；引用回复=%s；主动消息通道=%s",
+                "@事件等待窗口=%.1fs（0=默认不等待）；引用回复=%s；@标记形态=%s；主动消息通道=%s",
                 _plugin_version(),
                 "开" if self.unify_at else "关",
                 "开" if self.unify_dm else "关",
                 self.at_grace,
                 "开" if self.quote_reply else "关",
+                self.at_markup_style,
                 "开" if self.proactive_enabled else "关",
             )
         else:
@@ -748,6 +751,20 @@ class QQOfficialGroupBridge(BasePlugin):
                     else:
                         name = getattr(element, "nickname", None) or pid or "全体成员"
                         rewritten.append(Text("@" + name))
+                elif isinstance(element, Text) and getattr(element, "text", ""):
+                    # 模型自己写进正文的 @ 标记 —— 它是普通字符串，会被原样发成文本
+                    fixed, did = normalize_outgoing_markup(element.text, style)
+                    if did:
+                        if not self._llm_markup_logged:
+                            self._llm_markup_logged = True
+                            logger.info(
+                                "[QQBOT-BRIDGE] 正文里出现了模型自己写的 @ 标记 —— 已按 "
+                                "at_markup_style=%s 归一化（这就是「@ 显示成一串文本」的常见来源）",
+                                style,
+                            )
+                        rewritten.append(Text(fixed))
+                    else:
+                        rewritten.append(element)
                 else:
                     rewritten.append(element)
             return original(rewritten)

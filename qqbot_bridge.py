@@ -361,6 +361,30 @@ def at_user_markup(pid, style: str = "legacy") -> str:
     return "<@%s>" % pid
 
 
+#: 模型会**模仿历史里出现过的 @ 标记**：群里已经发出去过 ``<qqbot-at-user id="…" />``，
+#: 模型就会在正文里照样写一份。它是普通字符串、不是 At 元素，会被原样发出去变成一串文本。
+OUTGOING_AT_MARKUP_RE = re.compile(
+    r'<qqbot-at-user\s+id=["\']?([A-Za-z0-9_\-:]{6,})["\']?\s*/?>'
+    r'|<@!?([A-Za-z0-9_\-:]{6,})>'
+)
+
+
+def normalize_outgoing_markup(text: str, style: str = "legacy"):
+    """把正文里**模型自己写出来**的 @ 标记归一成配置的形态。
+
+    返回 ``(新文本, 是否改动过)``。没改动过时原样返回，避免无谓的拷贝。
+    """
+    if not text or ("<@" not in text and "qqbot-at-user" not in text):
+        return text, False
+
+    def _sub(m):
+        pid = m.group(1) or m.group(2) or ""
+        return at_user_markup(pid, style) if pid else m.group(0)
+
+    fixed = OUTGOING_AT_MARKUP_RE.sub(_sub, text)
+    return fixed, fixed != text
+
+
 def _match_at_id(match) -> str:
     """两种形态取其中之一。"""
     return match.group(1) or match.group(2) or ""
@@ -444,18 +468,39 @@ def quoted_author_is_self(body: dict, self_identity=None):
 
 
 def _scene_ext_value(body: dict, key: str):
-    """从 ``message_scene.ext`` 里取 ``key=value`` 形式的扩展字段。"""
+    """从 ``message_scene.ext`` 里取 ``key=value`` 形式的扩展字段（尽量宽容）。
+
+    官方文档里它长这样::
+
+        "message_scene": {"ext": ["msg_idx=REFIDX_xxx==", "ref_msg_idx=REFIDX_yyy=="]}
+
+    实测口径可能有出入（URL 编码 / 多余空格 / 引号 / 字典形式），这里都兜一层，
+    免得解析不出来导致「引用回复」静默失效。
+    """
     scene = body.get("message_scene")
     if not isinstance(scene, dict):
         return None
     ext = scene.get("ext")
-    if not isinstance(ext, list):
+    if isinstance(ext, dict):
+        items = ["%s=%s" % (k, v) for k, v in ext.items()]
+    elif isinstance(ext, list):
+        items = [x for x in ext if isinstance(x, str)]
+    else:
         return None
     prefix = key + "="
-    for item in ext:
-        if isinstance(item, str) and item.startswith(prefix):
-            value = item[len(prefix):]
-            return value or None
+    for item in items:
+        text = item.strip()
+        if not text.startswith(prefix):
+            continue
+        value = text[len(prefix):].strip().strip('"').strip("'")
+        try:
+            from urllib.parse import unquote
+
+            value = unquote(value)
+        except Exception:
+            pass
+        if value:
+            return value
     return None
 
 
