@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.4
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -307,8 +307,8 @@ python3 tests/run_tests.py
 |---|---|---|
 | `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
 | `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
-| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **162/162** |
-| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **75/75** |
+| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **165/165** |
+| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **77/77** |
 
 ```bash
 # 冒烟需要真实源码路径（找不到会自动跳过）
@@ -329,6 +329,21 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.1.5</b> — 紧急修复：消息链类型丢失</summary>
+
+**问题（v1.1.1 引入的回归）**
+- 拆完 @ 之后把消息链换成了普通 `list`，丢掉了 KiraAI 的 `MessageChain` 类型
+- S 版 / 其他聊天插件的 `_process_media()` 会直接访问 `chain.message_list`
+  ⇒ `AttributeError: 'list' object has no attribute 'message_list'`
+  ⇒ handler 抛异常 ⇒ **聊天插件对每条消息都失效**（用户实测）
+
+**修复**
+- 拆分链之后**就地还原链类型**（`chain.message_list = ...`，对象身份保持不变）
+- 补两条回归断言：普通消息、以及拆过 @ 的消息，链都必须是 `MessageChain`
+
+</details>
+
+<details>
 <summary><b>v1.1.4</b> — 富内容归一化（语音 / 卡片 / 表情）</summary>
 
 - **语音**：官方 `content_type` 写的是 `voice`（不是 mime），框架会误判成 File；
