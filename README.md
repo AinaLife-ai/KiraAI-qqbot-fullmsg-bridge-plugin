@@ -1,0 +1,1 @@
+# KiraAI-qqbot-fullmsg-bridge-plugin
