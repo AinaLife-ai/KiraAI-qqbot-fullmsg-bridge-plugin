@@ -774,9 +774,21 @@ class QQOfficialGroupBridge(BasePlugin):
         做法上只接管 At 元素：把它换成等价的 Text，其余元素原样交给原实现，
         这样框架以后新增元素类型也不会漏处理。
         """
-        original = getattr(adapter, "_text_content", None)
-        if not callable(original) or getattr(original, "_kira_bridge_at", False):
+        current = getattr(adapter, "_text_content", None)
+        # 关键：如果已经有一层**别的实例**留下的补丁（热重载残留），要能顶掉它 ——
+        # 否则我们会一直沿用旧实例的包装（它的配置/状态可能都是旧的）。
+        original = getattr(adapter, "_qqbot_bridge_text_orig", None)
+        if original is None:
+            if getattr(current, "_kira_bridge_at", False):
+                original = getattr(current, "_kira_bridge_orig", None) or current
+                logger.warning(
+                    "[QQBOT-BRIDGE] 检测到 adapter 上已存在 @ 补丁层（多为热重载残留），已接管"
+                )
+            else:
+                original = current
+        if not callable(original):
             return
+        adapter._qqbot_bridge_text_orig = original
 
         style = self.at_markup_style
 
@@ -809,6 +821,7 @@ class QQOfficialGroupBridge(BasePlugin):
             return original(rewritten)
 
         _text_content._kira_bridge_at = True
+        _text_content._kira_bridge_orig = original
         adapter._text_content = _text_content
         self._text_originals[getattr(adapter.info, "name", "?")] = original
 
@@ -822,11 +835,25 @@ class QQOfficialGroupBridge(BasePlugin):
         api = getattr(client, "api", None)
         if api is None:
             return
+        # 原始方法表挂在 api 上：新实例可以**顶掉**旧实例留下的补丁层（热重载残留），
+        # 否则一直是旧实例的包装在跑（它的配置/状态可能已经过时）。
         patched = self._api_patched.setdefault(name, [])
+        originals = getattr(api, "_qqbot_bridge_api_orig", None)
+        if originals is None:
+            originals = {}
+            try:
+                api._qqbot_bridge_api_orig = originals
+            except Exception:
+                return
         for method_name, is_group in (("post_group_message", True), ("post_c2c_message", False)):
-            orig = getattr(api, method_name, None)
-            if not callable(orig) or getattr(orig, "_kira_bridge_quote", False):
+            current = getattr(api, method_name, None)
+            if not callable(current):
                 continue
+            if getattr(current, "_kira_bridge_quote", False):
+                orig = originals.get(method_name) or getattr(current, "_kira_bridge_orig", None) or current
+            else:
+                orig = current
+            originals[method_name] = orig
             store = {}
 
             async def _patched(*args, _orig=orig, _is_group=is_group, _store=store, **kwargs):
@@ -851,6 +878,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 return result
 
             _patched._kira_bridge_quote = True
+            _patched._kira_bridge_orig = orig
             setattr(api, method_name, _patched)
             patched.append((api, method_name, orig))
     async def _proactive_send(self, adapter, target_id, send_message_obj, is_group):

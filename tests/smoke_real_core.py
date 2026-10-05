@@ -650,6 +650,16 @@ async def main():
     check("★ 实例 A 记录的引用，实例 B 也能查到（适配器级共享，防热重载丢索引）",
           found_shared == "REFIDX_shared==", found_shared)
 
+    # ---- 20. 二次加载（热重载）：新实例必须顶掉旧补丁层，行为仍正确 ----
+    plugin_again = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)
+    await plugin_again.initialize()
+    out_again = adapter._text_content([_ST('<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />哥ww')])
+    check("★ 二次加载后，正文里的标记仍被归一化成 legacy 形态",
+          str(out_again).startswith("<@9CD54739CC9BAA46B93243088802DC72>"), str(out_again)[:50])
+    check("补丁层记录的仍是最初的原始实现",
+          getattr(adapter._text_content, "_kira_bridge_orig", None) is not None, None)
+    await plugin_again.terminate()
+
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)
 
