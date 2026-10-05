@@ -173,7 +173,7 @@ class QQOfficialGroupBridge(BasePlugin):
         self.pinned_self_openid = str(basic.get("self_openid", "") or "").strip()
 
         proactive = cfg.get("section_proactive", {}) or {}
-        self.proactive_enabled = bool(proactive.get("proactive_enabled", False))
+        self.proactive_enabled = bool(proactive.get("proactive_enabled", True))
         try:
             self.proactive_min_interval = max(0.0, float(proactive.get("proactive_min_interval", 0)))
         except (TypeError, ValueError):
@@ -757,7 +757,20 @@ class QQOfficialGroupBridge(BasePlugin):
             if result is not None and bool(getattr(result, "ok", True)):
                 return result
             err = str(getattr(result, "err", "") or "")
-            if self.proactive_enabled and "needs a received message" in err:
+            # 被动 msg_id 已过期（官方 40034005「回复消息msg_id已过期」）：
+            # 缓存的回复 id 已死，先清掉——否则之后每条消息都会先白失败一次。
+            # 典型触发：跨会话合并路由来的轮（触发消息是合成控制消息，没有新鲜
+            # msg_id，只能用到 5 分钟前的旧 id）。
+            expired = "msg_id已过期" in err or "40034005" in err
+            if expired:
+                self._purge_dead_reply_id(adapter, str(target_id), is_group)
+            if self.proactive_enabled and (
+                "needs a received message" in err or expired
+            ):
+                logger.warning(
+                    "[QQBOT-BRIDGE] 被动回复不可用（%s），改走主动消息兜底",
+                    err[:80],
+                )
                 return await self._proactive_send(adapter, str(target_id), send_message_obj, is_group)
             return result
 
@@ -768,6 +781,22 @@ class QQOfficialGroupBridge(BasePlugin):
         if self.quote_reply or (self.send_at_mention and self.at_markdown):
             # 关掉「引用回复」也要装：@ 的 markdown 转换同样在这一层
             self._patch_api_quote(adapter, name, client)
+
+    @staticmethod
+    def _purge_dead_reply_id(adapter, target_id: str, is_group: bool) -> None:
+        """清掉已过期的被动回复 id（40034005 之后它就是死的，留着只会让后续
+        每条消息都先白失败一次）。best-effort，结构对不上就跳过。"""
+        try:
+            reply_ids = getattr(
+                adapter, "_group_reply_ids" if is_group else "_direct_reply_ids", None
+            )
+            if isinstance(reply_ids, dict) and reply_ids.pop(target_id, None):
+                logger.info(
+                    "[QQBOT-BRIDGE] 已清除过期的被动回复 id（%s %s）",
+                    "群" if is_group else "私聊", target_id,
+                )
+        except Exception:
+            pass
 
     def _patch_text_content(self, adapter) -> None:
         """把发出的 @ 渲染成平台认的标记（`<qqbot-at-user id="..." />`）。
@@ -964,14 +993,38 @@ class QQOfficialGroupBridge(BasePlugin):
         payload = {"msg_type": 7 if media else 0, "content": content or None, "msg_seq": 1}
         if media:
             payload["media"] = media
+        # 主动通道同样遵守「纯文本没有 @ 能力」：正文带 @ 标记时改按 markdown 发，
+        # 失败（无原生 MD 权限）退回剥掉标记的纯文本 —— 与被动路径（v1.1.9）同一语义
+        md_text = None
+        if not media and self.at_markdown and isinstance(content, str) and (
+            "<@" in content or "qqbot-at-user" in content
+        ):
+            md_text = content
+            payload["msg_type"] = 2
+            payload["markdown"] = {"content": content}
+            payload["content"] = None
         try:
             if is_group:
                 result = await client.api.post_group_message(group_openid=target_id, **payload)
             else:
                 result = await client.api.post_c2c_message(openid=target_id, **payload)
         except Exception as exc:
-            logger.warning("[QQBOT-BRIDGE] 主动消息发送失败: %s", exc)
-            return KiraIMSentResult(ok=False, err="proactive send failed: %s" % exc)
+            if md_text is not None:
+                try:
+                    payload = {"msg_type": 0, "content": strip_at_markup(md_text), "msg_seq": 1}
+                    if is_group:
+                        result = await client.api.post_group_message(group_openid=target_id, **payload)
+                    else:
+                        result = await client.api.post_c2c_message(openid=target_id, **payload)
+                    logger.warning(
+                        "[QQBOT-BRIDGE] 主动 markdown 发送失败（%s），已退回纯文本并剥掉 @ 标记", exc
+                    )
+                except Exception as exc2:
+                    logger.warning("[QQBOT-BRIDGE] 主动消息发送失败: %s", exc2)
+                    return KiraIMSentResult(ok=False, err="proactive send failed: %s" % exc2)
+            else:
+                logger.warning("[QQBOT-BRIDGE] 主动消息发送失败: %s", exc)
+                return KiraIMSentResult(ok=False, err="proactive send failed: %s" % exc)
 
         self._last_proactive[target_id] = now
         self._proactive_count += 1

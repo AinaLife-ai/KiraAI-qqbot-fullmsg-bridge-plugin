@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.9
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.2.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -29,7 +29,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | QQ 会重复推送同一 `msg_id`（官方明说） | 按 `(群, msg_id)` 直接去重，窗口 180 秒 |
 | 引用消息（`message_type=103`）解析不到 | 传原始 payload 给框架的 `_message_chain`，引用内容照常解析 |
 | 事件偶尔没带用户名 | 自动记住见过的 OpenID→昵称（`identities.json`），零维护、改名自动跟随 |
-| 官方适配器只能被动回复（5 分钟 / 每条最多 5 次） | 可选开启官方「主动消息」通道兜底 |
+| 官方适配器只能被动回复（5 分钟 / 每条最多 5 次），**msg_id 过期（40034005）直接丢消息** | 自动改走官方「主动消息」通道兜底，并清掉死 id |
 | 补丁改完收不回 | **全程可逆**：关掉 `enabled` 后自动还原成框架原生实现，不需要重启 |
 
 **S 版 / Z 版聊天插件一行都不用改** —— 只要事件语义对齐，关键词唤醒、围观、
@@ -91,11 +91,11 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `enhance_rich_content` | 开 | **富内容归一化**：语音（含平台免费 ASR）/ 结构化卡片 / QQ 表情标记 → 都能读 |
 | `self_openid` | 空 | 通常留空＝全自动。只有自动识别猜错时才把它钉死 |
 
-### 主动消息通道（可选，默认关）
+### 主动消息通道（默认开）
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `proactive_enabled` | 关 | 官方被动回复超时（群聊 5 分钟 / 每条最多 5 次）后，改用官方主动消息接口兜底 |
+| `proactive_enabled` | **开** | 官方被动回复失效（超时 / 40034005「msg_id已过期」）后，改用官方主动消息接口兜底；命中过期时顺手清掉死 id，避免后续每条都白失败一次 |
 | `proactive_min_interval` | 0 | 同一会话最小间隔（秒），**0＝不限速**。被动回复路径不受它影响，只有超出被动窗口的主动发言才走这条通道 |
 
 > 主动消息**没有本地条数上限**：官方本身就有配额（1000 条/群/天 + 单关系 20/qpm），超了它会返回错误、我们照实记录 —— 本地再设一道只会让对话被静默掐掉。日志里会打「今日第 N 条」方便你观察。
@@ -342,6 +342,35 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.2.0</b> — ★ msg_id 过期不再丢消息（主动消息兜底覆盖 40034005，默认开）</summary>
+
+**根因**（线上实测复现）：官方 bot 的被动回复依赖「最近一次收到消息的 msg_id」，
+有效期只有 5 分钟。**跨会话合并路由（session_merger handoff）过来的轮**，触发消息是
+合成控制消息，适配器只能拿到 5 分钟前的旧 id → 腾讯返回
+**40034005「回复消息msg_id已过期」** → 整条发送失败。
+而旧的主动兜底只认 `"needs a received message"` 这一个错误串，且 `proactive_enabled`
+**默认关** → 消息无声丢失，LLM 却以为发出去了（线上日志：连续两条
+`Failed to send QQ official group message: 回复消息msg_id已过期`，群里什么都没收到）。
+
+**修复**：
+
+- **兜底触发条件扩展**：`needs a received message`（无可用 msg_id）之外，
+  新增 `msg_id已过期` / `40034005`（msg_id 已死）——两种被动失效都会改走主动消息接口；
+- **命中 40034005 时顺手清掉死 id**（`_group_reply_ids` / `_direct_reply_ids`），
+  否则之后每条消息都会先白失败一次再兜底（@ 消息的 markdown 路径还会白失败两次）；
+- **`proactive_enabled` 默认改为开**（README 配额说明不变：1000 条/群/天 + 20/qpm
+  由官方判定，本地不设限；需群主在群设置里开「机器人主动在群聊内发言」，
+  未开时主动发送会失败并打 WARNING——可见，不再静默丢）；
+- **主动通道补齐 @ 语义**：带 @ 标记的正文走主动通道时同样改按 markdown 发送
+  （纯文本没有 @ 能力），失败退回剥掉标记的纯文本——与被动路径（v1.1.9）同一语义。
+
+影响面：仅 QQ 官方 bot；OneBot（NapCat 等）无被动窗口概念，不涉及。
+新增回归测试：`test_bridge.py` +4 用例（过期触发兜底 / 死 id 清除 / 关 proactive 时仍清 id /
+主动通道 @ 走 markdown），全量测试见下。
+
+</details>
+
+<details>
 <summary><b>v1.1.9</b> — ★ 用 markdown 发 @（揭开「@ 一直显示成文本」的根因）</summary>
 
 **根因**：官方 API 的**纯文本消息（`msg_type=0`）没有 @ 能力** —— 提到标签只在
