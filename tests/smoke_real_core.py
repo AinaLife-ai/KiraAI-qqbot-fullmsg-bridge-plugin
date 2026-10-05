@@ -713,6 +713,52 @@ async def main():
           plain_call.get("msg_type") == 0 and plain_call.get("markdown") is None,
           {k: plain_call.get(k) for k in ("msg_type", "content")})
 
+    # ---- 22. msg_id 过期（40034005）→ 主动消息兜底 + 清死 id（v1.2.0）----
+    class _ExpireAPI:
+        """带 msg_id 的被动发送一律抛 40034005（模拟被动窗口过期）；
+        不带 msg_id 的主动发送成功。"""
+
+        def __init__(self):
+            self.calls = []
+
+        async def post_group_message(self, **kw):
+            self.calls.append(dict(kw))
+            if kw.get("msg_id"):
+                raise RuntimeError("接口请求异常, 错误代码: 400, "
+                                   "{'message': '回复消息msg_id已过期', 'code': 40034005}")
+            return {"id": "PROACTIVE1"}
+
+        async def post_c2c_message(self, **kw):
+            self.calls.append(dict(kw))
+            if kw.get("msg_id"):
+                raise RuntimeError("回复消息msg_id已过期")
+            return {"id": "PROACTIVE2"}
+
+    # 还原发送路径后按新实例重新打补丁（避免叠层干扰观测）
+    orig_send = plugin_md._patched_sends.get("QQ Official")
+    if orig_send is not None:
+        adapter._send_message = orig_send
+    expire_api = _ExpireAPI()
+    adapter.client = types.SimpleNamespace(api=expire_api)
+    cfg_pro = dict(cfg)
+    cfg_pro["section_basic"] = dict(cfg["section_basic"], at_grace_seconds=0)
+    cfg_pro["section_proactive"] = {"proactive_enabled": True}
+    plugin_pro = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg_pro)
+    plugin_pro._patch_send_path(adapter, "QQ Official", adapter.client)
+
+    adapter._group_reply_ids["G_EXPIRE"] = "STALE-MSG-ID"
+    adapter._client_task = asyncio.current_task()  # 让真实 _send_message 通过连接检查
+    from core.chat.message_elements import Text as _T22
+    res_expire = await adapter.send_group_message("G_EXPIRE", [_T22("到期兜底测试")])
+    check("★ msg_id 过期（40034005）→ 主动兜底发出",
+          bool(getattr(res_expire, "ok", True)), repr(getattr(res_expire, "err", "")))
+    no_id_calls = [c for c in expire_api.calls if not c.get("msg_id")]
+    check("兜底走的是不带 msg_id 的主动通道", len(no_id_calls) >= 1, repr(expire_api.calls))
+    check("过期的被动回复 id 已被清除（之后不再每条白失败）",
+          adapter._group_reply_ids.get("G_EXPIRE") is None, repr(adapter._group_reply_ids))
+    adapter._client_task = None
+    await plugin_pro.terminate()
+
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)
 
