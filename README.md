@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.0
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -81,6 +81,10 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `at_grace_seconds` | 0 | **不用动**。只有当日志报出「全量+@ 双副本」（按官方文档不该发生）时才设 1.5~2：全量副本会等一会儿，@ 副本随后到达就让位。代价是每条群消息晚这么多秒 |
 | `dedup_ttl` | 180 | 消息去重窗口（秒） |
 | `remember_nicknames` | 开 | 自动昵称通讯录，零维护 |
+| `resolve_at_markup` | 开 | 把 `<@openid>` 解析成标准 `At` 元素 `[At 昵称(pid)]`（**保留 pid 防改名冒充**）；机器人自己被 @ 时名字带「（你）」并强制唤醒 |
+| `learn_self_openid` | 开 | 自动学出机器人自己的 OpenID（优先 `mentions[].is_you`，兜底用"查不到的 @"反推） |
+| `reply_to_self_wakes` | 开 | **有人引用回复机器人的消息 = 被提及**（对齐 KiraAI 的 OneBot 适配器行为） |
+| `self_openid` | 空 | 通常留空＝全自动。只有自动识别猜错时才把它钉死 |
 
 ### 主动消息通道（可选，默认关）
 
@@ -90,6 +94,98 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `proactive_min_interval` | 0 | 同一会话最小间隔（秒），**0＝不限速**。被动回复路径不受它影响，只有超出被动窗口的主动发言才走这条通道 |
 
 > 主动消息**没有本地条数上限**：官方本身就有配额（1000 条/群/天 + 单关系 20/qpm），超了它会返回错误、我们照实记录 —— 本地再设一道只会让对话被静默掐掉。日志里会打「今日第 N 条」方便你观察。
+
+### LLM 认不出"有人在叫我"？—— @ 富文本的锅
+
+官方 bot 群消息里的 @ 是**富文本标记**，直接留在 `content` 里：
+
+```
+<@0A0B9F323E6AA18BF08B6901A3B2DEFC> 妹
+```
+
+KiraAI 原生实现完全不解析它（`mentions` 数组也没用上），所以 LLM 看到的是一串
+32 位 hex —— **连"这是在叫我"都判断不出来**，只能当成"哥在 @ 别人"。
+
+插件把它解析成 **KiraAI 标准 `At` 元素**，渲染出来是：
+
+```
+[At 香里（你）(0A0B9F323E6AA18BF08B6901A3B2DEFC)] 妹
+```
+
+#### 为什么一定要保留 pid，不能只显示昵称
+
+**昵称是用户随时可以改的字段。** 只显示昵称的话，任何人把群昵称改成「香里」就能冒充机器人
+—— LLM 分不出谁是谁。而 `pid` 是平台下发的 openid，**用户不可控**。
+
+KiraAI 原版就是这个约定：`At` 的渲染是 `[At 昵称(pid)]`，OneBot 路径甚至只给
+`[At QQ号]`（只有 id、没有名字）—— **名字给人读，pid 做身份**。
+
+机器人自己的那个 `At`，名字额外带一个「**（你）**」后缀（`[At 香里（你）(pid)]`），
+这样"同名冒充"在语义上也一眼分得清：真身带「（你）」，冒充者不带。
+
+插件做了三件事：
+
+1. **认出"自己"**：优先用事件里的 `mentions[].is_you`；没有就用「`bot=true` 且昵称与机器人
+   名字一致」比对；都没有时兜底反推 —— 内容里有、`mentions` 里查不到的 `@`，那就是机器人自己
+   （平台本来就会把机器人从 `mentions` 里摘掉）。
+2. **拆成标准 At 元素**：`<@openid>` → `At(pid=openid, nickname=昵称)`。**pid 永远保留**；
+   名字只是锦上添花，解析不出来时给 `[At pid]`，绝不编造身份。自己的 `At` 名字带「（你）」。
+3. **硬唤醒**：内容里出现"自己的 @"就**强制** `is_mentioned=True`，这条证据比 `mentions`
+   更硬，不依赖平台给不给 `is_you`。
+
+> 第一次遇到 @ 富文本时，日志会打出原文 / 解析结果 / mentions / 认出的 OpenID 及其来源，
+> 方便你一眼核对：
+> ```
+> [QQBOT-BRIDGE] 首次遇到 @ 富文本：原文='<@0A0B...> 妹' → 解析后='@香里 妹'；mentions=[...]；机器人 OpenID=0A0B...（来源 is_you）
+> ```
+
+### @ 他人 和 引用回复 也对齐了吗？
+
+**@ 他人：一样处理。** 一条消息里 @ 了几个人就拆出几个 `At`，各自带自己的 pid 和昵称：
+
+```
+小红: <@AAAA1111BBBB2222> 你看 <@CCCC3333DDDD4444>
+                                        ↓
+小红: [At 小红(AAAA1111BBBB2222)] 你看 [At 小刚(CCCC3333DDDD4444)]
+```
+
+只 @ 别人**不算唤醒**（`is_mentioned` 保持 False）——只有真被 @ 才唤醒，和 NapCat 一致。
+
+**引用回复：内容能解析出来，而且「被引用回复」= 被唤醒。**
+
+先说唤醒这一条 —— 这是对齐 KiraAI 的 QQ(OneBot) 适配器：
+
+```python
+# core/adapter/src/qq/qq.py
+elif m.get("type") == "reply":
+    reply_msg_info = await self.bot.get_msg(...)
+    if reply_msg_info["data"]["user_id"] == msg["self_id"]:
+        is_mentioned = True        # ← 「回复机器人自己的消息」在框架里就等于被提及
+```
+
+本插件照做。而且 QQ 官方这边**比 OneBot 还省事**：被引用消息的作者直接就在
+`msg_elements[0].author` 里（`bot: true` + 名字），不用像 OneBot 那样额外发一次 `get_msg`
+去反查。引用别人的消息则**不算**唤醒。
+
+再说内容解析 —— 这是**原生实现做不到的**。
+
+KiraAI 原生适配器会先把事件包装成 botpy 的 `GroupMessage` 对象，而那个对象**只保留
+`content` / `mentions` / `attachments`** —— 引用消息靠的 `msg_elements` 被丢掉了，
+所以原版下引用内容根本进不来。本插件把**原始 payload** 交给框架的 `_message_chain()`，
+于是：
+
+- `message_type=103` 的引用消息 → 生成标准 **`Reply` 元素**，被引用的原话作为它的 `chain` 带进来；
+- S 版 / Z 版的**「引用检测」**（骚扰判定的 `_detect_kind` → `"reply"`）依赖真正的
+  `Reply` 元素 —— 现在有了，这条路径才真正生效；
+- **引用内容里的 @ 也会拆成 `At`**，但**不算"现在在叫我"** —— 那是被引用的历史消息，
+  不是当前这条消息在呼唤你（避免被"引用一条 @ 过机器人的旧消息"误触发）。
+
+> **已知边界**：QQ 群消息的 payload 里**没有** `message_reference`（引用指针在
+> `message_scene.ext` 的 `ref_msg_idx`），所以 `Reply` 的 message_id 是空的，渲染成
+> `[Reply ]` + 引用内容 —— **内容有、id 没有**。若某条消息 QQ 连 `msg_elements` 都没给，
+> 那就拿不到引用信息（退化成普通文本）。
+> 没有把 `ref_msg_idx` 塞进 `message_reference` 是**故意的**：那是索引不是消息 id，
+> 塞进去会让"回复它"变得可点击、最终以非法 msg_id 发送失败。
 
 ### 同一条消息会不会来两次？
 
@@ -163,8 +259,10 @@ python3 tests/run_tests.py
 
 | 套件 | 覆盖 | 结果 |
 |---|---|---|
-| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、去重与双事件竞态、边界、能力降级、性能与内存、**可逆性** | **101/101** |
-| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」与**跨事件重复观测**验证 | **37/37** |
+| `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
+| `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
+| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@ 富文本/@他人/引用/被引用唤醒/自我识别（含防冒充）**、去重、边界、能力降级、性能与内存、**可逆性** | **142/142** |
+| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用解析与引用唤醒**、跨事件重复观测 | **62/62** |
 
 ```bash
 # 冒烟需要真实源码路径（找不到会自动跳过）
@@ -185,6 +283,34 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.1.1</b> — 认得出「机器人自己被 @」</summary>
+
+**@ 富文本解析（KiraAI 标准格式）**
+- 官方 bot 群消息里的 @ 是富文本标记（形如 `<@32位hex>`），原生实现不解析，
+  LLM 只看到一串 hex、连「有人在叫我」都判断不出来
+- 现在解析成 **KiraAI 标准 `At` 元素**：`[At 香里（你）(0A0B9F...)] 妹`
+- **pid 永远保留**：昵称用户随时能改，只显示昵称会被改名冒充；
+  KiraAI 原版约定就是「名字给人读，pid 做身份」（OneBot 路径甚至只给 `[At QQ号]`）
+- 自己那个 `At` 的名字带「（你）」后缀，同名冒充也分得清
+- 内容里出现「自己的 @」时**强制** `is_mentioned=True` —— 不依赖平台是否给 `is_you`
+- **@ 他人同样拆成标准 `At`**（各带各的 pid），只 @ 别人不算唤醒
+- **引用消息**（`message_type=103`）解析成标准 `Reply` + 被引用原话；
+  引用内容里的 @ 也拆 `At`，但**不算"现在在叫我"**（历史消息不触发误唤醒）
+- **「被引用回复」= 被提及**：有人引用机器人的消息时唤醒它（`reply_to_self_wakes`，
+  对齐 KiraAI 的 OneBot 适配器 —— 那边遇到 `reply` 段会反查作者是不是自己）
+
+**认出「自己」**
+- 三级识别：`mentions[].is_you` → `bot=true` 且昵称与机器人名字一致 → 兜底反推
+  （内容里有、`mentions` 里查不到的 @ ⇒ 就是机器人自己）
+- 新增 `self_openid` 配置：留空＝全自动；自动识别猜错时可钉死
+- 首次遇到 @ 富文本打样本日志（原文 / 解析后 / mentions / 认出的 OpenID 及来源）
+
+**新增配置**
+- `resolve_at_markup`（默认开）、`learn_self_openid`（默认开）、`self_openid`（默认空）
+
+</details>
+
+<details>
 <summary><b>v1.1.0</b> — 全面对齐 + 可逆</summary>
 
 **昵称与语义对齐**
@@ -216,6 +342,11 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 - 昵称通讯录落盘移出消息路径（`asyncio.to_thread`，仅脏时写）
 - 热路径日志改为惰性格式化；异常一律兜住，绝不抛回 botpy 的事件循环
 - 新增性能 / 内存 / 事件循环存活性测试
+
+**自我识别（本版新增）**
+- 新增 @ 富文本解析：`<@openid>` → `@昵称`，机器人自己 → `@<机器人名字>`
+- 自动学出机器人自己的 OpenID（`is_you` → `bot+昵称` → 兜底反推），并可手动钉死
+- 内容里出现"自己的 @"时强制 `is_mentioned=True`，不再依赖平台是否给 `is_you`
 
 **主动消息通道**
 - `proactive_min_interval` 默认从 30 秒改为 **0（不限速）**：被动回复路径本来就不受它影响，

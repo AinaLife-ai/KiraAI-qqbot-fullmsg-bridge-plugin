@@ -48,7 +48,7 @@ if "qqbot_bridge" in sys.modules:
 
 from core.plugin import BasePlugin, logger
 from core.chat import Group, User
-from core.chat.message_elements import File, Image
+from core.chat.message_elements import At, File, Image, Text
 from core.chat.message_utils import KiraIMMessage, KiraMessageEvent, KiraIMSentResult
 
 from qqbot_bridge import (
@@ -60,6 +60,7 @@ from qqbot_bridge import (
     KIND_FULL,
     IdentityStore,
     MessageDedup,
+    SelfIdentity,
     attach_client_handler,
     build_event,
     check_adapter_capabilities,
@@ -67,9 +68,11 @@ from qqbot_bridge import (
     dedup_key,
     detach_client_handler,
     drop_live_parser,
+    collect_self_identity,
     inject_live_parser,
     install_class_parser,
     normalize_body,
+    normalize_mentions,
     restore_class_parser,
 )
 
@@ -116,6 +119,10 @@ class QQOfficialGroupBridge(BasePlugin):
         except (TypeError, ValueError):
             self.at_grace = 0.0
         self.remember_nicknames = bool(basic.get("remember_nicknames", True))
+        self.resolve_at = bool(basic.get("resolve_at_markup", True))
+        self.learn_self_openid = bool(basic.get("learn_self_openid", True))
+        self.reply_to_self_wakes = bool(basic.get("reply_to_self_wakes", True))
+        self.pinned_self_openid = str(basic.get("self_openid", "") or "").strip()
 
         proactive = cfg.get("section_proactive", {}) or {}
         self.proactive_enabled = bool(proactive.get("proactive_enabled", False))
@@ -138,6 +145,10 @@ class QQOfficialGroupBridge(BasePlugin):
         self._handled = 0
         #: 观测计数：同一条消息同时以「全量+@」两种事件到达的次数（正常恒为 0）
         self._cross_pairs = 0
+        #: 每个适配器实例 → 机器人自己的身份（OpenID / 昵称）
+        self._self_ident = {}
+        self._self_logged = set()
+        self._at_sample_logged = False
         self._last_proactive = {}
         #: 仅用于日志观测（今日主动消息条数），不做任何限制——配额由官方判
         self._proactive_day = ""
@@ -365,7 +376,8 @@ class QQOfficialGroupBridge(BasePlugin):
                 continue
             # 顺序很重要：先挂处理器，再强制替换解析器。
             res = attach_client_handler(
-                client, attr, self._make_handler(adapter, kind, is_group), allow_shadow=allow_shadow
+                client, attr, self._make_handler(adapter, name, kind, is_group),
+                allow_shadow=allow_shadow,
             )
             if res == "attached":
                 newly_attached.append(attr)
@@ -402,19 +414,21 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     # 事件 -> KiraAI
     # ------------------------------------------------------------------ #
-    def _make_handler(self, adapter, kind: str, is_group: bool):
+    def _make_handler(self, adapter, name: str, kind: str, is_group: bool):
         async def _handler(payload):
             try:
-                await self._on_event(adapter, payload, kind, is_group)
+                await self._on_event(adapter, name, payload, kind, is_group)
             except Exception as exc:  # 绝不把异常抛回 botpy 的事件循环
                 logger.warning("[QQBOT-BRIDGE] 处理事件失败（%s）: %s: %s", kind, type(exc).__name__, exc)
 
         return _handler
 
-    async def _on_event(self, adapter, payload, kind: str, is_group: bool):
+    async def _on_event(self, adapter, name: str, payload, kind: str, is_group: bool):
         if not self.enabled:
             return
         body = normalize_body(payload) or {}
+        raw_content = body.get("content")
+        ident = self._self_identity(adapter, name)
         key = dedup_key(body, is_group)
 
         # 官方文档：全量模式下「群里的每一条消息（不限于@机器人）」都走
@@ -446,6 +460,12 @@ class QQOfficialGroupBridge(BasePlugin):
                 self_ids=collect_self_ids(adapter.get_client()),
                 dedup=self.dedup,
                 identities=self.identities if self.remember_nicknames else None,
+                self_identity=ident,
+                resolve_at=self.resolve_at,
+                learn_self=self.learn_self_openid,
+                reply_to_self_wakes=self.reply_to_self_wakes,
+                At=At,
+                Text=Text,
             )
         except Exception as exc:
             logger.warning("[QQBOT-BRIDGE] 构造事件失败（%s）: %s: %s", kind, type(exc).__name__, exc)
@@ -455,6 +475,9 @@ class QQOfficialGroupBridge(BasePlugin):
             if reason != "duplicate":
                 logger.debug("[QQBOT-BRIDGE] 事件被丢弃（%s）: %s", kind, reason)
             return
+
+        self._log_self_learned(name, ident)
+        self._log_at_sample_once(raw_content, body, ident, event)
 
         # 严格模式（可选，默认关）：全量副本先压住 at_grace 秒，@ 副本随后到达就让位。
         # 代价是每条群消息都晚 at_grace 秒，所以默认 0 不启用。
@@ -473,6 +496,62 @@ class QQOfficialGroupBridge(BasePlugin):
             adapter.publish(event)
         except Exception as exc:
             logger.warning("[QQBOT-BRIDGE] 发布事件失败: %s", exc)
+
+    def _self_identity(self, adapter, name: str):
+        """取（并顺带刷新）机器人自己的身份。"""
+        ident = self._self_ident.get(name)
+        if ident is None:
+            ident = SelfIdentity()
+            self._self_ident[name] = ident
+        if not ident.openid and self.pinned_self_openid:
+            ident.openid = self.pinned_self_openid
+            ident.source = "config"
+        if not ident.name:
+            try:
+                _, robot_name = collect_self_identity(adapter.get_client())
+            except Exception:
+                robot_name = None
+            if robot_name:
+                ident.name = str(robot_name)
+        return ident
+
+    def _log_self_learned(self, name: str, ident) -> None:
+        if not ident.openid or name in self._self_logged:
+            return
+        self._self_logged.add(name)
+        logger.info(
+            "[QQBOT-BRIDGE] %s: 已认出机器人自己的 OpenID（来源 %s），昵称「%s」——"
+            "此后内容里的 <@自己> 会渲染成 [At %s（你）(pid)] 并强制视为被 @",
+            name, ident.source, ident.name or "?", ident.name or "你",
+        )
+
+    def _log_at_sample_once(self, raw_content, body, ident, event) -> None:
+        """第一次遇到 @ 富文本时把原文/mentions/判定结果如实打出来（便于核对）。"""
+        if self._at_sample_logged:
+            return
+        if not (isinstance(raw_content, str) and "<@" in raw_content):
+            return
+        self._at_sample_logged = True
+        try:
+            mentions = json.dumps(normalize_mentions(body.get("mentions")),
+                                  ensure_ascii=False)[:500]
+        except Exception:
+            mentions = "<?>"
+        resolved = ""
+        try:
+            for ele in event.message.chain:
+                text = getattr(ele, "text", None)
+                if isinstance(text, str):
+                    resolved += text
+                else:
+                    resolved += (getattr(ele, "repr", None) or str(ele))
+        except Exception:
+            resolved = "<?>"
+        logger.info(
+            "[QQBOT-BRIDGE] 首次遇到 @ 富文本：原文=%r → 解析后=%r；mentions=%s；"
+            "机器人 OpenID=%s（来源 %s）",
+            raw_content, resolved[:200], mentions, ident.openid, ident.source,
+        )
 
     def _log_sample_once(self, body, source: str, kind: str):
         if self._sample_logged or kind != KIND_FULL:

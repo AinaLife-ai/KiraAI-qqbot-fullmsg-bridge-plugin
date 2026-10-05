@@ -52,6 +52,30 @@
         "type": "switch",
         "default": true,
         "hint": "把见过的 OpenID→QQ昵称 自动记入本地通讯录（identities.json）。事件里没带 username 时用上次记住的名字兜底。全自动，无需维护；改名会自动跟随"
+      },
+      "resolve_at_markup": {
+        "name": "把 @ 解析成昵称（推荐开）",
+        "type": "switch",
+        "default": true,
+        "hint": "官方 bot 的群消息里 @ 是富文本标记（形如 <@32位hex>），原生实现不解析，LLM 看到的是一串乱码、连「有人在叫我」都看不出来。开启后解析成 KiraAI 标准 At 元素 [At 昵称(pid)]：**pid（平台下发的 openid）永远保留** —— 昵称用户随时能改，只给昵称会被改名冒充；机器人自己被 @ 时名字带「（你）」后缀并强制视为被提及。"
+      },
+      "learn_self_openid": {
+        "name": "自动识别机器人自己（推荐开）",
+        "type": "switch",
+        "default": true,
+        "hint": "开启后，插件会自动学出机器人自己的 OpenID（优先用事件里的 is_you 标记；顺带用机器人昵称比对）。若某条消息里的 @ 在 mentions 里查不到，也会把它当作机器人自己——平台本来就会把机器人从 mentions 里摘掉。关掉后只认 is_you。"
+      },
+      "reply_to_self_wakes": {
+        "name": "被引用回复也算唤醒（推荐开）",
+        "type": "switch",
+        "default": true,
+        "hint": "有人「引用回复」机器人的消息时视为被提及。这与 KiraAI 的 QQ(OneBot) 适配器行为一致（那边遇到 reply 段会反查被引用消息的作者，是机器人自己就置 is_mentioned）。关掉后回复机器人不触发唤醒，只有 @ 和关键词能唤醒。"
+      },
+      "self_openid": {
+        "name": "机器人自己的 OpenID（通常留空）",
+        "type": "string",
+        "default": "",
+        "hint": "留空＝全自动识别（推荐）。只有在自动识别猜错、导致把别人的 @ 当成叫自己时，才把它固定成正确的 OpenID。"
       }
     }
   },

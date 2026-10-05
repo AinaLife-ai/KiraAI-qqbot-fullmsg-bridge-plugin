@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Iterable, Optional, Sequence
@@ -312,6 +313,198 @@ class IdentityStore:
 
 
 # --------------------------------------------------------------------------- #
+# @ 标记解析 / 机器人自我身份
+#
+# 官方 bot 的群消息里，@ 是以富文本标记的形式留在 content 里的：
+#     <@0A0B9F323E6AA18BF08B6901A3B2DEFC> 妹
+# 而 mentions 数组只给出被 @ 者的 id / username。KiraAI 原生适配器完全不碰这两个
+# 字段，于是 LLM 看到的是一串 32 位 hex —— **连"有人在叫我"都看不出来**。
+#
+# 这里做三件事：
+#   ① 学出"机器人自己"的 OpenID（优先 mentions[].is_you；其次 bot=true 且昵称与
+#      机器人名字一致；最后兜底：把"内容里有、mentions 里查不到的 @"当作自己 ——
+#      平台本来就会把机器人从 mentions 里摘掉，这个反推在实践中往往成立）；
+#   ② 把 <@openid> 解析成 KiraAI **标准 At 元素**：``[At 昵称(pid)]`` ——
+#      名字给人看，**pid（平台下发的 openid）才是身份**；
+#      ★ 只留昵称是不安全的：昵称用户随时能改，把名字改成机器人名字就能冒充。
+#      KiraAI 原版就是这个约定（OneBot 路径甚至是 ``[At QQ号]``，只有 id 没有名字）。
+#   ③ 一旦内容里出现了"自己的 @"，就强制 is_mentioned=True —— 这是比 mentions
+#      更硬的一条唤醒证据，不依赖平台给不给 is_you。
+# --------------------------------------------------------------------------- #
+
+#: QQ 富文本 @ 标记：<@32位hex>（放宽到 8 位以上的字母数字，兼容其它形态）
+AT_MARKUP_RE = re.compile(r"<@([0-9A-Za-z]{8,})>")
+
+
+class SelfIdentity:
+    """机器人自己的身份（OpenID + 昵称）。由调用方持有，build_event 就地补全。"""
+
+    __slots__ = ("openid", "name", "source")
+
+    def __init__(self, openid=None, name=None, source=None):
+        self.openid = openid
+        self.name = name
+        self.source = source
+
+
+def extract_at_ids(text) -> list:
+    """抓出 content 里所有 <@openid> 的 openid。"""
+    if not isinstance(text, str) or "@" not in text:
+        return []
+    return AT_MARKUP_RE.findall(text)
+
+
+def mention_name_map(body: dict) -> dict:
+    """mentions[] -> {openid: username}（只收带昵称的项）。"""
+    out = {}
+    for item in normalize_mentions(body.get("mentions")):
+        mid = item.get("id")
+        name = item.get("username")
+        if mid is not None and name:
+            out[str(mid)] = str(name)
+    return out
+
+
+def learn_self_from_mentions(body: dict, robot_name=None):
+    """从 mentions 里认出机器人自己的 openid。返回 (openid, 来源) 或 (None, None)。"""
+    mentions = normalize_mentions(body.get("mentions"))
+    for item in mentions:
+        if item.get("is_you") is True and item.get("id") is not None:
+            return str(item["id"]), "is_you"
+    if robot_name:
+        for item in mentions:
+            if item.get("bot") and str(item.get("username") or "") == str(robot_name) \
+                    and item.get("id") is not None:
+                return str(item["id"]), "bot+name"
+    return None, None
+
+
+def quoted_author_is_self(body: dict, self_identity=None):
+    """引用消息的作者是不是机器人自己 —— 对齐 KiraAI 的 OneBot 语义。
+
+    KiraAI 的 OneBot 路径（``core/adapter/src/qq/qq.py``）遇到 ``reply`` 段会
+    ``get_msg`` 反查被引用消息的作者，若 ``user_id == self_id`` 就置
+    ``is_mentioned = True`` —— **「回复机器人自己的消息」在框架里就等于被提及**。
+
+    QQ 官方这边更省事：被引用消息的 ``author`` 直接就在 ``msg_elements[0]`` 里，
+    不用额外请求接口。
+
+    返回 ``(是否自己, 可顺便学到的 openid 或 None)``。
+    """
+    if not looks_like_quote(body):
+        return False, None
+    elements = body.get("msg_elements")
+    if not isinstance(elements, list) or not elements:
+        return False, None
+    first = elements[0]
+    author = first.get("author") if isinstance(first, dict) else None
+    if not isinstance(author, dict):
+        return False, None
+
+    oid = author.get("id")
+    name = str(author.get("username") or "")
+    known = self_identity.openid if self_identity is not None else None
+
+    if known is not None and oid is not None and str(oid) == str(known):
+        return True, None
+    if author.get("bot") is True and self_identity is not None and self_identity.name:
+        if name and name == str(self_identity.name):
+            return True, (str(oid) if oid is not None else None)
+    return False, None
+
+
+def looks_like_quote(body: dict) -> bool:
+    """这条消息是不是一条「引用回复」。
+
+    ``message_type == 103`` 是官方文档标注的引用消息；``message_reference`` 是旧格式。
+    两者都不满足就按普通消息处理（避免把聊记/转发误判成引用）。
+    """
+    if body.get("message_reference"):
+        return True
+    try:
+        return int(body.get("message_type") or 0) == 103
+    except (TypeError, ValueError):
+        return False
+
+
+def split_at_markup(chain, body, self_identity=None, learn_self=True, At=None, Text=None,
+                    count_self=True, _depth=0):
+    """把 chain 里 ``Text`` 元素中的 ``<@openid>`` 拆成 KiraAI 标准 ``At`` 元素。
+
+    **为什么不是纯文本替换**：昵称是用户随时能改的字段，只显示昵称的话，任何人把
+    昵称改成机器人的名字就能冒充它。``At`` 的 ``pid`` 是平台下发的 openid（用户不可控），
+    渲染成 KiraAI 标准格式 ``[At 昵称(pid)]`` —— 名字给人读，pid 做身份，两全。
+
+    机器人自己的那个 ``At`` 名字带一个「（你）」后缀，避免"同名冒充"在语义上混淆。
+
+    **引用消息里的 @ 也会被拆**（``Reply.chain`` 递归处理），但 ``count_self=False``：
+    引用内容里的"自己的 @"**不算**本条消息在叫你 —— 那是被引用的历史消息，不是现在的呼唤。
+
+    返回 ``(新 chain, 是否 @ 到自己, 新学到的 openid)``；任何一步出问题都原样返回。
+    """
+    if At is None or Text is None or not chain:
+        return chain, False, None
+
+    names = mention_name_map(body)
+    known = self_identity.openid if self_identity is not None else None
+    learned = None
+    hit_self = False
+    out = []
+
+    def _text(value):
+        try:
+            return Text(value)
+        except Exception:
+            return value
+
+    for ele in chain:
+        # 引用消息：嵌套链同样拆 At（只做展示，不作为「叫自己」的判据）
+        nested = getattr(ele, "chain", None)
+        if nested is not None and hasattr(nested, "message_list") and _depth < 2:
+            sub, _h, _l = split_at_markup(
+                list(nested), body, self_identity, learn_self,
+                At=At, Text=Text, count_self=False, _depth=_depth + 1,
+            )
+            try:
+                ele.chain = type(nested)(sub)
+            except Exception:
+                pass
+
+        text = getattr(ele, "text", None)
+        if not isinstance(text, str) or "<@" not in text:
+            out.append(ele)
+            continue
+        pos = 0
+        for match in AT_MARKUP_RE.finditer(text):
+            oid = match.group(1)
+            # 兜底学习：内容里有 @、但 mentions 里查不到 → 很可能就是机器人自己
+            if known is None and learn_self and oid not in names:
+                learned = oid
+                known = oid
+            head = text[pos:match.start()]
+            if head:
+                out.append(_text(head))
+            is_self = known is not None and oid == known
+            label = None
+            if is_self:
+                if count_self:
+                    hit_self = True
+                base = self_identity.name if self_identity is not None else None
+                label = f"{base}（你）" if base else "你"
+            elif oid in names:
+                label = names[oid]
+            try:
+                out.append(At(oid, label) if label else At(oid))
+            except Exception:
+                out.append(_text(match.group(0)))
+            pos = match.end()
+        tail = text[pos:]
+        if tail:
+            out.append(_text(tail))
+    return out, hit_self, learned
+
+
+# --------------------------------------------------------------------------- #
 # Mention semantics
 # --------------------------------------------------------------------------- #
 def normalize_mentions(raw: Any) -> list:
@@ -403,6 +596,12 @@ def build_event(
     dedup: Optional[MessageDedup] = None,
     identities: Optional[IdentityStore] = None,
     alias_ids: bool = False,
+    self_identity: Optional[SelfIdentity] = None,
+    resolve_at: bool = True,
+    learn_self: bool = True,
+    reply_to_self_wakes: bool = True,
+    At: Any = None,
+    Text: Any = None,
     now: Optional[float] = None,
 ) -> tuple:
     """Turn one raw QQ payload into a KiraAI event.
@@ -436,12 +635,46 @@ def build_event(
         if verdict == "dup":
             return None, "duplicate"
 
+    chain_fn = getattr(adapter, "_message_chain", None)
+    if not callable(chain_fn):
+        return None, "no-chain-builder"
+    chain = chain_fn(body, is_group=is_group, target_id=target_id)
+
+    # ---- @ 富文本标记：拆成标准 At 元素（保留 pid），顺带认出"自己" ----
+    if resolve_at:
+        if self_identity is not None and self_identity.openid is None:
+            oid, why = learn_self_from_mentions(body, self_identity.name)
+            if oid is not None:
+                self_identity.openid = oid
+                self_identity.source = why
+        chain, hit_self, learned = split_at_markup(
+            chain, body, self_identity, learn_self=learn_self, At=At, Text=Text
+        )
+        if learned and self_identity is not None and self_identity.openid is None:
+            self_identity.openid = learned
+            self_identity.source = "unresolved-markup"
+    else:
+        hit_self = False
+
+    # 「回复机器人自己的消息」= 被提及（对齐 OneBot 路径；官方 payload 里连作者都给了）
+    reply_to_self = False
+    if reply_to_self_wakes:
+        reply_to_self, quoted_oid = quoted_author_is_self(body, self_identity)
+        if quoted_oid and self_identity is not None and self_identity.openid is None:
+            self_identity.openid = quoted_oid
+            self_identity.source = "quoted-author"
+
     if force_mention:
         is_mentioned, source = True, "forced"
     elif is_group:
         is_mentioned, source = detect_mention(body, mention_mode, self_ids)
     else:
         is_mentioned, source = True, "dm"
+    if reply_to_self and not is_mentioned:
+        is_mentioned, source = True, "reply_to_self"
+    if hit_self and not is_mentioned:
+        # 内容里出现"自己的 @"——比 mentions 更硬的一条唤醒证据
+        is_mentioned, source = True, "self_at_markup"
 
     nickname = str(author.get("username") or "").strip()
     if identities is not None:
@@ -461,10 +694,6 @@ def build_event(
             except Exception:
                 display_id = ""
 
-    chain_fn = getattr(adapter, "_message_chain", None)
-    if not callable(chain_fn):
-        return None, "no-chain-builder"
-
     ts = int(now if now is not None else time.time())
     event = KiraMessageEvent(
         adapter=adapter.info,
@@ -476,7 +705,7 @@ def build_event(
             is_mentioned=is_mentioned,
             message_id=display_id or message_id,
             self_id=adapter.app_id,
-            chain=chain_fn(body, is_group=is_group, target_id=target_id),
+            chain=chain,
         ),
         timestamp=ts,
     )
@@ -485,11 +714,27 @@ def build_event(
 
 def collect_self_ids(client: Any) -> list:
     """Best-effort read of the bot's own id from a botpy client."""
-    robot = getattr(client, "robot", None)
-    if isinstance(robot, dict):
-        rid = robot.get("id")
-    elif robot is not None:
-        rid = getattr(robot, "id", None)
-    else:
-        rid = None
+    try:
+        rid, _ = collect_self_identity(client)
+    except Exception:
+        # botpy 的 client.robot 是个 property，未连接时 _connection 为 None 会抛
+        return []
     return [rid] if rid is not None else []
+
+
+def collect_self_identity(client: Any):
+    """读 botpy client 上机器人自己的 (id, 昵称)。
+
+    ``READY`` 之后 botpy 会挂上 ``client.robot``（``user.id`` / ``user.username``）。
+    昵称用于把「机器人自己被 @」渲染成 ``@香里`` 而不是一串 hex。
+    **全防御**：未连接时 ``client.robot`` 这个 property 会抛，不能让它冒到消息路径上。
+    """
+    try:
+        robot = getattr(client, "robot", None)
+    except Exception:
+        return None, None
+    if isinstance(robot, dict):
+        return robot.get("id"), (robot.get("username") or robot.get("name"))
+    if robot is not None:
+        return getattr(robot, "id", None), getattr(robot, "name", None)
+    return None, None
