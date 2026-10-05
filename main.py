@@ -84,6 +84,29 @@ from qqbot_bridge import (
 
 _SELF_PLUGIN_ID = "qqbot-fullmsg-bridge"
 
+#: 引用索引兜底表（适配器不支持挂属性时按名字共享）
+_REF_STORES_BY_NAME: dict = {}
+
+
+def ref_store_for(adapter):
+    """取「适配器级」共享的引用索引。
+
+    挂在**适配器对象**上而不是插件实例上 —— 热重载/多次加载时，
+    负责收消息的实例和负责发消息的实例可能不是同一个，
+    各存一份就会出现「明明记过、却查不到」（用户实测踩到）。
+    """
+    try:
+        store = getattr(adapter, "_qqbot_bridge_refs", None)
+        if store is None:
+            store = OrderedDict()
+            adapter._qqbot_bridge_refs = store
+        return store
+    except Exception:
+        pass
+    name = str(getattr(getattr(adapter, "info", None), "name", "?"))
+    return _REF_STORES_BY_NAME.setdefault(name, OrderedDict())
+
+
 #: 这一次发送要引用哪条消息（REFIDX）。用 contextvar 传给 api 层的包装函数，
 #: 避免为了注入 message_reference 去复制一遍适配器的发送逻辑。
 _QUOTE_REF: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
@@ -169,7 +192,6 @@ class QQOfficialGroupBridge(BasePlugin):
         #: 观测计数：同一条消息同时以「全量+@」两种事件到达的次数（正常恒为 0）
         self._cross_pairs = 0
         #: (sid, 展示态 message_id) -> REFIDX，用于「引用回复」
-        self._ref_idx: "OrderedDict[tuple, str]" = OrderedDict()
         self._api_patched: dict = {}
         self._text_originals: dict = {}
         #: 每个适配器实例 → 机器人自己的身份（OpenID / 昵称）
@@ -181,6 +203,7 @@ class QQOfficialGroupBridge(BasePlugin):
         self._ref_miss = 0
         self._quote_miss_logged = False
         self._llm_markup_logged = False
+        self._ref_logged = 0
         self._last_proactive = {}
         #: 仅用于日志观测（今日主动消息条数），不做任何限制——配额由官方判
         self._proactive_day = ""
@@ -534,7 +557,13 @@ class QQOfficialGroupBridge(BasePlugin):
         if self.quote_reply:
             ref = extract_msg_idx(body)
             if ref:
-                self._remember_ref(str(event.session.sid), str(event.message.message_id), ref)
+                sid = str(getattr(event.session, "sid", "") or "")
+                display = str(event.message.message_id or "")
+                self._remember_ref(adapter, sid, display, ref)
+                # 模型有时会回原始 id（框架某些路径渲染的是它）——两个键都记
+                raw_id = str(body.get("id") or "")
+                if raw_id and raw_id != display:
+                    self._remember_ref(adapter, sid, raw_id, ref)
             self._log_ref_diag(body, ref)
 
         # 严格模式（可选，默认关）：全量副本先压住 at_grace 秒，@ 副本随后到达就让位。
@@ -633,14 +662,22 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     _REF_MAX = 1024
 
-    def _remember_ref(self, sid: str, display_id: str, ref_idx: str) -> None:
-        if not sid or not display_id or not ref_idx:
+    def _remember_ref(self, adapter, sid: str, display_id: str, ref_idx: str) -> None:
+        if not display_id or not ref_idx:
             return
-        store = self._ref_idx
-        store[(sid, display_id)] = str(ref_idx)
-        store.move_to_end((sid, display_id))
+        store = ref_store_for(adapter)
+        key = (str(sid or ""), str(display_id))
+        store[key] = str(ref_idx)
+        store.move_to_end(key)
         while len(store) > self._REF_MAX:
             store.popitem(last=False)
+        # 头几条打出来：把「记录时的键」和「查找时的键」放一起对比，一眼看出是否同源
+        if self._ref_logged < 3:
+            self._ref_logged += 1
+            logger.info(
+                "[QQBOT-BRIDGE] 引用索引 +1：键=(%s, %s) ← %s；当前共 %d 条",
+                key[0], key[1], ref_idx, len(store),
+            )
 
     def _quote_ref_for(self, adapter, target_id, chain, is_group):
         """chain 里**显式**带了 Reply 元素时，找出被引用消息的 REFIDX。
@@ -652,23 +689,25 @@ class QQOfficialGroupBridge(BasePlugin):
             sid = f"{adapter.info.name}:{'gm' if is_group else 'dm'}:{target_id}"
         except Exception:
             return None
+        store = ref_store_for(adapter)
         for ele in chain:
             if not isinstance(ele, Reply):
                 continue
             display_id = str(getattr(ele, "message_id", "") or "")
-            ref = self._ref_idx.get((sid, display_id))
+            ref = store.get((sid, display_id))
             if ref:
                 return ref
-            # 兜底：sid 对不上时按展示态 id 全局找（map 有上限，扫描很便宜）
-            for (_, known_id), known_ref in self._ref_idx.items():
+            # 兜底：sid 对不上时按 id 全局找（map 有上限，扫描很便宜）
+            for (_, known_id), known_ref in store.items():
                 if known_id == display_id:
                     return known_ref
             if not self._quote_miss_logged:
                 self._quote_miss_logged = True
+                known = ", ".join(sorted({str(k[1]) for k in store})[:6])
                 logger.warning(
-                    "[QQBOT-BRIDGE] 机器人想引用 %s，但没找到对应的 REFIDX（已知 %d 条）——"
-                    "本条按普通回复发出",
-                    display_id, len(self._ref_idx),
+                    "[QQBOT-BRIDGE] 机器人想引用 %s，但没找到对应的 REFIDX（已知 %d 条：%s）——"
+                    "本条按普通回复发出；如持续如此请把本条连同启动日志一起反馈",
+                    display_id, len(store), known or "无",
                 )
         return None
 
@@ -806,7 +845,7 @@ class QQOfficialGroupBridge(BasePlugin):
                                 display = adapter._display_message_id(str(sent_id))
                                 sid = f"{adapter.info.name}:{'gm' if _is_group else 'dm'}:{target}"
                                 _store.setdefault("adapter", adapter)
-                                self._remember_ref(sid, display, sent_ref)
+                                self._remember_ref(adapter, sid, display, sent_ref)
                 except Exception as exc:
                     logger.debug("[QQBOT-BRIDGE] 记录已发送消息的 ref_idx 失败: %s", exc)
                 return result

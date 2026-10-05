@@ -508,8 +508,9 @@ async def main():
     if evs:
         display = str(evs[0].message.message_id)
         sid = str(evs[0].session.sid)
-        check("插件记住了它的 REFIDX", plugin0._ref_idx.get((sid, display)) == "REFIDX_quoted==",
-              str(dict(plugin0._ref_idx)))
+        check("插件记住了它的 REFIDX",
+          plugin_main.ref_store_for(adapter).get((sid, display)) == "REFIDX_quoted==",
+              str(dict(plugin_main.ref_store_for(adapter))))
         from core.chat.message_elements import Reply as _RealReply, Text as _RealText
         chain = [_RealReply(display), _RealText("引用测试")]
         check("链里有显式 Reply 时能解析出 REFIDX",
@@ -535,8 +536,9 @@ async def main():
     finally:
         plugin_main._QUOTE_REF.reset(token)
     check("机器人自己发的消息也记下了 ref_idx（以后能引用自己发过的消息）",
-          any(k[0].endswith("GRP_OPENID_1") and k[1].startswith("qqo-") for k in plugin0._ref_idx),
-          str(list(plugin0._ref_idx)[:3]))
+          any(k[0].endswith("GRP_OPENID_1") and k[1].startswith("qqo-")
+              for k in plugin_main.ref_store_for(adapter)),
+          str(list(plugin_main.ref_store_for(adapter))[:3]))
 
     sent_calls.clear()
     await client.api.post_group_message(group_openid="GRP_OPENID_1", msg_type=0, content="noquote")
@@ -638,6 +640,15 @@ async def main():
         for ev in await drain(0.15):
             renders.add(chain_repr(ev.message.chain))
     check("★ 同一内容 30 次 → 渲染逐字节一致（不吃掉提示词缓存）", len(renders) == 1, len(renders))
+
+    # ---- 19. 引用索引是「适配器级」共享的：热重载换实例也要能查到 ----
+    from core.chat.message_elements import Reply as _SR, Text as _ST
+    plugin_extra = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)
+    plugin_extra._remember_ref(adapter, "qq:gm:GRP_OPENID_1", "qqo-shared", "REFIDX_shared==")
+    shared_chain = [_SR(message_id="qqo-shared", chain=[_ST("x")]), _ST("reply")]
+    found_shared = plugin0._quote_ref_for(adapter, "GRP_OPENID_1", shared_chain, True)
+    check("★ 实例 A 记录的引用，实例 B 也能查到（适配器级共享，防热重载丢索引）",
+          found_shared == "REFIDX_shared==", found_shared)
 
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)
