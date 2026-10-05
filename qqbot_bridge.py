@@ -385,6 +385,16 @@ def normalize_outgoing_markup(text: str, style: str = "legacy"):
     return fixed, fixed != text
 
 
+def strip_at_markup(text: str) -> str:
+    """把正文里的 @ 标记整个去掉（markdown 发不出去时的兜底）。
+
+    宁可少一个 @，也不要把 `<qqbot-at-user id="…" />` 这种标签原样发到群里。
+    """
+    if not text or ("<@" not in text and "qqbot-at-user" not in text):
+        return text
+    return OUTGOING_AT_MARKUP_RE.sub("", text)
+
+
 def _match_at_id(match) -> str:
     """两种形态取其中之一。"""
     return match.group(1) or match.group(2) or ""

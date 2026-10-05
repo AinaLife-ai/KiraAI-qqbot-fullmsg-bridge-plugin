@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.8
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.9
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -86,6 +86,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `reply_to_self_wakes` | 开 | **有人引用回复机器人的消息 = 被提及**（对齐 KiraAI 的 OneBot 适配器行为） |
 | `quote_reply` | 开 | **机器人也能「引用回复」** —— 官方发送接口支持 `message_reference`，填上就以引用形式展示 |
 | `send_at_mention` | 开 | **机器人发出的 @ 是真 @**（而不是纯文本 `@昵称`） |
+| `at_markdown` | **开** | **含 @ 标记的正文自动改走 markdown 消息**（重要：纯文本消息没有 @ 能力，见下文） |
 | `at_markup_style` | **legacy** | @ 标记形态：`legacy` = `<@openid>`（**默认**，平台自己下发用的那种）/ `new` = `<qqbot-at-user id="…" />`（官方文档推荐，但实测部分环境会被当纯文本原样显示） |
 | `enhance_rich_content` | 开 | **富内容归一化**：语音（含平台免费 ASR）/ 结构化卡片 / QQ 表情标记 → 都能读 |
 | `self_openid` | 空 | 通常留空＝全自动。只有自动识别猜错时才把它钉死 |
@@ -312,8 +313,8 @@ python3 tests/run_tests.py
 |---|---|---|
 | `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
 | `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
-| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **171/171** |
-| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **83/83** |
+| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **173/173** |
+| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **85/85** |
 
 ```bash
 # 冒烟需要真实源码路径（找不到会自动跳过）
@@ -341,6 +342,26 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.1.9</b> — ★ 用 markdown 发 @（揭开「@ 一直显示成文本」的根因）</summary>
+
+**根因**：官方 API 的**纯文本消息（`msg_type=0`）没有 @ 能力** —— 提到标签只在
+**markdown 消息（`msg_type=2`）** 里才会被客户端渲染成真的 @。
+
+依据（两处互相印证）：
+- 官方《文本交互》页：@ 能力"支持含有文本文字的消息类型，如：文本消息、图文消息、**markdown 消息**"；
+- `bunqq-core` 开发文档写得更直白：
+  > 含 `<qqbot-at-user id>` 提及标签 → **强制 md（纯文本无 @ 能力）**
+  > ⚠️ 纯文本消息无法 @，必须走 `replyMarkdown` 或正文含 md 语法触发自动 md
+
+而 KiraAI 的适配器对文本消息发的正是 `{"msg_type": 0, "content": …}` —— 所以标签永远只会被当文本显示。
+
+**修复**：发出的正文里只要带 @ 标记，**本条自动改按 markdown 发送**（`msg_type=2` + `markdown.content`）。
+若该机器人没有 markdown 消息权限导致发送失败 ⇒ **自动退回纯文本并剥掉标记**
+（宁可少一个 @，也不把 `<qqbot-at-user id="…" />` 原样发到群里），并打一条 WARNING 说明原因。
+
+</details>
+
+<details>
 <summary><b>v1.1.8</b> — 旧补丁层会被顶掉（@ 仍不生效的真凶）+ 引用索引适配器级共享</summary>
 
 用户在 v1.1.7 上反馈：日志明确写了「已记录第 1 个 REFIDX」，但真要引用时却报

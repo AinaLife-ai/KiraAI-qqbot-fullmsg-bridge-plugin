@@ -678,6 +678,41 @@ async def main():
           getattr(adapter._text_content, "_kira_bridge_orig", None) is not None, None)
     await plugin_again.terminate()
 
+    # ---- 21. 含 @ 标记的正文必须走 markdown（纯文本没有 @ 能力）----
+    import types
+
+    class _FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        async def post_group_message(self, **kw):
+            self.calls.append(kw)
+            return {"id": "SENT1", "ext_info": {"ref_idx": "REFIDX_sent=="}}
+
+        async def post_c2c_message(self, **kw):
+            self.calls.append(kw)
+            return {"id": "SENT2"}
+
+    fake_api = _FakeApi()
+    plugin_md = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)
+    adapter.client = types.SimpleNamespace(api=fake_api)
+    plugin_md._patch_send_path(adapter, "QQ Official", adapter.client)
+    _at_id = "9CD54739CC9BAA46B93243088802DC72"
+    import asyncio as _aio
+
+    await fake_api.post_group_message(group_openid="G1", msg_type=0,
+                                      content=f"<@{_at_id}>哥ww", msg_id="M1", msg_seq=1)
+    md_call = fake_api.calls[-1]
+    check("★ 含 @ 标记 → 自动改走 markdown（msg_type=2）",
+          md_call.get("msg_type") == 2 and md_call.get("markdown", {}).get("content") == f"<@{_at_id}>哥ww",
+          {k: md_call.get(k) for k in ("msg_type", "content", "markdown")})
+
+    await fake_api.post_group_message(group_openid="G1", msg_type=0, content="普通消息", msg_id="M2", msg_seq=1)
+    plain_call = fake_api.calls[-1]
+    check("不含 @ 的正文不受影响（仍走纯文本）",
+          plain_call.get("msg_type") == 0 and plain_call.get("markdown") is None,
+          {k: plain_call.get(k) for k in ("msg_type", "content")})
+
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)
 

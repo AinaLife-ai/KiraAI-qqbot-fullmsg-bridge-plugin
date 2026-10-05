@@ -743,6 +743,12 @@ def test_at_markup():
     plain, did3 = B.normalize_outgoing_markup("哥ww 香香又到啦", "legacy")
     check("普通文本不动", not did3 and plain == "哥ww 香香又到啦", plain)
 
+    check("兜底：标记会被整段剥掉（宁缺 @ 也不发标签）",
+          B.strip_at_markup("<@9CD54739CC9BAA46B93243088802DC72>哥ww") == "哥ww"
+          and B.strip_at_markup('<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />哥') == "哥",
+          None)
+    check("普通文本不被 strip 影响", B.strip_at_markup("哥ww 香香在哦") == "哥ww 香香在哦", None)
+
     class _BoomClient:
         @property
         def robot(self):
