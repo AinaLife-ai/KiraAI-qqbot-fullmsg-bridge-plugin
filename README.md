@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.1
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -84,6 +84,9 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `resolve_at_markup` | 开 | 把 `<@openid>` 解析成标准 `At` 元素 `[At 昵称(pid)]`（**保留 pid 防改名冒充**）；机器人自己被 @ 时名字带「（你）」并强制唤醒 |
 | `learn_self_openid` | 开 | 自动学出机器人自己的 OpenID（优先 `mentions[].is_you`，兜底用"查不到的 @"反推） |
 | `reply_to_self_wakes` | 开 | **有人引用回复机器人的消息 = 被提及**（对齐 KiraAI 的 OneBot 适配器行为） |
+| `quote_reply` | 开 | **机器人也能「引用回复」** —— 官方发送接口支持 `message_reference`，填上就以引用形式展示 |
+| `send_at_mention` | 开 | **机器人发出的 @ 是真 @** —— 用平台要求的 `<qqbot-at-user id="openid" />` 标记 |
+| `enhance_rich_content` | 开 | **富内容归一化**：语音（含平台免费 ASR）/ 结构化卡片 / QQ 表情标记 → 都能读 |
 | `self_openid` | 空 | 通常留空＝全自动。只有自动识别猜错时才把它钉死 |
 
 ### 主动消息通道（可选，默认关）
@@ -167,6 +170,16 @@ elif m.get("type") == "reply":
 `msg_elements[0].author` 里（`bot: true` + 名字），不用像 OneBot 那样额外发一次 `get_msg`
 去反查。引用别人的消息则**不算**唤醒。
 
+**机器人自己也能引用回复了。** 官方发送接口本来就有这个能力（文档原文：
+`message_reference` —— 「**引用回复。填写后以引用形式展示，关联上下文**」），
+KiraAI 只是没传这个字段。所以不需要任何额外连接，只是多发一个字段：
+
+- 机器人要引用的那条消息 → 用官方要求的 **`REFIDX`**（不是消息 id）：
+  - 别人发的消息：取事件 `message_scene.ext` 里的 `msg_idx`
+  - 机器人自己发的消息：取发送响应 `ext_info.ref_idx`
+- 只有当机器人**主动引用**某条消息（LLM 输出了 `<reply>xxx</reply>`）时才带上 ——
+  否则每条消息都会变成"引用上一条"，那是刷屏。
+
 再说内容解析 —— 这是**原生实现做不到的**。
 
 KiraAI 原生适配器会先把事件包装成 botpy 的 `GroupMessage` 对象，而那个对象**只保留
@@ -186,6 +199,39 @@ KiraAI 原生适配器会先把事件包装成 botpy 的 `GroupMessage` 对象�
 > 那就拿不到引用信息（退化成普通文本）。
 > 没有把 `ref_msg_idx` 塞进 `message_reference` 是**故意的**：那是索引不是消息 id，
 > 塞进去会让"回复它"变得可点击、最终以非法 msg_id 发送失败。
+
+### 机器人 @ 人，也是真 @ 吗？
+
+**是** —— 但要用平台认的标记，纯文本不行。平台发送侧要求的是：
+
+```
+<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />
+```
+
+KiraAI 原实现只拼了个纯文本 `@{element.nickname or element.pid}`，所以群里看到的是
+**一串 openid 文本**（用户实测："@9CD54739CC9BAA46B93243088802DC72哥ww"）。
+
+> 参考实现：AstrBot 的 qqofficial 发送路径就是
+> `plain_text += f'<qqbot-at-user id="{mention_id}" />'`。
+
+插件在 `_text_content` 上做了一层很薄的包装：**只接管 `At` 元素**（换成等价的 `Text`），
+其余元素原样交给框架的实现 —— 这样框架以后新增元素类型也不会漏处理。
+`pid="all"` 时退化成文本（平台不支持 @全体）。
+
+### 收到的富内容，也都变成能读的东西
+
+官方 bot 的 payload 里有几种形态，KiraAI 的 `_content_elements()` **都不认识**，
+到了 LLM 那里要么变成一串乱码、要么直接变成 `[Unsupported message]`：
+
+| 形态 | 原生结果 | 归一化后 |
+|---|---|---|
+| **语音**（`content_type: "voice"`） | ⚠️ `voice` 不是 mime，框架判不出是音频 → 当成 **File** | ✅ 识别成音频；**有平台自带的 ASR 就直接用文字** |
+| **结构化卡片**（`message_type=3` + `ark_data`） | ❌ `[Unsupported message]`，LLM 完全不知道对方发了什么 | ✅ `[卡片: 图文卡片 - 标题 - 描述]` |
+| **QQ 表情标记** `<faceType=6, faceId="0", ext="<base64>">` | ❌ 一串 base64 乱码 | ✅ `[表情: 微笑]`（解码 `ext` 里的 JSON） |
+
+**语音那条特别值**：官方语音附件里带 `asr_refer_text` —— 腾讯自己做的免费语音识别。
+有它就**直接用文字**（省掉本地 STT 的时间与 token），没有才把 url 换成 `voice_wav_url`
+（WAV 更好转写）交给框架。
 
 ### 同一条消息会不会来两次？
 
@@ -261,8 +307,8 @@ python3 tests/run_tests.py
 |---|---|---|
 | `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
 | `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
-| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@ 富文本/@他人/引用/被引用唤醒/自我识别（含防冒充）**、去重、边界、能力降级、性能与内存、**可逆性** | **142/142** |
-| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用解析与引用唤醒**、跨事件重复观测 | **62/62** |
+| `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **162/162** |
+| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **75/75** |
 
 ```bash
 # 冒烟需要真实源码路径（找不到会自动跳过）
@@ -283,6 +329,55 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.1.4</b> — 富内容归一化（语音 / 卡片 / 表情）</summary>
+
+- **语音**：官方 `content_type` 写的是 `voice`（不是 mime），框架会误判成 File；
+  现在归一化成音频，并且**优先用平台自带的免费 ASR**（`asr_refer_text`）——
+  有它就直接拿文字，不再跑本地 STT
+- **结构化卡片**（`message_type=3` + `ark_data`）：原来 LLM 只看到 `[Unsupported message]`，
+  现在渲染成 `[卡片: 名称 - 标题 - 描述]`
+- **QQ 表情标记** `<faceType=.., faceId=.., ext="base64">`：解码 `ext` 里的 JSON，
+  渲染成 `[表情: 微笑]`（解码失败退化成 `[表情]`，不会崩）
+
+</details>
+
+<details>
+<summary><b>v1.1.3</b> — 机器人 @ 人也是真 @</summary>
+
+- 平台发送侧要求 `<qqbot-at-user id="openid" />` 才会渲染成真正的提及；
+  KiraAI 原实现只拼了纯文本 `@昵称`，群里显示的是一串 openid 文本（用户实测）
+- 插件只接管 `At` 元素（换成等价 `Text`），其余元素原样交给框架实现
+- 收到的事件里两种 @ 形态（`<@openid>` 与 `<qqbot-at-user id="..." />`）**都能解析**
+- `pid="all"` 退化成文本（平台不支持 @全体）
+
+</details>
+
+<details>
+<summary><b>v1.1.2</b> — 引用回复（收发双向）</summary>
+
+**机器人也能「引用回复」**
+- 官方发送接口支持 `message_reference`（文档："引用回复。填写后以引用形式展示，关联上下文"），
+  KiraAI 只是没传这个字段 —— 补上即可，**不需要任何额外连接**
+- 用官方要求的 `REFIDX`（不是消息 id）：别人发的取事件 `message_scene.ext.msg_idx`，
+  机器人自己发的取发送响应 `ext_info.ref_idx`
+- 只在机器人**主动引用**时才带（否则每条都会变成引用上一条）
+
+**被引用回复 = 被提及（对齐 OneBot）**
+- 有人引用机器人的消息时唤醒它 —— 与 KiraAI 的 QQ(OneBot) 适配器一致
+  （那边遇到 `reply` 段会反查被引用消息的作者是不是自己）
+- QQ 官方这边不用额外请求：被引用消息的作者就在 `msg_elements[0].author` 里
+- 引用**别人**的消息不算唤醒；引用内容里的 @ 也不算（历史内容）
+
+**修复：热重载后仍跑旧代码**
+- 插件重载时，旧实例留在 client 上的 handler 会被新实例**接替**（之前会一直用旧的，
+  导致"代码更新了但行为没变"）
+
+**可观测**
+- 启动日志带上版本号与各项开关状态，一眼看出跑的是哪一版
+
+</details>
+
+<details>
 <summary><b>v1.1.1</b> — 认得出「机器人自己被 @」</summary>
 
 **@ 富文本解析（KiraAI 标准格式）**
@@ -298,6 +393,8 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
   引用内容里的 @ 也拆 `At`，但**不算"现在在叫我"**（历史消息不触发误唤醒）
 - **「被引用回复」= 被提及**：有人引用机器人的消息时唤醒它（`reply_to_self_wakes`，
   对齐 KiraAI 的 OneBot 适配器 —— 那边遇到 `reply` 段会反查作者是不是自己）
+- **机器人也能引用回复**（`quote_reply`）：自动带上官方要求的 `REFIDX`
+  （`message_scene.ext.msg_idx` / 发送响应 `ext_info.ref_idx`），消息以引用形式展示
 
 **认出「自己」**
 - 三级识别：`mentions[].is_you` → `bot=true` 且昵称与机器人名字一致 → 兜底反推

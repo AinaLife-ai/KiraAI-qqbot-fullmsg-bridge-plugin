@@ -33,8 +33,10 @@ import asyncio
 import importlib
 import json
 import os
+import contextvars
 import sys
 import time
+from collections import OrderedDict
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
@@ -48,7 +50,7 @@ if "qqbot_bridge" in sys.modules:
 
 from core.plugin import BasePlugin, logger
 from core.chat import Group, User
-from core.chat.message_elements import At, File, Image, Text
+from core.chat.message_elements import At, File, Image, Reply, Text
 from core.chat.message_utils import KiraIMMessage, KiraMessageEvent, KiraIMSentResult
 
 from qqbot_bridge import (
@@ -68,7 +70,10 @@ from qqbot_bridge import (
     dedup_key,
     detach_client_handler,
     drop_live_parser,
+    at_user_markup,
     collect_self_identity,
+    extract_msg_idx,
+    extract_sent_ref_idx,
     inject_live_parser,
     install_class_parser,
     normalize_body,
@@ -77,6 +82,19 @@ from qqbot_bridge import (
 )
 
 _SELF_PLUGIN_ID = "qqbot-fullmsg-bridge"
+
+#: 这一次发送要引用哪条消息（REFIDX）。用 contextvar 传给 api 层的包装函数，
+#: 避免为了注入 message_reference 去复制一遍适配器的发送逻辑。
+_QUOTE_REF: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "qqbot_bridge_quote_ref", default=None)
+
+
+def _plugin_version() -> str:
+    try:
+        with open(os.path.join(_PLUGIN_DIR, "manifest.json"), encoding="utf-8") as fh:
+            return str(json.load(fh).get("version") or "?")
+    except Exception:
+        return "?"
 
 #: 15s 巡检：插件与适配器的启动顺序不确定，客户端重建要重新挂载，配置变更要能还原。
 #: 每次巡检只是幂等的 dict/getattr 操作，成本可忽略。
@@ -122,6 +140,9 @@ class QQOfficialGroupBridge(BasePlugin):
         self.resolve_at = bool(basic.get("resolve_at_markup", True))
         self.learn_self_openid = bool(basic.get("learn_self_openid", True))
         self.reply_to_self_wakes = bool(basic.get("reply_to_self_wakes", True))
+        self.quote_reply = bool(basic.get("quote_reply", True))
+        self.send_at_mention = bool(basic.get("send_at_mention", True))
+        self.enhance_rich = bool(basic.get("enhance_rich_content", True))
         self.pinned_self_openid = str(basic.get("self_openid", "") or "").strip()
 
         proactive = cfg.get("section_proactive", {}) or {}
@@ -145,10 +166,15 @@ class QQOfficialGroupBridge(BasePlugin):
         self._handled = 0
         #: 观测计数：同一条消息同时以「全量+@」两种事件到达的次数（正常恒为 0）
         self._cross_pairs = 0
+        #: (sid, 展示态 message_id) -> REFIDX，用于「引用回复」
+        self._ref_idx: "OrderedDict[tuple, str]" = OrderedDict()
+        self._api_patched: dict = {}
+        self._text_originals: dict = {}
         #: 每个适配器实例 → 机器人自己的身份（OpenID / 昵称）
         self._self_ident = {}
         self._self_logged = set()
         self._at_sample_logged = False
+        self._rich_logged = set()
         self._last_proactive = {}
         #: 仅用于日志观测（今日主动消息条数），不做任何限制——配额由官方判
         self._proactive_day = ""
@@ -164,10 +190,13 @@ class QQOfficialGroupBridge(BasePlugin):
         await self._tick(report=True)
         if self.enabled:
             logger.info(
-                "[QQBOT-BRIDGE] 已启动：全量群消息=开；统一@消息=%s；统一单聊=%s；@事件等待窗口=%.1fs（0=默认不等待）；主动消息通道=%s",
+                "[QQBOT-BRIDGE] v%s 已启动：全量群消息=开；统一@消息=%s；统一单聊=%s；"
+                "@事件等待窗口=%.1fs（0=默认不等待）；引用回复=%s；主动消息通道=%s",
+                _plugin_version(),
                 "开" if self.unify_at else "关",
                 "开" if self.unify_dm else "关",
                 self.at_grace,
+                "开" if self.quote_reply else "关",
                 "开" if self.proactive_enabled else "关",
             )
         else:
@@ -304,6 +333,16 @@ class QQOfficialGroupBridge(BasePlugin):
             if original is not None:
                 adapter._send_message = original
                 changed.append(f"{name}._send_message")
+            text_orig = self._text_originals.pop(name, None)
+            if text_orig is not None:
+                adapter._text_content = text_orig
+                changed.append(f"{name}._text_content")
+            for api, method_name, orig in self._api_patched.pop(name, []):
+                try:
+                    setattr(api, method_name, orig)
+                    changed.append(f"{name}.api.{method_name}")
+                except Exception:
+                    pass
         if changed and not self._restore_reported:
             self._restore_reported = True
             logger.info("[QQBOT-BRIDGE] 已还原 %d 处补丁：%s", len(changed), ", ".join(changed[:6]))
@@ -377,7 +416,7 @@ class QQOfficialGroupBridge(BasePlugin):
             # 顺序很重要：先挂处理器，再强制替换解析器。
             res = attach_client_handler(
                 client, attr, self._make_handler(adapter, name, kind, is_group),
-                allow_shadow=allow_shadow,
+                allow_shadow=allow_shadow, owner=self,
             )
             if res == "attached":
                 newly_attached.append(attr)
@@ -408,8 +447,8 @@ class QQOfficialGroupBridge(BasePlugin):
                 " + @消息" if self.unify_at else "",
                 " + 单聊" if self.unify_dm else "",
             )
-        if self.proactive_enabled:
-            self._patch_send(adapter, name)
+        if self.proactive_enabled or self.quote_reply or self.send_at_mention:
+            self._patch_send_path(adapter, name, client)
 
     # ------------------------------------------------------------------ #
     # 事件 -> KiraAI
@@ -428,6 +467,7 @@ class QQOfficialGroupBridge(BasePlugin):
             return
         body = normalize_body(payload) or {}
         raw_content = body.get("content")
+        rich_notes: list = []
         ident = self._self_identity(adapter, name)
         key = dedup_key(body, is_group)
 
@@ -464,6 +504,8 @@ class QQOfficialGroupBridge(BasePlugin):
                 resolve_at=self.resolve_at,
                 learn_self=self.learn_self_openid,
                 reply_to_self_wakes=self.reply_to_self_wakes,
+                enhance_rich=self.enhance_rich,
+                notes=rich_notes,
                 At=At,
                 Text=Text,
             )
@@ -478,6 +520,14 @@ class QQOfficialGroupBridge(BasePlugin):
 
         self._log_self_learned(name, ident)
         self._log_at_sample_once(raw_content, body, ident, event)
+        for note in rich_notes:
+            if note not in self._rich_logged:
+                self._rich_logged.add(note)
+                logger.info("[QQBOT-BRIDGE] 富内容归一化首次生效: %s", note)
+        if self.quote_reply:
+            ref = extract_msg_idx(body)
+            if ref:
+                self._remember_ref(str(event.session.sid), str(event.message.message_id), ref)
 
         # 严格模式（可选，默认关）：全量副本先压住 at_grace 秒，@ 副本随后到达就让位。
         # 代价是每条群消息都晚 at_grace 秒，所以默认 0 不启用。
@@ -570,7 +620,36 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     # 可选：主动消息通道（官方 bot 无被动窗口时兜底）
     # ------------------------------------------------------------------ #
-    def _patch_send(self, adapter, name: str):
+    # ------------------------------------------------------------------ #
+    # 发送链路：① 引用回复（message_reference）② 主动消息兜底
+    # ------------------------------------------------------------------ #
+    _REF_MAX = 1024
+
+    def _remember_ref(self, sid: str, display_id: str, ref_idx: str) -> None:
+        if not sid or not display_id or not ref_idx:
+            return
+        store = self._ref_idx
+        store[(sid, display_id)] = str(ref_idx)
+        store.move_to_end((sid, display_id))
+        while len(store) > self._REF_MAX:
+            store.popitem(last=False)
+
+    def _quote_ref_for(self, adapter, target_id, chain, is_group):
+        """chain 里**显式**带了 Reply 元素时，找出被引用消息的 REFIDX。
+
+        只认显式引用：否则 KiraAI 会把"最后收到的消息"当作回复目标，
+        我们若跟着发 message_reference，机器人每条消息都会变成引用上一条 —— 那是刷屏。
+        """
+        try:
+            sid = f"{adapter.info.name}:{'gm' if is_group else 'dm'}:{target_id}"
+        except Exception:
+            return None
+        for ele in chain:
+            if isinstance(ele, Reply):
+                return self._ref_idx.get((sid, str(getattr(ele, "message_id", "") or "")))
+        return None
+
+    def _patch_send_path(self, adapter, name: str, client) -> None:
         if name in self._patched_sends:
             return
         original = getattr(adapter, "_send_message", None)
@@ -578,21 +657,100 @@ class QQOfficialGroupBridge(BasePlugin):
             return
 
         async def _send_message(target_id, send_message_obj, is_group):
-            result = await original(target_id, send_message_obj, is_group)
-            ok = bool(getattr(result, "ok", True))
-            err = str(getattr(result, "err", "") or "")
-            if ok or "needs a received message" not in err:
+            ref = self._quote_ref_for(adapter, target_id, send_message_obj, is_group) \
+                if self.quote_reply else None
+            token = _QUOTE_REF.set(ref)
+            try:
+                result = await original(target_id, send_message_obj, is_group)
+            finally:
+                _QUOTE_REF.reset(token)
+            if result is not None and bool(getattr(result, "ok", True)):
                 return result
-            return await self._proactive_send(adapter, str(target_id), send_message_obj, is_group)
+            err = str(getattr(result, "err", "") or "")
+            if self.proactive_enabled and "needs a received message" in err:
+                return await self._proactive_send(adapter, str(target_id), send_message_obj, is_group)
+            return result
 
         adapter._send_message = _send_message
         self._patched_sends[name] = original
-        logger.info(
-            "[QQBOT-BRIDGE] %s: 主动消息通道已启用（最小间隔 %.0fs（0=不限速）；"
-            "配额交给官方判，本地不设上限）",
-            name, self.proactive_min_interval,
-        )
+        if self.send_at_mention:
+            self._patch_text_content(adapter)
+        if self.quote_reply:
+            self._patch_api_quote(adapter, name, client)
 
+    def _patch_text_content(self, adapter) -> None:
+        """把发出的 @ 渲染成平台认的标记（`<qqbot-at-user id="..." />`）。
+
+        KiraAI 原实现是 ``f"@{element.nickname or element.pid}"`` —— 那只是**纯文本**，
+        QQ 不会渲染成真正的提及（用户实测：机器人 @ 人，群里显示的是一串 openid 文本）。
+        平台发送侧要的是富文本标记，参考 AstrBot 的同一段实现。
+
+        做法上只接管 At 元素：把它换成等价的 Text，其余元素原样交给原实现，
+        这样框架以后新增元素类型也不会漏处理。
+        """
+        original = getattr(adapter, "_text_content", None)
+        if not callable(original) or getattr(original, "_kira_bridge_at", False):
+            return
+
+        def _text_content(send_message_obj):
+            rewritten = []
+            for element in send_message_obj:
+                if isinstance(element, At):
+                    pid = str(getattr(element, "pid", "") or "")
+                    if pid and pid != "all" and pid.isalnum():
+                        rewritten.append(Text(at_user_markup(pid)))
+                    else:
+                        name = getattr(element, "nickname", None) or pid or "全体成员"
+                        rewritten.append(Text("@" + name))
+                else:
+                    rewritten.append(element)
+            return original(rewritten)
+
+        _text_content._kira_bridge_at = True
+        adapter._text_content = _text_content
+        self._text_originals[getattr(adapter.info, "name", "?")] = original
+
+    def _patch_api_quote(self, adapter, name: str, client) -> None:
+        """在 botpy 的发送接口上注入 message_reference。
+
+        botpy 的 ``post_group_message``/``post_c2c_message`` 用 ``payload = locals()``
+        组装请求体，所以只要多传一个 ``message_reference`` 关键字参数，它就会进 JSON —— 
+        不用去复制一遍适配器的发送逻辑。
+        """
+        api = getattr(client, "api", None)
+        if api is None:
+            return
+        patched = self._api_patched.setdefault(name, [])
+        for method_name, is_group in (("post_group_message", True), ("post_c2c_message", False)):
+            orig = getattr(api, method_name, None)
+            if not callable(orig) or getattr(orig, "_kira_bridge_quote", False):
+                continue
+            store = {}
+
+            async def _patched(*args, _orig=orig, _is_group=is_group, _store=store, **kwargs):
+                ref = _QUOTE_REF.get()
+                if ref and not kwargs.get("message_reference"):
+                    kwargs["message_reference"] = {"message_id": ref}
+                result = await _orig(*args, **kwargs)
+                try:
+                    sent_ref = extract_sent_ref_idx(result)
+                    if sent_ref:
+                        # 记住"机器人自己发的这条"的 ref_idx，以后才能引用它
+                        target = kwargs.get("group_openid") if _is_group else kwargs.get("openid")
+                        if target:
+                            sent_id = result.get("id") if isinstance(result, dict) else None
+                            if sent_id:
+                                display = adapter._display_message_id(str(sent_id))
+                                sid = f"{adapter.info.name}:{'gm' if _is_group else 'dm'}:{target}"
+                                _store.setdefault("adapter", adapter)
+                                self._remember_ref(sid, display, sent_ref)
+                except Exception as exc:
+                    logger.debug("[QQBOT-BRIDGE] 记录已发送消息的 ref_idx 失败: %s", exc)
+                return result
+
+            _patched._kira_bridge_quote = True
+            setattr(api, method_name, _patched)
+            patched.append((api, method_name, orig))
     async def _proactive_send(self, adapter, target_id, send_message_obj, is_group):
         client = adapter.get_client()
         if client is None:

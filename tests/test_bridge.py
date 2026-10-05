@@ -604,6 +604,90 @@ def test_at_markup():
     adapter, (event, src) = _build(payload2, self_identity=B.SelfIdentity(openid=BOTID, name="香里"))
     check("引用别人的消息不唤醒", event.message.is_mentioned is False, src)
 
+    # ---- message_scene.ext 的 msg_idx（引用回复要用它） ----
+    scene_body = {"message_scene": {"source": "default",
+                                    "ext": ["msg_idx=REFIDX_abc==", "auth_token=x",
+                                            "ref_msg_idx=REFIDX_old=="]}}
+    check("取出本条消息的 msg_idx", B.extract_msg_idx(scene_body) == "REFIDX_abc==")
+    check("取出被引用消息的 ref_msg_idx", B.extract_ref_msg_idx(scene_body) == "REFIDX_old==")
+    check("没有 message_scene 时返回 None", B.extract_msg_idx({"content": "x"}) is None)
+    check("ext 形状异常时不崩", B.extract_msg_idx({"message_scene": {"ext": "坏"}}) is None)
+    check("从发消息响应里取 ext_info.ref_idx",
+          B.extract_sent_ref_idx({"id": "R1", "ext_info": {"ref_idx": "REFIDX_s=="}}) == "REFIDX_s==")
+    check("响应没有 ext_info 时返回 None", B.extract_sent_ref_idx({"id": "R1"}) is None)
+
+    # ---- 热重载：旧实例留下的 handler 必须被新实例接替 ----
+    class _FakeClient:
+        pass
+
+    holder = _FakeClient()
+
+    async def _h1(payload):
+        pass
+
+    async def _h2(payload):
+        pass
+
+    owner_a, owner_b = object(), object()
+    check("首次挂载 -> attached",
+          B.attach_client_handler(holder, "on_x", _h1, allow_shadow=True, owner=owner_a) == "attached")
+    check("同一实例重复挂载 -> already（幂等）",
+          B.attach_client_handler(holder, "on_x", _h1, allow_shadow=True, owner=owner_a) == "already")
+    check("★ 换了插件实例（热重载）-> 接替挂载，不跑旧代码",
+          B.attach_client_handler(holder, "on_x", _h2, allow_shadow=True, owner=owner_b) == "attached")
+    check("接替后挂的是新 handler", holder.on_x is _h2)
+
+    # ---- 发出的 @：平台标记（不是纯文本） ----
+    check("构造平台认的 @ 标记",
+          B.at_user_markup("9CD54739CC9BAA46B93243088802DC72")
+          == '<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />')
+    check("两种 @ 形态都能抓取",
+          B.extract_at_ids('<@0A0B9F323E6AA18BF08B6901A3B2DEFC>') == ["0A0B9F323E6AA18BF08B6901A3B2DEFC"]
+          and B.extract_at_ids('<qqbot-at-user id="0A0B9F323E6AA18BF08B6901A3B2DEFC" />')
+          == ["0A0B9F323E6AA18BF08B6901A3B2DEFC"])
+    chain2, hit2, _ = B.split_at_markup(
+        [StubText('<qqbot-at-user id="AAAABBBBCCCCDDDD" /> 妹')], {},
+        B.SelfIdentity(openid="AAAABBBBCCCCDDDD", name="香里"), At=StubAt, Text=StubText)
+    check("发送侧形态的 @ 也能拆成 At",
+          isinstance(chain2[0], StubAt) and chain2[0].pid == "AAAABBBBCCCCDDDD" and hit2 is True,
+          chain_repr(chain2))
+
+    # ---- 富内容归一化：语音 / 卡片 / 表情 ----
+    import base64 as _b64
+    voice = {"content": "", "attachments": [
+        {"content_type": "voice", "url": "http://x/a.silk", "voice_wav_url": "http://x/a.wav"}]}
+    nb, notes = B.normalize_rich_body(voice)
+    check("语音归一化成音频（否则框架会判成 File）",
+          notes == ["voice-as-audio"] and nb["attachments"][0]["content_type"] == "audio/wav"
+          and nb["attachments"][0]["url"] == "http://x/a.wav", str(notes))
+    voice_asr = {"content": "", "attachments": [
+        {"content_type": "voice", "asr_refer_text": "今天天气不错"}]}
+    nb2, n2 = B.normalize_rich_body(voice_asr)
+    check("语音带平台 ASR → 直接用文字、不再跑本地 STT",
+          n2 == ["voice-asr"] and nb2["content"] == "[语音: 今天天气不错]" and nb2["attachments"] == [],
+          f"{n2}/{nb2}")
+    card = {"content": "", "message_type": 3,
+            "ark_data": {"ark_name": "图文卡片", "fields": {"title": "某个帖子", "desc": "看看"}}}
+    nb3, n3 = B.normalize_rich_body(card)
+    check("结构化卡片渲染成可读文本",
+          n3 == ["ark-card"] and "图文卡片" in nb3["content"] and "某个帖子" in nb3["content"], str(nb3))
+    ext = _b64.b64encode(json.dumps({"text": "微笑"}).encode()).decode()
+    nb4, n4 = B.normalize_rich_body({"content": f'<faceType=6, faceId="0", ext="{ext}"> 你好'})
+    check("表情标记解码成可读文字", n4 == ["face-markup"] and nb4["content"] == "[表情: 微笑] 你好", str(nb4))
+    nb5, n5 = B.normalize_rich_body({"content": '<faceType=1, faceId="0", ext="坏数据">'})
+    check("表情解码失败时退化成 [表情]（不崩）", "[表情]" in nb5["content"], str(nb5))
+    check("关掉开关时原样返回", B.normalize_rich_body(voice, enhance=False)[1] == [])
+    nb6, n6 = B.normalize_rich_body({
+        "message_type": "脏数据", "content": '<faceType=1, faceId="0", ext="x">',
+        "attachments": [{"content_type": "voice", "asr_refer_text": "你好"}]})
+    check("message_type 是脏数据时不连累其它归一化",
+          set(n6) == {"voice-asr", "face-markup"}, str(n6))
+
+    adapter, (event, _) = _build(gm_payload(content="", message_type=3,
+                                            ark_data={"ark_name": "位置", "fields": {"title": "某地"}}))
+    check("build_event：卡片进了消息链", "卡片" in chain_repr(event.message.chain),
+          chain_repr(event.message.chain))
+
     class _BoomClient:
         @property
         def robot(self):

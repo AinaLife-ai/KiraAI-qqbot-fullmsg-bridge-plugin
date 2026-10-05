@@ -151,7 +151,8 @@ def client_has_native_handler(client: Any, attr_name: str) -> bool:
 
 
 def attach_client_handler(
-    client: Any, attr_name: str, handler: Callable[..., Any], allow_shadow: bool = False
+    client: Any, attr_name: str, handler: Callable[..., Any],
+    allow_shadow: bool = False, owner: Any = None,
 ) -> str:
     """Bind an async handler as an **instance** attribute.
 
@@ -164,8 +165,12 @@ def attach_client_handler(
         return "native"
     current = getattr(client, attr_name, None)
     if getattr(current, _MARK, False):
-        return "already"
+        # ⚠ 热重载：旧插件实例留下的 handler 必须被新实例**接替**，否则跑的还是旧代码。
+        # 同一个实例重复挂载则直接跳过（幂等）。
+        if getattr(current, "_kira_bridge_owner", None) == (id(owner) if owner is not None else None):
+            return "already"
     setattr(handler, _MARK, True)
+    setattr(handler, "_kira_bridge_owner", id(owner) if owner is not None else None)
     setattr(client, attr_name, handler)
     return "attached"
 
@@ -332,8 +337,26 @@ class IdentityStore:
 #      更硬的一条唤醒证据，不依赖平台给不给 is_you。
 # --------------------------------------------------------------------------- #
 
-#: QQ 富文本 @ 标记：<@32位hex>（放宽到 8 位以上的字母数字，兼容其它形态）
-AT_MARKUP_RE = re.compile(r"<@([0-9A-Za-z]{8,})>")
+#: QQ 富文本 @ 标记。收到的事件里可能是 `<@openid>`，也可能是
+#: `<qqbot-at-user id="openid" />`（后者是平台发送侧用的规范形式），两种都认。
+AT_MARKUP_RE = re.compile(
+    r'<@([0-9A-Za-z]{8,})>|<qqbot-at-user\s+id="([0-9A-Za-z]{8,})"\s*/?>'
+)
+
+
+def at_user_markup(pid) -> str:
+    """发送侧 @ 某人的标记 —— 平台的富文本格式，客户端会渲染成**真正的 @**。
+
+    对齐参考：AstrBot 的 qqofficial 发送路径就是
+    ``plain_text += f'<qqbot-at-user id="{mention_id}" />'``。
+    只拼 ``@昵称``/``@openid`` 是纯文本，QQ 不会渲染成提及（用户实测反馈）。
+    """
+    return '<qqbot-at-user id="%s" />' % pid
+
+
+def _match_at_id(match) -> str:
+    """两种形态取其中之一。"""
+    return match.group(1) or match.group(2) or ""
 
 
 class SelfIdentity:
@@ -348,10 +371,10 @@ class SelfIdentity:
 
 
 def extract_at_ids(text) -> list:
-    """抓出 content 里所有 <@openid> 的 openid。"""
-    if not isinstance(text, str) or "@" not in text:
+    """抓出 content 里所有 @ 标记的 openid（两种形态都算）。"""
+    if not isinstance(text, str) or ("<@" not in text and "qqbot-at-user" not in text):
         return []
-    return AT_MARKUP_RE.findall(text)
+    return [oid for oid in (_match_at_id(m) for m in AT_MARKUP_RE.finditer(text)) if oid]
 
 
 def mention_name_map(body: dict) -> dict:
@@ -413,6 +436,184 @@ def quoted_author_is_self(body: dict, self_identity=None):
     return False, None
 
 
+def _scene_ext_value(body: dict, key: str):
+    """从 ``message_scene.ext`` 里取 ``key=value`` 形式的扩展字段。"""
+    scene = body.get("message_scene")
+    if not isinstance(scene, dict):
+        return None
+    ext = scene.get("ext")
+    if not isinstance(ext, list):
+        return None
+    prefix = key + "="
+    for item in ext:
+        if isinstance(item, str) and item.startswith(prefix):
+            value = item[len(prefix):]
+            return value or None
+    return None
+
+
+def extract_msg_idx(body: dict):
+    """本条消息的 ``msg_idx`` —— 也就是"引用回复它"时该填的 REFIDX。"""
+    return _scene_ext_value(body, "msg_idx")
+
+
+def extract_ref_msg_idx(body: dict):
+    """被引用消息的 ``ref_msg_idx``（引用消息里指向它引用的那条）。"""
+    return _scene_ext_value(body, "ref_msg_idx")
+
+
+def extract_sent_ref_idx(result) -> Optional[str]:
+    """从发消息的响应里取 ``ext_info.ref_idx`` —— 引用"机器人自己发过的消息"要用它。"""
+    if not isinstance(result, dict):
+        result = getattr(result, "__dict__", None) or {}
+    ext = result.get("ext_info") if isinstance(result, dict) else None
+    if isinstance(ext, dict):
+        ref = ext.get("ref_idx")
+        return str(ref) if ref else None
+    return None
+
+
+#: 语音附件在官方 payload 里的 content_type（不是 mime，框架会误判成 File）
+VOICE_CONTENT_TYPES = {"voice", "silk", "audio/silk", "amr", "audio/amr"}
+
+#: 内容里的 QQ 表情标记：<faceType=6, faceId="0", ext="<base64 JSON>">
+FACE_MARKUP_RE = re.compile(r'<faceType=\d+,\s*faceId="[^"]*",\s*ext="([^"]*)"\s*>')
+
+#: 解码出来的表情描述最长保留多少字
+_FACE_TEXT_MAX = 40
+
+
+def _decode_face_ext(ext: str):
+    """表情标记里的 ext 是 base64(JSON)，里面带可读描述（键名通常是 text）。"""
+    if not ext:
+        return None
+    try:
+        import base64 as _b64
+
+        raw = _b64.b64decode(ext + "=" * (-len(ext) % 4))
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("text", "desc", "description", "prompt", "summary", "name", "title"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:_FACE_TEXT_MAX]
+    return None
+
+
+def render_ark_card(body: dict):
+    """把结构化卡片（message_type=3 + ark_data）渲染成一行可读文本。
+
+    框架的 ``_content_elements`` 只认 content/attachments，卡片会被丢成
+    "[Unsupported message]" —— LLM 完全不知道对方发了什么。
+    """
+    ark = body.get("ark_data")
+    if not isinstance(ark, dict):
+        return None
+    fields = ark.get("fields") if isinstance(ark.get("fields"), dict) else {}
+
+    def _pick(*keys):
+        for source in (ark, fields):
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+
+    kind = _pick("ark_name", "ark_type") or "卡片"
+    title = _pick("title") or ""
+    desc = _pick("desc", "prompt") or ""
+    detail = " - ".join(x for x in (title, desc) if x)
+    return f"[卡片: {kind}{' - ' + detail if detail else ''}]"
+
+
+def normalize_rich_body(body: dict, enhance: bool = True):
+    """把官方 bot 特有的、框架不认识的几种形态转成框架能读的样子。
+
+    ① **语音**：官方把 ``content_type`` 写成 ``voice``（不是 mime），框架会判成 File。
+       有平台自带的 ``asr_refer_text``（腾讯免费 ASR）时直接用它当文本，不再跑本地 STT；
+       没有时把附属信息归一化成音频，并用 ``voice_wav_url`` 替换 url（WAV 更好转写）。
+    ② **结构化卡片**（``message_type=3``）：渲染成 ``[卡片: ...]`` 文本。
+    ③ **QQ 表情标记** ``<faceType=.., faceId=.., ext="base64">``：解码 ext，渲染成 ``[表情: xxx]``。
+
+    返回 ``(新 body, 变更说明列表)``；没有任何改动时原样返回。绝不抛异常。
+    """
+    if not enhance or not isinstance(body, dict):
+        return body, []
+    notes = []
+    new = body
+
+    try:
+        # ① 语音
+        attachments = body.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            kept, extra_text, changed = [], [], False
+            for att in attachments:
+                if not isinstance(att, dict):
+                    kept.append(att)
+                    continue
+                ct = str(att.get("content_type") or "").lower()
+                if ct in VOICE_CONTENT_TYPES:
+                    changed = True
+                    asr = att.get("asr_refer_text")
+                    if isinstance(asr, str) and asr.strip():
+                        # 平台已经给了识别结果 → 用它当文本，跳过本地 STT
+                        extra_text.append(f"[语音: {asr.strip()}]")
+                        notes.append("voice-asr")
+                        continue
+                    att = dict(att)
+                    wav = att.get("voice_wav_url")
+                    if isinstance(wav, str) and wav:
+                        att["url"] = wav
+                        att["content_type"] = "audio/wav"
+                    else:
+                        att["content_type"] = "audio/silk"
+                    notes.append("voice-as-audio")
+                kept.append(att)
+            if changed:
+                new = dict(new)
+                new["attachments"] = kept
+                if extra_text:
+                    new["content"] = (str(new.get("content") or "") + "".join(extra_text)).strip()
+
+        # ② 结构化卡片
+        try:
+            _mtype = int(body.get("message_type") or 0)
+        except (TypeError, ValueError):
+            _mtype = 0
+        if _mtype == 3 or isinstance(body.get("ark_data"), dict):
+            card = render_ark_card(body)
+            if card:
+                content = str(new.get("content") or "")
+                if card not in content:
+                    new = dict(new)
+                    new["content"] = (content + " " + card).strip()
+                    notes.append("ark-card")
+
+        # ③ 表情标记
+        content = new.get("content")
+        if isinstance(content, str) and "faceType=" in content:
+            replaced = 0
+
+            def _sub(match):
+                nonlocal replaced
+                text = _decode_face_ext(match.group(1))
+                replaced += 1
+                return f"[表情: {text}]" if text else "[表情]"
+
+            new_content = FACE_MARKUP_RE.sub(_sub, content)
+            if replaced and new_content != content:
+                new = dict(new)
+                new["content"] = new_content
+                notes.append("face-markup")
+    except Exception:
+        return body, []
+
+    return new, notes
+
+
 def looks_like_quote(body: dict) -> bool:
     """这条消息是不是一条「引用回复」。
 
@@ -471,12 +672,14 @@ def split_at_markup(chain, body, self_identity=None, learn_self=True, At=None, T
                 pass
 
         text = getattr(ele, "text", None)
-        if not isinstance(text, str) or "<@" not in text:
+        if not isinstance(text, str) or ("<@" not in text and "qqbot-at-user" not in text):
             out.append(ele)
             continue
         pos = 0
         for match in AT_MARKUP_RE.finditer(text):
-            oid = match.group(1)
+            oid = _match_at_id(match)
+            if not oid:
+                continue
             # 兜底学习：内容里有 @、但 mentions 里查不到 → 很可能就是机器人自己
             if known is None and learn_self and oid not in names:
                 learned = oid
@@ -600,6 +803,8 @@ def build_event(
     resolve_at: bool = True,
     learn_self: bool = True,
     reply_to_self_wakes: bool = True,
+    enhance_rich: bool = True,
+    notes: Optional[list] = None,
     At: Any = None,
     Text: Any = None,
     now: Optional[float] = None,
@@ -634,6 +839,11 @@ def build_event(
         verdict = dedup.classify(dedup_key(body, is_group), kind, now=now)
         if verdict == "dup":
             return None, "duplicate"
+
+    if enhance_rich:
+        body, rich_notes = normalize_rich_body(body)
+        if rich_notes and isinstance(notes, list):
+            notes.extend(rich_notes)
 
     chain_fn = getattr(adapter, "_message_chain", None)
     if not callable(chain_fn):
