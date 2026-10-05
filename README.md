@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.7
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -313,7 +313,7 @@ python3 tests/run_tests.py
 | `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
 | `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
 | `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **171/171** |
-| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **79/79** |
+| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **83/83** |
 
 ```bash
 # 冒烟需要真实源码路径（找不到会自动跳过）
@@ -341,6 +341,49 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.1.8</b> — 旧补丁层会被顶掉（@ 仍不生效的真凶）+ 引用索引适配器级共享</summary>
+
+用户在 v1.1.7 上反馈：日志明确写了「已记录第 1 个 REFIDX」，但真要引用时却报
+「没找到对应的 REFIDX（已知 5 条）」。
+
+### ★ 首要修复：热重载残留的**旧补丁层**会被顶掉
+
+v1.1.7 及更早的版本里，如果 adapter 上**已经有一层补丁**（多为热重载残留），代码会**直接跳过**：
+
+```python
+original = getattr(adapter, "_text_content", None)
+if not callable(original) or getattr(original, "_kira_bridge_at", False):
+    return          # ← 于是旧实例的包装一直在跑
+```
+
+后果：新版本的能力（正文 @ 归一化）**根本没装上**，跑的还是旧包装 ——
+表现就是「At 仍然用旧形态 + 正文里的标记原样发出去」（用户实测正是如此）。
+
+⇒ 现在检测到旧层会 **warning + 接管**：从 `_qqbot_bridge_text_orig` 找到**真正的原始实现**，
+用新实例的包装替换掉旧层。api 侧（`message_reference`）同理。
+
+> **更新插件后请彻底重启 KiraAI**（只重载插件不一定能清掉旧实例的补丁层）。
+
+### 引用索引的两个根因，一起堵掉：
+
+1. **各存一份**：引用索引原来挂在**插件实例**上；热重载/多次加载时，收消息的实例和发消息的实例
+   可能不是同一个 ⇒ 记录到了 A 的表里，B 去查自然查不到。
+   ⇒ 现在挂在**适配器对象**上共享（`ref_store_for(adapter)`）。
+2. **id 口径**：模型有时会回**原始 message id**，而框架渲染的是 `qqo-xxxx` 短 id。
+   ⇒ 现在**两个键都记**（展示态 id + 原始 id），查哪个都能命中。
+
+**诊断加强**（下次一眼定位）
+- 记录时打前 3 条：`引用索引 +1：键=(qq:gm:xxx, qqo-xxxx) ← REFIDX_yyy==`
+- 查找失败时把**已知的 id 列出来**：`没找到对应的 REFIDX（已知 5 条：qqo-abcd…, qqo-efgh…）`
+
+**缓存友好性（同时加固）**
+- 新增断言：**50 条无关消息之后再重放同一条 → 渲染与首次逐字节一致**
+  （证明注入内容是「消息 + 已学身份」的纯函数，不受后续状态影响）
+- 审计确认：v1.1.7 / v1.1.8 的改动**全在发送侧**，没碰任何 LLM 看得到的内容
+
+</details>
+
+<details>
 <summary><b>v1.1.7</b> — 正文里模型自己写的 @ 标记也会被归一化</summary>
 
 **@ 为什么还是一串文本？**

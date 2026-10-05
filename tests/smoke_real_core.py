@@ -508,8 +508,9 @@ async def main():
     if evs:
         display = str(evs[0].message.message_id)
         sid = str(evs[0].session.sid)
-        check("插件记住了它的 REFIDX", plugin0._ref_idx.get((sid, display)) == "REFIDX_quoted==",
-              str(dict(plugin0._ref_idx)))
+        check("插件记住了它的 REFIDX",
+          plugin_main.ref_store_for(adapter).get((sid, display)) == "REFIDX_quoted==",
+              str(dict(plugin_main.ref_store_for(adapter))))
         from core.chat.message_elements import Reply as _RealReply, Text as _RealText
         chain = [_RealReply(display), _RealText("引用测试")]
         check("链里有显式 Reply 时能解析出 REFIDX",
@@ -535,8 +536,9 @@ async def main():
     finally:
         plugin_main._QUOTE_REF.reset(token)
     check("机器人自己发的消息也记下了 ref_idx（以后能引用自己发过的消息）",
-          any(k[0].endswith("GRP_OPENID_1") and k[1].startswith("qqo-") for k in plugin0._ref_idx),
-          str(list(plugin0._ref_idx)[:3]))
+          any(k[0].endswith("GRP_OPENID_1") and k[1].startswith("qqo-")
+              for k in plugin_main.ref_store_for(adapter)),
+          str(list(plugin_main.ref_store_for(adapter))[:3]))
 
     sent_calls.clear()
     await client.api.post_group_message(group_openid="GRP_OPENID_1", msg_type=0, content="noquote")
@@ -638,6 +640,43 @@ async def main():
         for ev in await drain(0.15):
             renders.add(chain_repr(ev.message.chain))
     check("★ 同一内容 30 次 → 渲染逐字节一致（不吃掉提示词缓存）", len(renders) == 1, len(renders))
+
+    # 状态无关性：灌 50 条别的消息后重放同一条，渲染必须仍与首次一致
+    first_render = sorted(renders)[0] if renders else ""
+    for i in range(50):
+        other = dict(det_base)
+        other["id"] = f"NOISE{i}"
+        other["content"] = f"无关消息 {i}"
+        other["author"] = {"id": f"UN{i}", "member_openid": f"UN{i}",
+                           "username": f"路人{i}", "bot": False}
+        parsers["group_message_create"]({"op": 0, "s": 400 + i, "t": "GROUP_MESSAGE_CREATE",
+                                        "id": f"EVN{i}", "d": other})
+        await drain(0.05)
+    replay = dict(det_base)
+    replay["id"] = "REPLAY1"
+    parsers["group_message_create"]({"op": 0, "s": 700, "t": "GROUP_MESSAGE_CREATE", "id": "EVRE", "d": replay})
+    replayed = {chain_repr(ev.message.chain) for ev in await drain(0.3)}
+    check("★ 状态无关：50 条杂音后重放同一条，渲染与首次完全一致（注入内容是纯函数）",
+          replayed == {first_render}, f"{len(replayed)} 种")
+
+    # ---- 19. 引用索引是「适配器级」共享的：热重载换实例也要能查到 ----
+    from core.chat.message_elements import Reply as _SR, Text as _ST
+    plugin_extra = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)
+    plugin_extra._remember_ref(adapter, "qq:gm:GRP_OPENID_1", "qqo-shared", "REFIDX_shared==")
+    shared_chain = [_SR(message_id="qqo-shared", chain=[_ST("x")]), _ST("reply")]
+    found_shared = plugin0._quote_ref_for(adapter, "GRP_OPENID_1", shared_chain, True)
+    check("★ 实例 A 记录的引用，实例 B 也能查到（适配器级共享，防热重载丢索引）",
+          found_shared == "REFIDX_shared==", found_shared)
+
+    # ---- 20. 二次加载（热重载）：新实例必须顶掉旧补丁层，行为仍正确 ----
+    plugin_again = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)
+    await plugin_again.initialize()
+    out_again = adapter._text_content([_ST('<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />哥ww')])
+    check("★ 二次加载后，正文里的标记仍被归一化成 legacy 形态",
+          str(out_again).startswith("<@9CD54739CC9BAA46B93243088802DC72>"), str(out_again)[:50])
+    check("补丁层记录的仍是最初的原始实现",
+          getattr(adapter._text_content, "_kira_bridge_orig", None) is not None, None)
+    await plugin_again.terminate()
 
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)
