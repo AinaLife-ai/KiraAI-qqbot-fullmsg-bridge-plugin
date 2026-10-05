@@ -614,6 +614,31 @@ async def main():
               any("[语音: 这是一段被引用的语音]" in (getattr(x, "text", "") or "") for x in sub),
               chain_repr(sub))
 
+    # ---- 18. 确定性：同一内容重复构造，渲染必须逐字节一致（提示词缓存友好）----
+    while not bus.empty():
+        bus.get_nowait()
+    renders = set()
+    det_voice = {"content_type": "voice", "asr_refer_text": "语音内容"}
+    det_base = {
+        "author": {"id": "UID9", "member_openid": "UID9", "username": "小明", "bot": False},
+        "content": '<@A1B2C3D4E5F60718293A4B5C6D7E8F90> 你看 <faceType=6, faceId="0", ext="eyJ0ZXh0IjogIuW+rueskSJ9">',
+        "group_openid": "GRP_OPENID_1",
+        "message_type": 103,
+        "mentions": [{"id": "A1B2C3D4E5F60718293A4B5C6D7E8F90", "username": "香里", "is_you": True}],
+        "attachments": [det_voice],
+        "msg_elements": [{"author": {"id": "UID8", "username": "小红"}, "content": " ",
+                          "attachments": [dict(det_voice)]}],
+        "message_scene": {"source": "default", "ext": ["msg_idx=REFIDX_det=="]},
+    }
+    for i in range(30):
+        body_i = dict(det_base)
+        body_i["id"] = f"R{i}"
+        parsers["group_message_create"]({"op": 0, "s": 200 + i, "t": "GROUP_MESSAGE_CREATE",
+                                        "id": f"EVR{i}", "d": body_i})
+        for ev in await drain(0.15):
+            renders.add(chain_repr(ev.message.chain))
+    check("★ 同一内容 30 次 → 渲染逐字节一致（不吃掉提示词缓存）", len(renders) == 1, len(renders))
+
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)
 
