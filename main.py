@@ -75,6 +75,7 @@ from qqbot_bridge import (
     extract_msg_idx,
     extract_sent_ref_idx,
     normalize_outgoing_markup,
+    strip_at_markup,
     inject_live_parser,
     install_class_parser,
     normalize_body,
@@ -168,6 +169,7 @@ class QQOfficialGroupBridge(BasePlugin):
         self.send_at_mention = bool(basic.get("send_at_mention", True))
         self.enhance_rich = bool(basic.get("enhance_rich_content", True))
         self.at_markup_style = str(basic.get("at_markup_style", "legacy") or "legacy").lower()
+        self.at_markdown = bool(basic.get("at_markdown", True))
         self.pinned_self_openid = str(basic.get("self_openid", "") or "").strip()
 
         proactive = cfg.get("section_proactive", {}) or {}
@@ -203,6 +205,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self._ref_miss = 0
         self._quote_miss_logged = False
         self._llm_markup_logged = False
+        self._at_md_logged = False
+        self._at_md_fallback_logged = False
         self._ref_logged = 0
         self._last_proactive = {}
         #: 仅用于日志观测（今日主动消息条数），不做任何限制——配额由官方判
@@ -761,7 +765,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self._patched_sends[name] = original
         if self.send_at_mention:
             self._patch_text_content(adapter)
-        if self.quote_reply:
+        if self.quote_reply or (self.send_at_mention and self.at_markdown):
+            # 关掉「引用回复」也要装：@ 的 markdown 转换同样在这一层
             self._patch_api_quote(adapter, name, client)
 
     def _patch_text_content(self, adapter) -> None:
@@ -860,7 +865,48 @@ class QQOfficialGroupBridge(BasePlugin):
                 ref = _QUOTE_REF.get()
                 if ref and not kwargs.get("message_reference"):
                     kwargs["message_reference"] = {"message_id": ref}
-                result = await _orig(*args, **kwargs)
+
+                # ★ 纯文本（msg_type=0）**没有 @ 能力** —— 正文里带提到标签时必须走
+                #   markdown（msg_type=2），否则客户端只会把标签原样显示成一串文本。
+                #   依据：官方《文本交互》页 + bunqq-core 开发文档
+                #   （"含 <qqbot-at-user id> 提及标签 → 强制 md（纯文本无 @ 能力）"）。
+                md_text = None
+                text = kwargs.get("content")
+                if self.at_markdown and isinstance(text, str) and (
+                    "<@" in text or "qqbot-at-user" in text
+                ):
+                    md_text = text
+                    kwargs = dict(kwargs)
+                    kwargs["msg_type"] = 2
+                    kwargs["markdown"] = {"content": text}
+                    kwargs["content"] = None
+                    if not self._at_md_logged:
+                        self._at_md_logged = True
+                        logger.info(
+                            "[QQBOT-BRIDGE] 正文含 @ 标记 → 本条改按 markdown 发送"
+                            "（纯文本消息没有 @ 能力，会被显示成文本）"
+                        )
+
+                if md_text is None:
+                    result = await _orig(*args, **kwargs)
+                else:
+                    try:
+                        result = await _orig(*args, **kwargs)
+                    except Exception as md_exc:
+                        # markdown 发不出去（例如未获原生 MD 权限）⇒ 退回纯文本，
+                        # 但必须剥掉标记，否则又会把标签原样发出去
+                        fallback = dict(kwargs)
+                        fallback["msg_type"] = 0
+                        fallback["markdown"] = None
+                        fallback["content"] = strip_at_markup(md_text)
+                        if not self._at_md_fallback_logged:
+                            self._at_md_fallback_logged = True
+                            logger.warning(
+                                "[QQBOT-BRIDGE] markdown 发送失败（%s: %s），已退回纯文本并剥掉 @ 标记 —— "
+                                "若群里看到的就是这种情况，说明该机器人没有 markdown 消息权限",
+                                type(md_exc).__name__, md_exc,
+                            )
+                        result = await _orig(*args, **fallback)
                 try:
                     sent_ref = extract_sent_ref_idx(result)
                     if sent_ref:

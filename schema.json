@@ -93,6 +93,12 @@
         "default": "legacy",
         "hint": "官方文档推荐 <qqbot-at-user id=...> 这种写法（new），但实测在部分环境会被当纯文本原样显示；legacy 是 <@openid> —— 文档标注即将弃用，可它正是平台自己下发给我们用的形态，客户端一定认。默认 legacy；若你那边 new 能正常渲染，可以切过去。"
       },
+      "at_markdown": {
+        "name": "含@时改用markdown",
+        "type": "bool",
+        "default": true,
+        "hint": "**重要**：官方 API 的纯文本消息（msg_type=0）没有 @ 能力，@ 标签只在 markdown 消息里才会被客户端渲染成真的 @（依据：官方《文本交互》页 + bunqq-core 开发文档）。开启后，只要发出的正文里带 @ 标记，本条就改按 markdown 发送；若该机器人没有 markdown 权限导致发送失败，会自动退回纯文本并剥掉标记。默认开。"
+      },
       "enhance_rich_content": {
         "name": "富内容归一化（推荐开）",
         "type": "switch",
