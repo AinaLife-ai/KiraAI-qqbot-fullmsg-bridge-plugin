@@ -114,6 +114,12 @@ async def main():
         max_async=1, connect=lambda session: None, dispatch=client.ws_dispatch, api=None,
     )
     adapter.client = client
+
+    class _FakeRobot:      # 模拟 READY 之后 botpy 挂上的 client.robot
+        id = 6158788878435714165
+        name = "香里"
+
+    client._connection.state.robot = _FakeRobot()
     parsers = client._connection.parser
 
     check("真实 botpy 解析表里没有 group_message_create（报错来源）",
@@ -298,6 +304,167 @@ async def main():
     check("零等待（<0.2s），不需要任何人工延时", elapsed < 0.2, f"{elapsed:.3f}s")
     check("跨事件重复被计数，便于观测（官方文档称不会发生，正常应为 0）",
           plugin0._cross_pairs == 1, str(plugin0._cross_pairs))
+
+    # ---- 10. @ 富文本 → KiraAI 标准 At 元素（保留 pid，防改名冒充） ----
+    from core.chat.message_elements import At as RealAt
+
+    def chain_repr(chain):
+        return "".join(getattr(e, "text", None) or getattr(e, "repr", None) or str(e) for e in chain)
+
+    while not bus.empty():
+        bus.get_nowait()
+    parsers["group_message_create"](gm(
+        msg_id="ATSELF1", content="<@0A0B9F323E6AA18BF08B6901A3B2DEFC> 妹",
+        mentions=[{"id": "0A0B9F323E6AA18BF08B6901A3B2DEFC", "is_you": True,
+                   "bot": True, "username": "香里"}],
+    ))
+    evs = await drain(0.4)
+    check("@ 富文本事件正常投递", len(evs) == 1, str(len(evs)))
+    if evs:
+        chain = evs[0].message.chain
+        ats = [e for e in chain if isinstance(e, RealAt)]
+        check("拆成 KiraAI 标准 At 元素（★ 保留 pid，不只给昵称）",
+              len(ats) == 1 and ats[0].pid == "0A0B9F323E6AA18BF08B6901A3B2DEFC", chain_repr(chain))
+        check("At 渲染成 [At 昵称(pid)]（名字给人看、pid 做身份）",
+              ats and ats[0].repr == "[At 香里（你）(0A0B9F323E6AA18BF08B6901A3B2DEFC)]",
+              ats[0].repr if ats else "")
+        check("自己的 At 带「（你）」后缀（同名冒充也分得清）",
+              ats and ats[0].nickname and "（你）" in ats[0].nickname)
+        check("识别为「叫自己」→ is_mentioned=True", evs[0].message.is_mentioned is True)
+        check("其余文本原样保留", chain_repr(chain).endswith(" 妹"), chain_repr(chain))
+
+    while not bus.empty():
+        bus.get_nowait()
+    # mentions 为空：已经认识的"自己"依然认得出来
+    parsers["group_message_create"](gm(
+        msg_id="ATSELF2", content="<@0A0B9F323E6AA18BF08B6901A3B2DEFC> 在吗", mentions=[]))
+    evs = await drain(0.4)
+    check("mentions 为空也能认出自己被 @（不依赖平台给 is_you）",
+          len(evs) == 1 and evs[0].message.is_mentioned is True, str(len(evs)))
+    if evs:
+        ats = [e for e in evs[0].message.chain if isinstance(e, RealAt)]
+        check("mentions 为空时同样拆成带 pid 的 At", len(ats) == 1 and ats[0].pid.startswith("0A0B"), "")
+
+    while not bus.empty():
+        bus.get_nowait()
+    # 认识了自己之后，另一个"查不到的 @"不会被误认成自己
+    parsers["group_message_create"](gm(
+        msg_id="ATSELF4", content="<@FFFF0000111122223333444455556666> 早", mentions=[]))
+    evs = await drain(0.4)
+    if evs:
+        ats = [e for e in evs[0].message.chain if isinstance(e, RealAt)]
+        check("未知的 @ 也保留 pid、只是没有名字（无法编造身份）",
+              len(ats) == 1 and ats[0].pid == "FFFF0000111122223333444455556666"
+              and ats[0].nickname is None, chain_repr(evs[0].message.chain))
+        check("未知的 @ 不会误唤醒", evs[0].message.is_mentioned is False)
+
+    while not bus.empty():
+        bus.get_nowait()
+    parsers["group_message_create"](gm(
+        msg_id="ATSELF3", content="<@1234567890ABCDEF> 早", mentions=[
+            {"id": "1234567890ABCDEF", "username": "小明", "is_you": False}]))
+    evs = await drain(0.4)
+    if evs:
+        ats = [e for e in evs[0].message.chain if isinstance(e, RealAt)]
+        check("别人的 @ 也带上昵称（但 pid 仍是对方的）",
+              len(ats) == 1 and ats[0].nickname == "小明"
+              and ats[0].pid == "1234567890ABCDEF", chain_repr(evs[0].message.chain))
+        check("只 @ 别人时不算唤醒（仍走围观/关键词）", evs[0].message.is_mentioned is False)
+
+    # ---- 11. 引用消息 + @ 他人（对齐框架） ----
+    from core.chat.message_elements import Reply as RealReply
+
+    while not bus.empty():
+        bus.get_nowait()
+    # 引用一条"里面 @ 了机器人"的历史消息，本条消息本身没 @ 机器人
+    quote = {
+        "id": "QUOTE1",
+        "author": {"id": "UID1", "member_openid": "UID1", "username": "小明", "bot": False},
+        "content": " ",
+        "group_openid": "GRP_OPENID_1",
+        "message_type": 103,
+        "msg_elements": [{
+            "msg_idx": "REFIDX_abc==",
+            "author": {"id": "UID2", "member_openid": "UID2", "username": "小红", "bot": False},
+            "message_type": 0,
+            "content": "<@0A0B9F323E6AA18BF08B6901A3B2DEFC> 我艾特过你",
+        }],
+        "message_scene": {"source": "default",
+                          "ext": ["msg_idx=REFIDX_x==", "ref_msg_idx=REFIDX_abc=="]},
+    }
+    parsers["group_message_create"]({"op": 0, "s": 30, "t": "GROUP_MESSAGE_CREATE", "id": "EVQ", "d": quote})
+    evs = await drain(0.4)
+    check("引用消息正常投递", len(evs) == 1, str(len(evs)))
+    if evs:
+        chain = evs[0].message.chain
+        replies = [e for e in chain if isinstance(e, RealReply)]
+        check("★ 引用被解析成 Reply 元素（原生实现丢 msg_elements，是拿不到的）",
+              len(replies) == 1, chain_repr(chain))
+        if replies:
+            sub = list(replies[0].chain or [])
+            check("引用内容被带出来（LLM 能看到被引用的原话）",
+                  any("我艾特过你" in (getattr(x, "text", "") or "") for x in sub), chain_repr(sub))
+            check("引用内容里的 @ 也拆成标准 At",
+                  any(isinstance(x, RealAt) and x.pid == "0A0B9F323E6AA18BF08B6901A3B2DEFC" for x in sub),
+                  chain_repr(sub))
+        check("★ 引用里的「自己的 @」不算现在在叫我（不误唤醒）",
+              evs[0].message.is_mentioned is False)
+
+    while not bus.empty():
+        bus.get_nowait()
+    # 一条消息同时 @ 两个人（都不是机器人）
+    parsers["group_message_create"](gm(
+        msg_id="ATOTHERS", content="<@AAAA1111BBBB2222> 你看 <@CCCC3333DDDD4444>",
+        mentions=[{"id": "AAAA1111BBBB2222", "username": "小红", "is_you": False},
+                  {"id": "CCCC3333DDDD4444", "username": "小刚", "is_you": False}]))
+    evs = await drain(0.4)
+    if evs:
+        ats = [e for e in evs[0].message.chain if isinstance(e, RealAt)]
+        check("@ 他人：两个都拆成标准 At，且各自 pid / 昵称正确",
+              len(ats) == 2 and {a.pid for a in ats} == {"AAAA1111BBBB2222", "CCCC3333DDDD4444"}
+              and [a.nickname for a in ats] == ["小红", "小刚"], chain_repr(evs[0].message.chain))
+        check("@ 他人不算唤醒（只有真被 @ 才唤醒）", evs[0].message.is_mentioned is False)
+
+    # ---- 12. 被引用回复 = 被提及（对齐 OneBot） ----
+    while not bus.empty():
+        bus.get_nowait()
+    quoted_bot = {
+        "id": "QRBOT1",
+        "author": {"id": "UID1", "member_openid": "UID1", "username": "小明", "bot": False},
+        "content": " ",
+        "group_openid": "GRP_OPENID_1",
+        "message_type": 103,
+        "msg_elements": [{
+            "msg_idx": "REFIDX_bot==",
+            "author": {"id": "0A0B9F323E6AA18BF08B6901A3B2DEFC", "username": "香里", "bot": True},
+            "message_type": 0,
+            "content": "香里之前说过的话",
+        }],
+        "message_scene": {"source": "default", "ext": ["msg_idx=REFIDX_z==", "ref_msg_idx=REFIDX_bot=="]},
+    }
+    parsers["group_message_create"]({"op": 0, "s": 40, "t": "GROUP_MESSAGE_CREATE", "id": "EVQ2", "d": quoted_bot})
+    evs = await drain(0.4)
+    check("引用机器人的消息 -> is_mentioned=True（对齐 OneBot 语义）",
+          len(evs) == 1 and evs[0].message.is_mentioned is True, str(len(evs)))
+    if evs:
+        check("引用内容仍照常带出来",
+              any("香里之前说过的话" in (getattr(x, "text", "") or "")
+                  for r in evs[0].message.chain if isinstance(r, RealReply)
+                  for x in (r.chain or [])), chain_repr(evs[0].message.chain))
+
+    while not bus.empty():
+        bus.get_nowait()
+    quoted_other = dict(quoted_bot)
+    quoted_other = {**quoted_bot, "id": "QROTHER1"}
+    quoted_other["msg_elements"] = [{
+        "msg_idx": "REFIDX_o==",
+        "author": {"id": "OTHERID000000000000", "username": "小红", "bot": False},
+        "message_type": 0,
+        "content": "小红之前说过的话",
+    }]
+    parsers["group_message_create"]({"op": 0, "s": 41, "t": "GROUP_MESSAGE_CREATE", "id": "EVQ3", "d": quoted_other})
+    evs = await drain(0.4)
+    check("引用别人的消息不算唤醒", len(evs) == 1 and evs[0].message.is_mentioned is False, str(len(evs)))
 
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)

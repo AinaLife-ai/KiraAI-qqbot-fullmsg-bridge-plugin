@@ -249,7 +249,8 @@ class StubAdapter:
 
     def _message_chain(self, body, is_group, target_id):
         self._chain_bodies.append(body)
-        return [f"<chain:{body.get('content') or ''}>"]
+        content = body.get("content")
+        return [StubText(content if isinstance(content, str) else "")]
 
 
 class StubGroup:
@@ -262,6 +263,44 @@ class StubUser:
     def __init__(self, user_id=None, nickname=None):
         self.user_id = user_id
         self.nickname = nickname
+
+
+class StubText:
+    def __init__(self, text):
+        self.text = text
+        self.repr = text
+
+
+class StubAt:
+    def __init__(self, pid, nickname=None):
+        self.pid = str(pid)
+        self.nickname = nickname
+
+    @property
+    def repr(self):
+        return f"[At {self.nickname}({self.pid})]" if self.nickname else f"[At {self.pid}]"
+
+
+def chain_repr(chain):
+    return "".join(getattr(e, "text", None) or getattr(e, "repr", None) or str(e) for e in chain)
+
+
+class StubChain:
+    def __init__(self, items):
+        self.message_list = list(items)
+
+    def __iter__(self):
+        return iter(self.message_list)
+
+
+class StubReply:
+    def __init__(self, message_id, chain=None):
+        self.message_id = message_id
+        self.chain = StubChain(chain or [])
+
+    @property
+    def repr(self):
+        return f"[Reply {self.message_id}]"
 
 
 class StubIMMessage:
@@ -323,6 +362,8 @@ def _build(payload, adapter=None, kind=B.KIND_FULL, is_group=True, ident=None, *
         kind=kind,
         is_group=is_group,
         identities=ident,
+        At=StubAt,
+        Text=StubText,
         **kw,
     )
 
@@ -414,6 +455,164 @@ def test_build_event():
     _, (event, src) = _build({"id": "M9", "author": {"member_openid": "U"},
                               "group_openid": "G", "content": "x"})
     check("裸 body（无 d 包装）也能解析", event is not None and src == "none", src)
+
+
+def test_at_markup():
+    print("\n[F] @ 富文本 → KiraAI 标准 At 元素（保留 pid，防改名冒充）")
+
+    BOT = "0A0B9F323E6AA18BF08B6901A3B2DEFC"
+    check("抓取 <@openid>", B.extract_at_ids(f"<@{BOT}> 妹") == [BOT])
+    check("无标记时返回空", B.extract_at_ids("普通消息") == [])
+    check("过短的 <@ABC> 不匹配", B.extract_at_ids("<@ABC>") == [])
+
+    oid, why = B.learn_self_from_mentions(
+        {"mentions": [{"id": "X" * 32, "is_you": True, "username": "香里"}]})
+    check("从 is_you 认出自己", oid == "X" * 32 and why == "is_you", f"{oid}/{why}")
+    oid, why = B.learn_self_from_mentions(
+        {"mentions": [{"id": "Y" * 32, "bot": True, "username": "香里"}]}, "香里")
+    check("没有 is_you 时用「bot+昵称一致」兜底", oid == "Y" * 32 and why == "bot+name", f"{oid}/{why}")
+    check("昵称不一致时不乱认", B.learn_self_from_mentions(
+        {"mentions": [{"id": "Z" * 32, "bot": True, "username": "别的机器人"}]}, "香里")[0] is None)
+
+    def split(content, body=None, ident=None, **kw):
+        return B.split_at_markup([StubText(content)], body or {}, ident,
+                                 At=StubAt, Text=StubText, **kw)
+
+    chain, hit, learned = split(f"<@{BOT}> 妹", {}, B.SelfIdentity(name="香里"))
+    check("兜底学习：拆成 At 且保留 pid", isinstance(chain[0], StubAt) and chain[0].pid == BOT)
+    check("兜底学习：昵称带「（你）」后缀（防同名冒充）",
+          chain[0].nickname == "香里（你）", str(chain[0].nickname))
+    check("兜底学习：判定为「叫自己」", hit is True)
+    check("兜底学习：返回学到的 openid", learned == BOT)
+    check("渲染成 KiraAI 标准格式 [At 昵称(pid)]",
+          chain_repr(chain) == f"[At 香里（你）({BOT})] 妹", chain_repr(chain))
+
+    me = B.SelfIdentity(openid="AAAABBBBCCCCDDDD", name="香里")
+    body = {"mentions": [{"id": "1234567890ABCDEF", "username": "小明"}]}
+    chain, hit, _ = split("<@AAAABBBBCCCCDDDD> 早 <@1234567890ABCDEF>", body, me)
+    check("同时解析自己和别人",
+          chain_repr(chain) == "[At 香里（你）(AAAABBBBCCCCDDDD)] 早 [At 小明(1234567890ABCDEF)]",
+          chain_repr(chain))
+    check("只有自己被 @ 才置位", hit is True)
+
+    chain, hit, _ = split("<@1234567890ABCDEF> 早", body, me)
+    check("只 @ 别人时不置位", hit is False and chain_repr(chain).startswith("[At 小明("), chain_repr(chain))
+
+    chain, _, _ = split("<@MMMMMMMMNNNNNNNN> 在吗", {}, me)
+    check("未知的 @ 也保留 pid（只是没有名字，无法编造身份）",
+          isinstance(chain[0], StubAt) and chain[0].pid == "MMMMMMMMNNNNNNNN"
+          and chain[0].nickname is None, chain_repr(chain))
+
+    chain, _, _ = split(f"<@{BOT}>", {}, B.SelfIdentity(name="香里"), learn_self=False)
+    check("learn_self=False 时不反推（原样当普通 At）",
+          isinstance(chain[0], StubAt) and chain[0].nickname is None, chain_repr(chain))
+
+    # ---- build_event 端到端 ----
+    adapter, (event, src) = _build(gm_payload(
+        content=f"<@{BOT}> 妹",
+        mentions=[{"id": BOT, "is_you": True, "bot": True, "username": "香里"}]),
+        self_identity=B.SelfIdentity(name="香里"))
+    check("build_event：@ 变成标准 At 元素（pid 在）",
+          isinstance(event.message.chain[0], StubAt) and event.message.chain[0].pid == BOT)
+    check("build_event：自己 @ 时强制唤醒",
+          event.message.is_mentioned is True and src == "is_you", src)
+
+    adapter, (event, src) = _build(gm_payload(content=f"<@{BOT}> 在吗", mentions=[]),
+                                   self_identity=B.SelfIdentity(name="香里"))
+    check("build_event：mentions 为空也能认出自己被 @",
+          isinstance(event.message.chain[0], StubAt) and event.message.is_mentioned is True
+          and src == "self_at_markup", src)
+
+    adapter, (event, _) = _build(gm_payload(content=f"<@{BOT}> 妹", mentions=[]),
+                                 self_identity=B.SelfIdentity(name="香里"), resolve_at=False)
+    check("resolve_at=False 时保持纯文本、不自我唤醒",
+          isinstance(event.message.chain[0], StubText)
+          and f"<@{BOT}>" in event.message.chain[0].text
+          and event.message.is_mentioned is False)
+
+    pinned = B.SelfIdentity(openid="AAAABBBBCCCCDDDD", name="香里", source="config")
+    adapter, (event, _) = _build(gm_payload(content="<@AAAABBBBCCCCDDDD> 妹", mentions=[]),
+                                 self_identity=pinned)
+    check("手动钉死的 OpenID 生效", event.message.is_mentioned is True
+          and isinstance(event.message.chain[0], StubAt))
+
+    adapter, (event, _) = _build(
+        gm_payload(content=f"<@{BOT}> 妹 <@{BOT}> 在吗", mentions=[]),
+        self_identity=B.SelfIdentity(name="香里"))
+    ats = [e for e in event.message.chain if isinstance(e, StubAt)]
+    check("同一 openid 出现两次都拆成 At（两次都保留 pid）",
+          len(ats) == 2 and all(a.pid == BOT for a in ats), chain_repr(event.message.chain))
+
+    adapter, (event, _) = _build(gm_payload(content="普通消息", mentions=[]))
+    check("没有 @ 标记时行为不变",
+          chain_repr(event.message.chain) == "普通消息" and event.message.is_mentioned is False)
+
+    _, (event, _) = _build(gm_payload(content=None, mentions=[]))
+    check("content 为 None 时不崩", event is not None)
+    _, (event, _) = _build(gm_payload(content=12345, mentions=[]))
+    check("content 不是字符串时不崩", event is not None)
+    _, (event, _) = _build(gm_payload(content=f"<@{BOT}>", mentions="坏数据"))
+    check("mentions 形状异常时不崩", event is not None)
+    check("At/Text 缺失时安全降级（不会崩）",
+          B.split_at_markup([StubText(f"<@{BOT}>")], {}, None)[1] is False)
+
+    # ---- 引用消息：嵌套链里的 @ 也要拆，但不能算「叫自己」 ----
+    quote_chain = [StubReply("", [StubText(f"<@{BOT}> 原话"), StubText(" 结尾")]),
+                   StubText(" 现在的回复")]
+    out, hit, _ = B.split_at_markup(quote_chain, {"mentions": []},
+                                   B.SelfIdentity(openid=BOT, name="香里"),
+                                   At=StubAt, Text=StubText)
+    sub = list(out[0].chain)
+    check("引用内容里的 @ 也拆成 At（保留 pid）",
+          isinstance(sub[0], StubAt) and sub[0].pid == BOT, chain_repr(sub))
+    check("引用内容里的文本保留", chain_repr(sub).endswith("原话 结尾"), chain_repr(sub))
+    check("★ 引用内容里的「自己的 @」不算现在在叫你（不误唤醒）", hit is False)
+    check("顶层文本不受影响", chain_repr([out[1]]) == " 现在的回复", chain_repr([out[1]]))
+
+    # ---- 被引用回复 = 被提及（对齐 OneBot 语义） ----
+    BOTID = "0A0B9F323E6AA18BF08B6901A3B2DEFC"
+    q_bot = {"message_type": 103, "msg_elements": [
+        {"author": {"id": BOTID, "username": "香里", "bot": True}, "content": "香里说过的话"}]}
+    q_other = {"message_type": 103, "msg_elements": [
+        {"author": {"id": "OTHERID000000000", "username": "小明", "bot": False}, "content": "小明说过的话"}]}
+    me_known = B.SelfIdentity(openid=BOTID, name="香里")
+    check("引用机器人的消息 -> 判定为自己", B.quoted_author_is_self(q_bot, me_known)[0] is True)
+    check("引用别人的消息 -> 不是自己", B.quoted_author_is_self(q_other, me_known)[0] is False)
+    check("普通消息 -> 不是引用", B.quoted_author_is_self(
+        {"message_type": 0, "content": "普通"}, me_known)[0] is False)
+    ok, learned = B.quoted_author_is_self(q_bot, B.SelfIdentity(name="香里"))
+    check("还不知道自己 openid 时：bot+昵称一致也能认，并顺便学到 openid",
+          ok is True and learned == BOTID, f"{ok}/{learned}")
+    check("looks_like_quote：103 / message_reference 都算",
+          B.looks_like_quote({"message_type": 103}) is True
+          and B.looks_like_quote({"message_reference": {"message_id": "x"}}) is True
+          and B.looks_like_quote({"message_type": 0}) is False)
+
+    # 端到端：引用机器人 + 没有 @ → 必须置 is_mentioned
+    payload = gm_payload(id="QR1", content=" ", message_type=103, mentions=[], msg_elements=[
+        {"author": {"id": BOTID, "username": "香里", "bot": True}, "content": "香里说过的话"}])
+    adapter, (event, src) = _build(payload, self_identity=B.SelfIdentity(openid=BOTID, name="香里"))
+    check("★ build_event：被引用回复 -> is_mentioned=True（对齐框架）",
+          event.message.is_mentioned is True and src == "reply_to_self", src)
+
+    adapter, (event, src) = _build(payload, self_identity=B.SelfIdentity(openid=BOTID, name="香里"),
+                                   reply_to_self_wakes=False)
+    check("关掉开关后引用不再唤醒", event.message.is_mentioned is False, src)
+
+    payload2 = gm_payload(id="QR2", content=" ", message_type=103, mentions=[], msg_elements=[
+        {"author": {"id": "OTHERID000000000", "username": "小明", "bot": False}, "content": "小明说过的话"}])
+    adapter, (event, src) = _build(payload2, self_identity=B.SelfIdentity(openid=BOTID, name="香里"))
+    check("引用别人的消息不唤醒", event.message.is_mentioned is False, src)
+
+    class _BoomClient:
+        @property
+        def robot(self):
+            raise RuntimeError("not connected (botpy property 会在未连接时抛)")
+
+    check("client.robot 抛异常时 collect_self_ids 安全返回空",
+          B.collect_self_ids(_BoomClient()) == [])
+    check("client.robot 抛异常时 collect_self_identity 也兜住",
+          B.collect_self_identity(_BoomClient()) == (None, None))
 
 
 def test_identity_store():
@@ -548,6 +747,7 @@ def main():
     test_real_botpy(pristine)
     test_build_event()
     test_identity_store()
+    test_at_markup()
     test_dedup()
     test_capabilities_and_perf()
 
