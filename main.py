@@ -1,0 +1,568 @@
+"""QQ官方bot兼容与增强补丁 — KiraAI plugin.
+
+把 QQ 官方机器人适配器对齐到 NapCat 语义：
+
+  ① **修掉 `_parser unknown event group_message_create`** —— 为 qq-botpy 补上
+     群全量消息解析器，让不 @ 机器人的消息也能进 KiraAI（围观 / 关键词唤醒）；
+  ② **@ 消息与单聊也统一接管** —— 原生实现把 `nickname` 写成 32 位 OpenID，
+     这里改成事件自带的 `author.username`（真实 QQ 昵称）；
+  ③ `is_mentioned` 按 NapCat 语义判定（只有真 @ 才算唤醒）；
+  ④ 同一 `msg_id` 去重（官方明说会重推）；跨事件重复按「绝不丢唤醒」处理，并留了
+     一个可选的等待窗口（`at_grace_seconds`，默认 0）；
+  ⑤ 自动记住昵称通讯录（零维护，改名自动跟随）；
+  ⑥ 可选：官方「主动消息」通道，兜底超出 5 分钟被动窗口的持续/主动回复。
+
+设计要点见 `qqbot_bridge.py` 的模块说明。本文件只负责 KiraAI 侧的生命周期、
+配置、适配器定位与补丁安装。
+
+性能、阻塞与可逆性约定
+----------------------
+* 消息路径上**没有同步 I/O、没有锁、没有无界循环**：每条消息只有几次 dict
+  查找 + 一次有界 LRU 更新（实测约 6.5 µs/条）；
+* 昵称通讯录落盘走 `asyncio.to_thread`，且只在「脏了」的时候写；
+* 每个异常都被兜住并降级成一条日志，绝不把异常抛回 botpy 的事件循环；
+* 所有 KiraAI 私有属性都用 `getattr` 防御式读取，框架版本变动只会打一条清晰的
+  错误然后停用桥接，不会每条消息崩一次；
+* **补丁可逆**：把 `enabled` 关掉（或关掉对应 unify 开关）后，下一次巡检会把
+  botpy 解析器与客户端处理器**还原成框架原生实现**，不需要重启进程。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import json
+import os
+import sys
+import time
+
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
+if "qqbot_bridge" in sys.modules:
+    try:
+        importlib.reload(sys.modules["qqbot_bridge"])
+    except Exception:
+        pass
+
+from core.plugin import BasePlugin, logger
+from core.chat import Group, User
+from core.chat.message_elements import File, Image
+from core.chat.message_utils import KiraIMMessage, KiraMessageEvent, KiraIMSentResult
+
+from qqbot_bridge import (
+    EVENT_C2C_MESSAGE,
+    EVENT_GROUP_AT_MESSAGE,
+    EVENT_GROUP_MESSAGE,
+    KIND_AT,
+    KIND_DM,
+    KIND_FULL,
+    IdentityStore,
+    MessageDedup,
+    attach_client_handler,
+    build_event,
+    check_adapter_capabilities,
+    collect_self_ids,
+    dedup_key,
+    detach_client_handler,
+    drop_live_parser,
+    inject_live_parser,
+    install_class_parser,
+    normalize_body,
+    restore_class_parser,
+)
+
+_SELF_PLUGIN_ID = "qqbot-fullmsg-bridge"
+
+#: 15s 巡检：插件与适配器的启动顺序不确定，客户端重建要重新挂载，配置变更要能还原。
+#: 每次巡检只是幂等的 dict/getattr 操作，成本可忽略。
+_WATCH_INTERVAL = 15.0
+
+_ALL_EVENTS = (EVENT_GROUP_MESSAGE, EVENT_GROUP_AT_MESSAGE, EVENT_C2C_MESSAGE)
+_HANDLERS = ("on_group_message_create", "on_group_at_message_create", "on_c2c_message_create")
+
+
+def _identity_path():
+    """Where to persist the auto-learned nickname directory."""
+    try:
+        from core.utils.path_utils import get_config_path
+
+        return str(get_config_path() / "plugins" / _SELF_PLUGIN_ID / "identities.json")
+    except Exception:
+        try:
+            return os.path.join(_PLUGIN_DIR, "data", "identities.json")
+        except Exception:
+            return None
+
+
+class QQOfficialGroupBridge(BasePlugin):
+    """把 QQ 官方机器人的群/单聊事件对齐成 KiraAI 标准语义。"""
+
+    def __init__(self, ctx, cfg: dict):
+        super().__init__(ctx, cfg)
+
+        basic = cfg.get("section_basic", {}) or {}
+        self.enabled = bool(basic.get("enabled", True))
+        self.mention_mode = str(basic.get("mention_mode", "auto") or "auto").lower()
+        try:
+            self.dedup_ttl = max(10.0, float(basic.get("dedup_ttl", 180)))
+        except (TypeError, ValueError):
+            self.dedup_ttl = 180.0
+        self.unify_at = bool(basic.get("unify_at_messages", True))
+        self.unify_dm = bool(basic.get("unify_direct_messages", True))
+        try:
+            self.at_grace = max(0.0, float(basic.get("at_grace_seconds", 0)))
+        except (TypeError, ValueError):
+            self.at_grace = 0.0
+        self.remember_nicknames = bool(basic.get("remember_nicknames", True))
+
+        proactive = cfg.get("section_proactive", {}) or {}
+        self.proactive_enabled = bool(proactive.get("proactive_enabled", False))
+        try:
+            self.proactive_min_interval = max(0.0, float(proactive.get("proactive_min_interval", 0)))
+        except (TypeError, ValueError):
+            self.proactive_min_interval = 0.0
+
+        self.dedup = MessageDedup(ttl=self.dedup_ttl)
+        self.identities = IdentityStore(path=_identity_path() if self.remember_nicknames else None)
+
+        self._task = None
+        self._stop = asyncio.Event()
+        self._patch_state = {}
+        self._sample_logged = False
+        self._patched = set()
+        self._broken_adapters = set()
+        self._patched_sends = {}
+        self._restore_reported = False
+        self._handled = 0
+        #: 观测计数：同一条消息同时以「全量+@」两种事件到达的次数（正常恒为 0）
+        self._cross_pairs = 0
+        self._last_proactive = {}
+        #: 仅用于日志观测（今日主动消息条数），不做任何限制——配额由官方判
+        self._proactive_day = ""
+        self._proactive_count = 0
+        self._last_report = ""
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+    async def initialize(self):
+        # 无论启用与否都跑巡检：禁用时负责把补丁**还原**干净（可逆，不需要重启）。
+        self._task = asyncio.create_task(self._watch_loop(), name="qqbot-fullmsg-bridge")
+        await self._tick(report=True)
+        if self.enabled:
+            logger.info(
+                "[QQBOT-BRIDGE] 已启动：全量群消息=开；统一@消息=%s；统一单聊=%s；@事件等待窗口=%.1fs（0=默认不等待）；主动消息通道=%s",
+                "开" if self.unify_at else "关",
+                "开" if self.unify_dm else "关",
+                self.at_grace,
+                "开" if self.proactive_enabled else "关",
+            )
+        else:
+            logger.info("[QQBOT-BRIDGE] 桥接已禁用（section_basic.enabled=false），已还原既有补丁")
+
+    async def terminate(self):
+        self._stop.set()
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        await self._flush_identities(force=True)
+        logger.info(
+            "[QQBOT-BRIDGE] 已停止（本次已处理 %d 条消息，其中 %d 条出现「全量+@」双副本，通常为 0；"
+            "补丁保留给热重载，要彻底还原请把 enabled 设为 false 或重启 KiraAI）",
+            self._handled, self._cross_pairs,
+        )
+
+    async def _watch_loop(self):
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(_WATCH_INTERVAL)
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self._tick()
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 巡检异常（忽略）: %s", exc)
+            await self._flush_identities()
+
+    async def _flush_identities(self, force: bool = False):
+        """落盘昵称通讯录 —— 走线程，绝不占用事件循环。"""
+        if not self.remember_nicknames:
+            return
+        if not force and not self.identities.dirty:
+            return
+        try:
+            await asyncio.to_thread(self.identities.save)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 昵称通讯录落盘失败（忽略）: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # 巡检 / 补丁安装与还原
+    # ------------------------------------------------------------------ #
+    async def _tick(self, report: bool = False):
+        if not self.enabled:
+            self._restore_all()
+            return
+        patches = self._ensure_class_patch()
+        adapters = self._find_adapters()
+        if not adapters:
+            if report:
+                logger.info("[QQBOT-BRIDGE] 暂未发现 QQ Official 适配器实例（插件可能先于适配器加载）")
+            return
+        for name, adapter in adapters:
+            self._attach(adapter, name, patches)
+        names = ",".join(n for n, _ in adapters)
+        if report or self._last_report != names:
+            self._last_report = names
+            logger.info("[QQBOT-BRIDGE] 已挂载到适配器: %s", ", ".join(n for n, _ in adapters))
+
+    @staticmethod
+    def _connection_state_cls():
+        try:
+            import botpy.connection as _conn  # noqa: WPS433
+
+            return _conn.ConnectionState
+        except Exception:
+            return None
+
+    def _ensure_class_patch(self):
+        """Register (or restore) the parsers we own on botpy's ConnectionState."""
+        cls = self._connection_state_cls()
+        if cls is None:
+            if self._patch_state.get("_import") != "unavailable":
+                self._patch_state["_import"] = "unavailable"
+                logger.warning("[QQBOT-BRIDGE] 未安装 qq-botpy，桥接无法工作")
+            return {}
+
+        # (event, force_override, wanted)
+        plan = [
+            (EVENT_GROUP_MESSAGE, False, True),
+            (EVENT_GROUP_AT_MESSAGE, True, bool(self.unify_at)),
+            (EVENT_C2C_MESSAGE, True, bool(self.unify_dm)),
+        ]
+        patches = {}
+        for event_name, force, wanted in plan:
+            if wanted:
+                state = install_class_parser(cls, event_name, force=force)
+            else:
+                state = "restored" if restore_class_parser(cls, event_name) else "untouched"
+            patches[event_name] = state
+            prev = self._patch_state.get(event_name)
+            self._patch_state[event_name] = state
+            if state == "patched" and prev != "patched":
+                logger.info(
+                    "[QQBOT-BRIDGE] 已为 botpy.ConnectionState 注册 parse_%s（%s）",
+                    event_name,
+                    "这是 `_parser unknown event group_message_create` 的直接修复"
+                    if event_name == EVENT_GROUP_MESSAGE
+                    else "改用原始 payload 以保留昵称/引用",
+                )
+            elif state == "foreign" and prev != "foreign":
+                logger.info("[QQBOT-BRIDGE] botpy 已自带 %s 解析器且不该覆盖，桥接对该事件让位", event_name)
+            elif state == "restored" and prev not in (None, "restored"):
+                logger.info("[QQBOT-BRIDGE] 已还原 parse_%s 为框架原生实现", event_name)
+        return patches
+
+    def _restore_all(self):
+        """Put every patch back (used when the plugin is switched off)."""
+        changed = []
+        cls = self._connection_state_cls()
+        if cls is not None:
+            for event_name in _ALL_EVENTS:
+                if restore_class_parser(cls, event_name):
+                    changed.append("parse_" + event_name)
+        for name, adapter in self._find_adapters():
+            try:
+                client = adapter.get_client()
+            except Exception:
+                client = None
+            if client is not None:
+                state = getattr(getattr(client, "_connection", None), "state", None)
+                for attr in _HANDLERS:
+                    if detach_client_handler(client, attr):
+                        changed.append(f"{name}.{attr}")
+                if state is not None:
+                    for event_name in _ALL_EVENTS:
+                        drop_live_parser(state, event_name)
+            original = self._patched_sends.pop(name, None)
+            if original is not None:
+                adapter._send_message = original
+                changed.append(f"{name}._send_message")
+        if changed and not self._restore_reported:
+            self._restore_reported = True
+            logger.info("[QQBOT-BRIDGE] 已还原 %d 处补丁：%s", len(changed), ", ".join(changed[:6]))
+
+    def _find_adapters(self):
+        found = []
+        try:
+            adapters = self.ctx.adapter_mgr.get_adapters()
+        except Exception:
+            return found
+        for name, adapter in list(adapters.items()):
+            if self._is_qq_official(adapter):
+                found.append((str(name), adapter))
+        return found
+
+    @staticmethod
+    def _is_qq_official(adapter) -> bool:
+        cls = type(adapter)
+        if "qq_official" in str(getattr(cls, "__module__", "")):
+            return True
+        if cls.__name__ == "QQOfficialAdapter":
+            return True
+        # 结构性兜底（框架改了包名也能认出来）
+        return all(
+            hasattr(adapter, attr)
+            for attr in ("app_id", "app_secret", "_group_reply_ids", "get_client", "_handle_group_message")
+        )
+
+    def _attach(self, adapter, name: str, patches: dict):
+        missing = check_adapter_capabilities(adapter)
+        if missing:
+            if name not in self._broken_adapters:
+                self._broken_adapters.add(name)
+                logger.error(
+                    "[QQBOT-BRIDGE] %s: 适配器缺少必要接口 %s —— 桥接对该适配器停用。"
+                    "通常是 KiraAI core 版本变动导致，请到插件仓库反馈",
+                    name, missing,
+                )
+            return
+
+        try:
+            client = adapter.get_client()
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] %s: get_client() 失败: %s", name, exc)
+            return
+        if client is None:
+            return
+
+        conn = getattr(client, "_connection", None)
+        state = getattr(conn, "state", None)
+
+        # (event, handler attr, kind, is_group, wanted, allow_shadow)
+        plan = [
+            (EVENT_GROUP_MESSAGE, "on_group_message_create", KIND_FULL, True, True, False),
+            (EVENT_GROUP_AT_MESSAGE, "on_group_at_message_create", KIND_AT, True,
+             bool(self.unify_at), True),
+            (EVENT_C2C_MESSAGE, "on_c2c_message_create", KIND_DM, False,
+             bool(self.unify_dm), True),
+        ]
+
+        newly_attached = []
+        for event_name, attr, kind, is_group, wanted, allow_shadow in plan:
+            if not wanted:
+                # 关掉某个 unify 开关 -> 把该事件还给框架原生实现（否则原生处理器
+                # 会收到原始 dict 而静默丢消息）。
+                if detach_client_handler(client, attr):
+                    logger.info("[QQBOT-BRIDGE] %s: %s 已还原为框架原生实现", name, attr)
+                if state is not None:
+                    drop_live_parser(state, event_name)
+                continue
+            # 顺序很重要：先挂处理器，再强制替换解析器。
+            res = attach_client_handler(
+                client, attr, self._make_handler(adapter, kind, is_group), allow_shadow=allow_shadow
+            )
+            if res == "attached":
+                newly_attached.append(attr)
+            elif res == "native":
+                logger.info("[QQBOT-BRIDGE] %s: %s 已由框架原生实现，桥接让位", name, attr)
+
+        if state is not None:
+            live_plan = [
+                (EVENT_GROUP_MESSAGE, False, True),
+                (EVENT_GROUP_AT_MESSAGE, True, bool(self.unify_at)),
+                (EVENT_C2C_MESSAGE, True, bool(self.unify_dm)),
+            ]
+            for event_name, forced, wanted in live_plan:
+                if not wanted:
+                    continue
+                if inject_live_parser(state, event_name, force=forced):
+                    logger.info("[QQBOT-BRIDGE] %s: 运行中解析表已注入 %s", name, event_name)
+
+        if newly_attached:
+            logger.info("[QQBOT-BRIDGE] %s: 已挂载 %s", name, ", ".join(newly_attached))
+        if name not in self._patched and (
+            newly_attached or patches.get(EVENT_GROUP_MESSAGE) in ("patched", "already")
+        ):
+            self._patched.add(name)
+            logger.info(
+                "[QQBOT-BRIDGE] %s: 桥接就绪（全量群消息%s%s；昵称取真实 QQ 昵称）",
+                name,
+                " + @消息" if self.unify_at else "",
+                " + 单聊" if self.unify_dm else "",
+            )
+        if self.proactive_enabled:
+            self._patch_send(adapter, name)
+
+    # ------------------------------------------------------------------ #
+    # 事件 -> KiraAI
+    # ------------------------------------------------------------------ #
+    def _make_handler(self, adapter, kind: str, is_group: bool):
+        async def _handler(payload):
+            try:
+                await self._on_event(adapter, payload, kind, is_group)
+            except Exception as exc:  # 绝不把异常抛回 botpy 的事件循环
+                logger.warning("[QQBOT-BRIDGE] 处理事件失败（%s）: %s: %s", kind, type(exc).__name__, exc)
+
+        return _handler
+
+    async def _on_event(self, adapter, payload, kind: str, is_group: bool):
+        if not self.enabled:
+            return
+        body = normalize_body(payload) or {}
+        key = dedup_key(body, is_group)
+
+        # 官方文档：全量模式下「群里的每一条消息（不限于@机器人）」都走
+        # GROUP_MESSAGE_CREATE；@ 消息在开启全量后不再单独走 AT 事件
+        # （AstrBot#8131 的现象也印证：只挂 AT 处理器的适配器在全量模式下连 @ 都收不到）。
+        # 所以正常情况下这里**不会**出现跨事件重复。万一真出现（文档没承诺过），
+        # 策略是「绝不丢唤醒」：@ 副本照常放行并告警——想消除重复把 at_grace_seconds 设 1.5。
+        if kind == KIND_AT and is_group and key and self.dedup.kind_of(key) == KIND_FULL:
+            self._cross_pairs += 1
+            if self._cross_pairs == 1:
+                logger.warning(
+                    "[QQBOT-BRIDGE] 检测到同一条消息同时以「全量」和「@」两种事件到达"
+                    "（官方文档未说明会这样）。已按「绝不丢唤醒」放行两条；"
+                    "若上下文里看到重复，把 at_grace_seconds 设为 1.5 即可消除"
+                )
+
+        try:
+            event, reason = build_event(
+                adapter,
+                body,
+                Group=Group,
+                User=User,
+                KiraIMMessage=KiraIMMessage,
+                KiraMessageEvent=KiraMessageEvent,
+                kind=kind,
+                is_group=is_group,
+                force_mention=(kind == KIND_AT or not is_group),
+                mention_mode=self.mention_mode,
+                self_ids=collect_self_ids(adapter.get_client()),
+                dedup=self.dedup,
+                identities=self.identities if self.remember_nicknames else None,
+            )
+        except Exception as exc:
+            logger.warning("[QQBOT-BRIDGE] 构造事件失败（%s）: %s: %s", kind, type(exc).__name__, exc)
+            return
+
+        if event is None:
+            if reason != "duplicate":
+                logger.debug("[QQBOT-BRIDGE] 事件被丢弃（%s）: %s", kind, reason)
+            return
+
+        # 严格模式（可选，默认关）：全量副本先压住 at_grace 秒，@ 副本随后到达就让位。
+        # 代价是每条群消息都晚 at_grace 秒，所以默认 0 不启用。
+        if kind == KIND_FULL and is_group and self.unify_at and self.at_grace > 0 and key:
+            await asyncio.sleep(self.at_grace)
+            if self._stop.is_set():
+                return
+            if self.dedup.kind_of(key) == KIND_AT:
+                self._cross_pairs += 1
+                logger.debug("[QQBOT-BRIDGE] 全量副本被随后到达的 @ 事件取代，已丢弃")
+                return
+
+        self._handled += 1
+        self._log_sample_once(body, reason, kind)
+        try:
+            adapter.publish(event)
+        except Exception as exc:
+            logger.warning("[QQBOT-BRIDGE] 发布事件失败: %s", exc)
+
+    def _log_sample_once(self, body, source: str, kind: str):
+        if self._sample_logged or kind != KIND_FULL:
+            return
+        self._sample_logged = True
+        try:
+            sample = json.dumps(body.get("mentions"), ensure_ascii=False)[:400]
+        except Exception:
+            sample = "<?>"
+        author = body.get("author") if isinstance(body.get("author"), dict) else {}
+        logger.info(
+            "[QQBOT-BRIDGE] 首条全量群消息：@判定来源=%s；昵称=%r；mentions 原文=%s",
+            source, author.get("username"), sample,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 可选：主动消息通道（官方 bot 无被动窗口时兜底）
+    # ------------------------------------------------------------------ #
+    def _patch_send(self, adapter, name: str):
+        if name in self._patched_sends:
+            return
+        original = getattr(adapter, "_send_message", None)
+        if not callable(original):
+            return
+
+        async def _send_message(target_id, send_message_obj, is_group):
+            result = await original(target_id, send_message_obj, is_group)
+            ok = bool(getattr(result, "ok", True))
+            err = str(getattr(result, "err", "") or "")
+            if ok or "needs a received message" not in err:
+                return result
+            return await self._proactive_send(adapter, str(target_id), send_message_obj, is_group)
+
+        adapter._send_message = _send_message
+        self._patched_sends[name] = original
+        logger.info(
+            "[QQBOT-BRIDGE] %s: 主动消息通道已启用（最小间隔 %.0fs（0=不限速）；"
+            "配额交给官方判，本地不设上限）",
+            name, self.proactive_min_interval,
+        )
+
+    async def _proactive_send(self, adapter, target_id, send_message_obj, is_group):
+        client = adapter.get_client()
+        if client is None:
+            return KiraIMSentResult(ok=False, err="QQ official bot is not connected")
+
+        today = time.strftime("%Y-%m-%d")
+        if today != self._proactive_day:
+            self._proactive_day = today
+            self._proactive_count = 0
+        now = time.time()
+        if self.proactive_min_interval > 0 and \
+                now - self._last_proactive.get(target_id, 0.0) < self.proactive_min_interval:
+            return KiraIMSentResult(ok=False, err="proactive throttled by qqbot bridge")
+
+        text_content = getattr(adapter, "_text_content", None)
+        content = text_content(send_message_obj) if callable(text_content) else ""
+        media_elements = [e for e in send_message_obj if isinstance(e, (File, Image))]
+        if len(media_elements) > 1 or (not content and not media_elements):
+            return KiraIMSentResult(ok=False, err="qqbot bridge cannot send this message shape")
+
+        media = None
+        if media_elements:
+            upload_file = getattr(adapter, "_upload_file", None)
+            media_payload = getattr(adapter, "_media_payload", None)
+            if not callable(upload_file) or not callable(media_payload):
+                return KiraIMSentResult(ok=False, err="qqbot bridge cannot upload media on this core version")
+            try:
+                upload = await upload_file(target_id, media_elements[0], is_group)
+                media = media_payload(upload)
+            except Exception as exc:
+                return KiraIMSentResult(ok=False, err="proactive media upload failed: %s" % exc)
+            if not media:
+                return KiraIMSentResult(ok=False, err="proactive media upload returned no file_info")
+
+        payload = {"msg_type": 7 if media else 0, "content": content or None, "msg_seq": 1}
+        if media:
+            payload["media"] = media
+        try:
+            if is_group:
+                result = await client.api.post_group_message(group_openid=target_id, **payload)
+            else:
+                result = await client.api.post_c2c_message(openid=target_id, **payload)
+        except Exception as exc:
+            logger.warning("[QQBOT-BRIDGE] 主动消息发送失败: %s", exc)
+            return KiraIMSentResult(ok=False, err="proactive send failed: %s" % exc)
+
+        self._last_proactive[target_id] = now
+        self._proactive_count += 1
+        result_id = getattr(adapter, "_result_message_id", None)
+        message_id = result_id(result) if callable(result_id) else None
+        logger.info("[QQBOT-BRIDGE] 主动消息已发送（今日第 %d 条）", self._proactive_count)
+        return KiraIMSentResult(message_id=message_id)
