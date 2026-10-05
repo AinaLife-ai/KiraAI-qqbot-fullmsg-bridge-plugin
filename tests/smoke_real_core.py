@@ -183,6 +183,8 @@ async def main():
         check("消息链由真实 _message_chain 从 dict 构造",
               any(getattr(e, "text", "") == "大家早上好" for e in m.chain), repr(m.chain))
         check("回复锚点已回填", adapter._group_reply_ids.get("GRP_OPENID_1") == "MSG1")
+        check("链类型是 MessageChain（插件直接访问 .message_list）",
+              hasattr(m.chain, "message_list"), type(m.chain).__name__)
 
         # 默认聊天插件（builtin_plugins/chat）的契约：它只读这几个字段
         check("默认聊天插件契约：str(session) == sid（它用 str(event.session) 取缓冲）",
@@ -355,6 +357,8 @@ async def main():
               ats and ats[0].nickname and "（你）" in ats[0].nickname)
         check("识别为「叫自己」→ is_mentioned=True", evs[0].message.is_mentioned is True)
         check("其余文本原样保留", chain_repr(chain).endswith(" 妹"), chain_repr(chain))
+        check("★ 拆完 @ 后链仍是 MessageChain（S 版会直接访问 chain.message_list）",
+              hasattr(chain, "message_list"), type(chain).__name__)
 
     while not bus.empty():
         bus.get_nowait()

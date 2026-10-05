@@ -285,6 +285,16 @@ def chain_repr(chain):
     return "".join(getattr(e, "text", None) or getattr(e, "repr", None) or str(e) for e in chain)
 
 
+class StubChainLike:
+    """模拟 KiraAI 的 MessageChain：有 .message_list 属性（S 版插件直接访问它）。"""
+
+    def __init__(self, items):
+        self.message_list = list(items)
+
+    def __iter__(self):
+        return iter(self.message_list)
+
+
 class StubChain:
     def __init__(self, items):
         self.message_list = list(items)
@@ -687,6 +697,25 @@ def test_at_markup():
                                             ark_data={"ark_name": "位置", "fields": {"title": "某地"}}))
     check("build_event：卡片进了消息链", "卡片" in chain_repr(event.message.chain),
           chain_repr(event.message.chain))
+
+    # ---- 链类型必须保留（否则插件里的 chain.message_list 会 AttributeError） ----
+    class _ChainAdapter(StubAdapter):
+        def _message_chain(self, body, is_group, target_id):
+            content = body.get("content")
+            return StubChainLike([StubText(content if isinstance(content, str) else "")])
+
+    adapter_c = _ChainAdapter()
+    ev_c, _ = B.build_event(
+        adapter_c, gm_payload(content=f"<@{BOT}> 妹", mentions=[]),
+        Group=StubGroup, User=StubUser, KiraIMMessage=StubIMMessage,
+        KiraMessageEvent=StubEvent, kind=B.KIND_FULL, is_group=True,
+        self_identity=B.SelfIdentity(name="香里"), At=StubAt, Text=StubText,
+    )
+    check("★ 拆完 @ 之后链仍是原来的类型（保留 .message_list）",
+          hasattr(ev_c.message.chain, "message_list"), type(ev_c.message.chain).__name__)
+    check("拆完 @ 之后链内容正确",
+          isinstance(ev_c.message.chain.message_list[0], StubAt),
+          chain_repr(ev_c.message.chain))
 
     class _BoomClient:
         @property

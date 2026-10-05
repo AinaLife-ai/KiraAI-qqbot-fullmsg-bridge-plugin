@@ -857,9 +857,16 @@ def build_event(
             if oid is not None:
                 self_identity.openid = oid
                 self_identity.source = why
-        chain, hit_self, learned = split_at_markup(
+        split_chain, hit_self, learned = split_at_markup(
             chain, body, self_identity, learn_self=learn_self, At=At, Text=Text
         )
+        # ⚠ split_at_markup 返回的是普通 list，**必须还原成原来的链类型** ——
+        # KiraAI 的 MessageChain 才有 .message_list，插件（如 S 版 _process_media）
+        # 会直接访问它；直接吐 list 会让所有插件当场 AttributeError。
+        try:
+            chain.message_list = list(split_chain)      # MessageChain：原地替换，保留对象
+        except Exception:
+            chain = split_chain
         if learned and self_identity is not None and self_identity.openid is None:
             self_identity.openid = learned
             self_identity.source = "unresolved-markup"
