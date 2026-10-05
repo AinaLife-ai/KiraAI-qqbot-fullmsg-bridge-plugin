@@ -546,8 +546,8 @@ async def main():
     # ---- 14. 发出的 @ 是真 @（<qqbot-at-user id="..." />） ----
     from core.chat.message_elements import At as _At2, Text as _Text2
     encoded = adapter._text_content([_At2("9CD54739CC9BAA46B93243088802DC72", "周武"), _Text2("哥ww")])
-    check("★ 发出的 @ 是平台标记（不是纯文本 @昵称）",
-          encoded == '<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />哥ww', encoded)
+    check("★ 发出的 @ 是标记而不是纯文本 @昵称（默认 legacy 形态）",
+          encoded == '<@9CD54739CC9BAA46B93243088802DC72>哥ww', encoded)
     encoded2 = adapter._text_content([_Text2("hi"), _At2("all", "全体成员")])
     check("pid=all 退化成文本（平台不支持 @全体）",
           "qqbot-at-user" not in encoded2, encoded2)
@@ -587,6 +587,32 @@ async def main():
     if evs:
         text = chain_repr(evs[0].message.chain)
         check("★ 表情标记解码成可读文字", "[表情: 微笑]" in text and "faceType" not in text, text)
+
+    # ---- 17. 引用一条语音：被引用的语音也要变成可读文字 ----
+    while not bus.empty():
+        bus.get_nowait()
+    quote_voice = {
+        "id": "QV1",
+        "author": {"id": "UID1", "member_openid": "UID1", "username": "小明", "bot": False},
+        "content": " ",
+        "group_openid": "GRP_OPENID_1",
+        "message_type": 103,
+        "msg_elements": [{
+            "msg_idx": "REFIDX_v==",
+            "author": {"id": "UID2", "member_openid": "UID2", "username": "小红", "bot": False},
+            "message_type": 0,
+            "content": " ",
+            "attachments": [{"content_type": "voice", "asr_refer_text": "这是一段被引用的语音"}],
+        }],
+        "message_scene": {"source": "default", "ext": ["msg_idx=REFIDX_w==", "ref_msg_idx=REFIDX_v=="]},
+    }
+    parsers["group_message_create"]({"op": 0, "s": 60, "t": "GROUP_MESSAGE_CREATE", "id": "EVQV", "d": quote_voice})
+    evs = await drain(0.4)
+    if evs:
+        sub = [x for r in evs[0].message.chain if isinstance(r, RealReply) for x in (r.chain or [])]
+        check("★ 引用一条语音：被引用的语音变成可读文字（不再是 File）",
+              any("[语音: 这是一段被引用的语音]" in (getattr(x, "text", "") or "") for x in sub),
+              chain_repr(sub))
 
     await plugin0.terminate()
     check("grace=0 实例正常收尾", True)

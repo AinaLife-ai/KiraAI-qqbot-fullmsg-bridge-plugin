@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.5
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot兼容与增强补丁 v1.1.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -85,7 +85,8 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `learn_self_openid` | 开 | 自动学出机器人自己的 OpenID（优先 `mentions[].is_you`，兜底用"查不到的 @"反推） |
 | `reply_to_self_wakes` | 开 | **有人引用回复机器人的消息 = 被提及**（对齐 KiraAI 的 OneBot 适配器行为） |
 | `quote_reply` | 开 | **机器人也能「引用回复」** —— 官方发送接口支持 `message_reference`，填上就以引用形式展示 |
-| `send_at_mention` | 开 | **机器人发出的 @ 是真 @** —— 用平台要求的 `<qqbot-at-user id="openid" />` 标记 |
+| `send_at_mention` | 开 | **机器人发出的 @ 是真 @**（而不是纯文本 `@昵称`） |
+| `at_markup_style` | **legacy** | @ 标记形态：`legacy` = `<@openid>`（**默认**，平台自己下发用的那种）/ `new` = `<qqbot-at-user id="…" />`（官方文档推荐，但实测部分环境会被当纯文本原样显示） |
 | `enhance_rich_content` | 开 | **富内容归一化**：语音（含平台免费 ASR）/ 结构化卡片 / QQ 表情标记 → 都能读 |
 | `self_openid` | 空 | 通常留空＝全自动。只有自动识别猜错时才把它钉死 |
 
@@ -202,11 +203,15 @@ KiraAI 原生适配器会先把事件包装成 botpy 的 `GroupMessage` 对象�
 
 ### 机器人 @ 人，也是真 @ 吗？
 
-**是** —— 但要用平台认的标记，纯文本不行。平台发送侧要求的是：
+**是** —— 但要用平台认的标记，纯文本不行。官方《文本交互》文档给了**两种**写法：
 
-```
-<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />
-```
+| 形态 | 写法 | 情况 |
+|---|---|---|
+| **new** | `<qqbot-at-user id="openid" />` | 文档推荐；**但实测在你那边被当纯文本原样显示了** ❌ |
+| **legacy**（默认） | `<@openid>` | 文档标注"即将弃用"，**可它正是平台自己下发给我们**的形态（入站 content 里的 @ 就是它），客户端一定认 ✅ |
+
+⇒ 默认走 `legacy`（"平台自己在用什么，我就用什么"这条原则），要试官方新写法把
+`at_markup_style` 改成 `new` 即可。
 
 KiraAI 原实现只拼了个纯文本 `@{element.nickname or element.pid}`，所以群里看到的是
 **一串 openid 文本**（用户实测："@9CD54739CC9BAA46B93243088802DC72哥ww"）。
@@ -336,6 +341,25 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.1.6</b> — @ 标记形态可配 + 引用语音可读 + 引用诊断</summary>
+
+**@ 标记形态**
+- 官方文档推荐 `<qqbot-at-user id="…" />`，但**实测在部分环境会被当纯文本原样显示**；
+  默认改用 **legacy 形态 `<@openid>`** —— 那是**平台自己下发给我们**用的写法，客户端一定认
+- 新增 `at_markup_style`（`legacy` / `new`）可随时切换
+
+**引用里的富内容**
+- 之前只归一化顶层 body，**引用元素（`msg_elements`）里的语音/卡片/表情没被处理** ⇒
+  「引用一条语音」时 LLM 读不出内容、容易答非所问。现在引用元素同样归一化
+
+**可观测（引用回复诊断）**
+- 首次拿到 REFIDX 会打一条 INFO；连续 3 条消息都没有 `message_scene.ext.msg_idx` 会打 WARNING
+  （带 body 顶层键与 `message_scene` 样本）
+- 机器人想引用却找不到 REFIDX 时提示一次（本条按普通回复发出）
+
+</details>
+
+<details>
 <summary><b>v1.1.5</b> — 紧急修复：消息链类型丢失</summary>
 
 **问题（v1.1.1 引入的回归）**

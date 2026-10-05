@@ -344,14 +344,21 @@ AT_MARKUP_RE = re.compile(
 )
 
 
-def at_user_markup(pid) -> str:
-    """发送侧 @ 某人的标记 —— 平台的富文本格式，客户端会渲染成**真正的 @**。
+def at_user_markup(pid, style: str = "legacy") -> str:
+    """发送侧 @ 某人的标记 —— 客户端会渲染成**真正的 @**。
 
-    对齐参考：AstrBot 的 qqofficial 发送路径就是
-    ``plain_text += f'<qqbot-at-user id="{mention_id}" />'``。
-    只拼 ``@昵称``/``@openid`` 是纯文本，QQ 不会渲染成提及（用户实测反馈）。
+    官方《文本交互》文档给了两种写法：
+
+    * ``new``（文档推荐）：``<qqbot-at-user id="openid" />`` —— 但**实测在群里被当纯文本
+      原样显示**（用户反馈），疑与环境/版本有关；
+    * ``legacy``（**默认**）：``<@openid>`` —— 文档标注"即将弃用"，可它正是**平台自己
+      下发给我们**用的形态（入站 content 里的 @ 就是它），客户端一定认。
+
+    ⇒ 默认 ``legacy``（"平台自己在用什么，我就用什么"），可用 ``at_markup_style`` 切到 ``new``。
     """
-    return '<qqbot-at-user id="%s" />' % pid
+    if str(style).lower() == "new":
+        return '<qqbot-at-user id="%s" />' % pid
+    return "<@%s>" % pid
 
 
 def _match_at_id(match) -> str:
@@ -529,8 +536,21 @@ def render_ark_card(body: dict):
     return f"[卡片: {kind}{' - ' + detail if detail else ''}]"
 
 
-def normalize_rich_body(body: dict, enhance: bool = True):
+def _normalize_element(elem, out_notes):
+    """对单个元素（顶层 body 或 msg_elements 里的条目）做富内容归一化。"""
+    if not isinstance(elem, dict):
+        return elem
+    new, notes = normalize_rich_body(elem, enhance=True, _depth=1)
+    if notes and isinstance(out_notes, list):
+        out_notes.extend(notes)
+    return new
+
+
+def normalize_rich_body(body: dict, enhance: bool = True, _depth: int = 0):
     """把官方 bot 特有的、框架不认识的几种形态转成框架能读的样子。
+
+    顶层 body 与 `msg_elements[]` 里的**引用元素**都会处理（``_depth`` 防递归）——
+    否则"引用一条语音"时，被引用的语音不会被归一化，LLM 读不出来。
 
     ① **语音**：官方把 ``content_type`` 写成 ``voice``（不是 mime），框架会判成 File。
        有平台自带的 ``asr_refer_text``（腾讯免费 ASR）时直接用它当文本，不再跑本地 STT；
@@ -583,7 +603,7 @@ def normalize_rich_body(body: dict, enhance: bool = True):
             _mtype = int(body.get("message_type") or 0)
         except (TypeError, ValueError):
             _mtype = 0
-        if _mtype == 3 or isinstance(body.get("ark_data"), dict):
+        if _mtype in (3, 103) or isinstance(body.get("ark_data"), dict):
             card = render_ark_card(body)
             if card:
                 content = str(new.get("content") or "")
@@ -608,6 +628,15 @@ def normalize_rich_body(body: dict, enhance: bool = True):
                 new = dict(new)
                 new["content"] = new_content
                 notes.append("face-markup")
+        # ④ 引用消息里的元素同样归一化
+        if _depth == 0:
+            elements = new.get("msg_elements")
+            if isinstance(elements, list) and elements:
+                fixed = [_normalize_element(elem, notes) for elem in elements]
+                if fixed != elements:
+                    new = dict(new)
+                    new["msg_elements"] = fixed
+                    notes.append("quoted-elements")
     except Exception:
         return body, []
 

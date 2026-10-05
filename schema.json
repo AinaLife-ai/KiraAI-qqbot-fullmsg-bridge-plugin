@@ -83,6 +83,16 @@
         "default": true,
         "hint": "平台发送侧要求用富文本标记 <qqbot-at-user id=\"openid\" /> 才会渲染成真正的提及；KiraAI 原实现只拼了纯文本「@昵称」，群里看到的是一串 openid 文本（用户实测）。开启后机器人 @ 人就是真 @。注：平台不支持 @全体，pid=all 时会退化成文本。"
       },
+      "at_markup_style": {
+        "name": "@ 标记形态",
+        "type": "string",
+        "options": [
+          "legacy",
+          "new"
+        ],
+        "default": "legacy",
+        "hint": "官方文档推荐 <qqbot-at-user id=...> 这种写法（new），但实测在部分环境会被当纯文本原样显示；legacy 是 <@openid> —— 文档标注即将弃用，可它正是平台自己下发给我们用的形态，客户端一定认。默认 legacy；若你那边 new 能正常渲染，可以切过去。"
+      },
       "enhance_rich_content": {
         "name": "富内容归一化（推荐开）",
         "type": "switch",

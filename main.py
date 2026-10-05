@@ -143,6 +143,7 @@ class QQOfficialGroupBridge(BasePlugin):
         self.quote_reply = bool(basic.get("quote_reply", True))
         self.send_at_mention = bool(basic.get("send_at_mention", True))
         self.enhance_rich = bool(basic.get("enhance_rich_content", True))
+        self.at_markup_style = str(basic.get("at_markup_style", "legacy") or "legacy").lower()
         self.pinned_self_openid = str(basic.get("self_openid", "") or "").strip()
 
         proactive = cfg.get("section_proactive", {}) or {}
@@ -175,6 +176,9 @@ class QQOfficialGroupBridge(BasePlugin):
         self._self_logged = set()
         self._at_sample_logged = False
         self._rich_logged = set()
+        self._ref_diag_done = False
+        self._ref_miss = 0
+        self._quote_miss_logged = False
         self._last_proactive = {}
         #: 仅用于日志观测（今日主动消息条数），不做任何限制——配额由官方判
         self._proactive_day = ""
@@ -528,6 +532,7 @@ class QQOfficialGroupBridge(BasePlugin):
             ref = extract_msg_idx(body)
             if ref:
                 self._remember_ref(str(event.session.sid), str(event.message.message_id), ref)
+            self._log_ref_diag(body, ref)
 
         # 严格模式（可选，默认关）：全量副本先压住 at_grace 秒，@ 副本随后到达就让位。
         # 代价是每条群消息都晚 at_grace 秒，所以默认 0 不启用。
@@ -645,9 +650,48 @@ class QQOfficialGroupBridge(BasePlugin):
         except Exception:
             return None
         for ele in chain:
-            if isinstance(ele, Reply):
-                return self._ref_idx.get((sid, str(getattr(ele, "message_id", "") or "")))
+            if not isinstance(ele, Reply):
+                continue
+            display_id = str(getattr(ele, "message_id", "") or "")
+            ref = self._ref_idx.get((sid, display_id))
+            if ref:
+                return ref
+            # 兜底：sid 对不上时按展示态 id 全局找（map 有上限，扫描很便宜）
+            for (_, known_id), known_ref in self._ref_idx.items():
+                if known_id == display_id:
+                    return known_ref
+            if not self._quote_miss_logged:
+                self._quote_miss_logged = True
+                logger.warning(
+                    "[QQBOT-BRIDGE] 机器人想引用 %s，但没找到对应的 REFIDX（已知 %d 条）——"
+                    "本条按普通回复发出",
+                    display_id, len(self._ref_idx),
+                )
         return None
+
+    def _log_ref_diag(self, body, ref) -> None:
+        """一次性诊断：让用户一眼看出 REFIDX 到底有没有、长什么样。"""
+        if self._ref_diag_done:
+            return
+        if ref:
+            self._ref_diag_done = True
+            logger.info(
+                "[QQBOT-BRIDGE] 引用回复：已记录第 1 个 REFIDX（来自 message_scene.ext.msg_idx）"
+                "—— 机器人之后可以引用这条消息"
+            )
+            return
+        self._ref_miss += 1
+        if self._ref_miss >= 3:
+            self._ref_diag_done = True
+            try:
+                scene = body.get("message_scene")
+            except Exception:
+                scene = None
+            logger.warning(
+                "[QQBOT-BRIDGE] 连续 %d 条消息都没有 message_scene.ext.msg_idx —— "
+                "机器人将无法「引用回复」。body 顶层键=%s；message_scene=%s",
+                self._ref_miss, list(body)[:14], scene,
+            )
 
     def _patch_send_path(self, adapter, name: str, client) -> None:
         if name in self._patched_sends:
@@ -692,13 +736,15 @@ class QQOfficialGroupBridge(BasePlugin):
         if not callable(original) or getattr(original, "_kira_bridge_at", False):
             return
 
+        style = self.at_markup_style
+
         def _text_content(send_message_obj):
             rewritten = []
             for element in send_message_obj:
                 if isinstance(element, At):
                     pid = str(getattr(element, "pid", "") or "")
                     if pid and pid != "all" and pid.isalnum():
-                        rewritten.append(Text(at_user_markup(pid)))
+                        rewritten.append(Text(at_user_markup(pid, style)))
                     else:
                         name = getattr(element, "nickname", None) or pid or "全体成员"
                         rewritten.append(Text("@" + name))
