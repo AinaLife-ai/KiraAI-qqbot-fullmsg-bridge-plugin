@@ -648,8 +648,11 @@ def test_at_markup():
     check("接替后挂的是新 handler", holder.on_x is _h2)
 
     # ---- 发出的 @：平台标记（不是纯文本） ----
-    check("构造平台认的 @ 标记",
+    check("默认用 legacy 形态（平台自己下发用的那种，客户端一定认）",
           B.at_user_markup("9CD54739CC9BAA46B93243088802DC72")
+          == "<@9CD54739CC9BAA46B93243088802DC72>")
+    check("可切到官方文档推荐的 new 形态",
+          B.at_user_markup("9CD54739CC9BAA46B93243088802DC72", "new")
           == '<qqbot-at-user id="9CD54739CC9BAA46B93243088802DC72" />')
     check("两种 @ 形态都能抓取",
           B.extract_at_ids('<@0A0B9F323E6AA18BF08B6901A3B2DEFC>') == ["0A0B9F323E6AA18BF08B6901A3B2DEFC"]
@@ -716,6 +719,19 @@ def test_at_markup():
     check("拆完 @ 之后链内容正确",
           isinstance(ev_c.message.chain.message_list[0], StubAt),
           chain_repr(ev_c.message.chain))
+
+    # ---- 引用元素里的富内容也要归一化（引用一条语音时否则读不出来） ----
+    q_voice = {"content": " ", "message_type": 103, "msg_elements": [
+        {"content": " ", "attachments": [
+            {"content_type": "voice", "asr_refer_text": "这是被引用的语音"}]}]}
+    nq, notes_q = B.normalize_rich_body(q_voice)
+    check("★ 引用元素里的语音也被归一化成文字",
+          "quoted-elements" in notes_q and "voice-asr" in notes_q
+          and nq["msg_elements"][0]["content"] == "[语音: 这是被引用的语音]", str(nq["msg_elements"]))
+    q_card = {"content": " ", "message_type": 103, "msg_elements": [
+        {"content": "", "ark_data": {"ark_name": "位置", "fields": {"title": "某地"}}}]}
+    nq2, notes_q2 = B.normalize_rich_body(q_card)
+    check("引用元素里的卡片也被渲染", "卡片" in str(nq2["msg_elements"][0].get("content")), str(notes_q2))
 
     class _BoomClient:
         @property
