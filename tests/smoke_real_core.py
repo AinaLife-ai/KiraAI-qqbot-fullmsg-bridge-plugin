@@ -641,6 +641,24 @@ async def main():
             renders.add(chain_repr(ev.message.chain))
     check("★ 同一内容 30 次 → 渲染逐字节一致（不吃掉提示词缓存）", len(renders) == 1, len(renders))
 
+    # 状态无关性：灌 50 条别的消息后重放同一条，渲染必须仍与首次一致
+    first_render = sorted(renders)[0] if renders else ""
+    for i in range(50):
+        other = dict(det_base)
+        other["id"] = f"NOISE{i}"
+        other["content"] = f"无关消息 {i}"
+        other["author"] = {"id": f"UN{i}", "member_openid": f"UN{i}",
+                           "username": f"路人{i}", "bot": False}
+        parsers["group_message_create"]({"op": 0, "s": 400 + i, "t": "GROUP_MESSAGE_CREATE",
+                                        "id": f"EVN{i}", "d": other})
+        await drain(0.05)
+    replay = dict(det_base)
+    replay["id"] = "REPLAY1"
+    parsers["group_message_create"]({"op": 0, "s": 700, "t": "GROUP_MESSAGE_CREATE", "id": "EVRE", "d": replay})
+    replayed = {chain_repr(ev.message.chain) for ev in await drain(0.3)}
+    check("★ 状态无关：50 条杂音后重放同一条，渲染与首次完全一致（注入内容是纯函数）",
+          replayed == {first_render}, f"{len(replayed)} 种")
+
     # ---- 19. 引用索引是「适配器级」共享的：热重载换实例也要能查到 ----
     from core.chat.message_elements import Reply as _SR, Text as _ST
     plugin_extra = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)

@@ -313,7 +313,7 @@ python3 tests/run_tests.py
 | `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
 | `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
 | `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **171/171** |
-| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **82/82** |
+| `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **83/83** |
 
 ```bash
 # 冒烟需要真实源码路径（找不到会自动跳过）
@@ -375,6 +375,11 @@ if not callable(original) or getattr(original, "_kira_bridge_at", False):
 **诊断加强**（下次一眼定位）
 - 记录时打前 3 条：`引用索引 +1：键=(qq:gm:xxx, qqo-xxxx) ← REFIDX_yyy==`
 - 查找失败时把**已知的 id 列出来**：`没找到对应的 REFIDX（已知 5 条：qqo-abcd…, qqo-efgh…）`
+
+**缓存友好性（同时加固）**
+- 新增断言：**50 条无关消息之后再重放同一条 → 渲染与首次逐字节一致**
+  （证明注入内容是「消息 + 已学身份」的纯函数，不受后续状态影响）
+- 审计确认：v1.1.7 / v1.1.8 的改动**全在发送侧**，没碰任何 LLM 看得到的内容
 
 </details>
 
