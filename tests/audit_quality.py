@@ -214,7 +214,9 @@ async def main():
         "markdown 标签": p5.markdown_enabled,
         "键盘标签": p5.keyboard_enabled,
         "互动回调": p5.interaction_enabled,
-        "群管理工具": p5.admin_tools_enabled,
+        "群信息（含人数）": p5.group_info_enabled,
+        "按名字找人": p5.member_query_enabled,
+        "读附件文件": p5.receive_files,
         "成员事件开关": p5.member_notice_enabled,
         "引用回复注入": p5.quote_reply,
         "发出的 @ 是真 @": p5.send_at_mention,
@@ -234,17 +236,31 @@ async def main():
         "markdown_enabled": default_plugin.markdown_enabled,
         "keyboard_enabled": default_plugin.keyboard_enabled,
         "interaction_enabled": default_plugin.interaction_enabled,
-        "admin_tools_enabled": default_plugin.admin_tools_enabled,
+        "group_info_enabled": default_plugin.group_info_enabled,
+        "member_query_enabled": default_plugin.member_query_enabled,
+        "receive_files": default_plugin.receive_files,
         "member_notice_enabled": default_plugin.member_notice_enabled,
         "proactive_enabled": default_plugin.proactive_enabled,
         "enabled": default_plugin.enabled,
     }
     for k, v in default_flags.items():
-        if k == "extra_intents":
-            continue
         check(f"默认开启：{k}", bool(v))
-    check("★ 默认关闭：extra_intents（保护「能收消息」这个基本盘）",
-          default_plugin.extra_intents is False)
+    check("★ 默认开启：extra_intents（2026-10-07 用户指令；有自愈回退兜底）",
+          default_plugin.extra_intents is True)
+    # ★ v1.3.3 分组原则：需要群管理权限的一律默认关
+    for k, v in {
+        "admin_tools_enabled": default_plugin.admin_tools_enabled,
+        "admin_mute": default_plugin.admin_mute,
+        "admin_mute_state": default_plugin.admin_mute_state,
+        "admin_join_approval": default_plugin.admin_join_approval,
+        "admin_recall_others": default_plugin.admin_recall_others,
+        "admin_member_roster": default_plugin.admin_member_roster,
+        "admin_kick": default_plugin.admin_kick,
+        "admin_blacklist": default_plugin.admin_blacklist,
+        # ★ 2026-10-07 复查官方文档后归入此类：加群申请事件需要群管理员
+        "join_request_notice_enabled": default_plugin.join_request_notice_enabled,
+    }.items():
+        check(f"★ 默认关闭（需管理员权限）：{k}", bool(v) is False)
 
     # 2.x 专属能力（在 2.x 核心上验证，这里只检查开关存在）
     check("2.x 专属：unify_at / unify_dm 开关仍在",

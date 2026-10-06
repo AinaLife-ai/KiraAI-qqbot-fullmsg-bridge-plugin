@@ -28,6 +28,29 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_join_request_injection.py ★ 加群申请/成员通知的**防注入**（借鉴群管插件做法：
+                        截断 + 明标不可信 + 明确说别当指令）+ 带上 openid。
+  audit_join_request_flow.py ★ 把「模型眼里的成员事件/加群申请」完整跑出来：
+                       notice 原文 → list 返回 → approve/decline 实际请求。
+  audit_peer_misuse.py  ★ 实测：同类插件的工具在**官 bot 会话**里被误选会怎样
+                       （工具是全局注册的 → 会被看到；但被平台判定/能力缺失拦住，
+                        且框架兜住异常 ⇒ 不会真的误用）。
+  audit_framework_peers.py ★ 对照**框架内置插件 + S 版 + Z 版**：确认我们新
+                       增的文件方法与昵称来源不冲突、不重复、只补缺口。
+  audit_core_files.py  ★ 核对**核心原生是否已支持发文件**（结论：已支持 ⇒ 我们
+                       不实现 send_qq_file，避免重复）。2.x/3.0 双核心报文级验证。
+  audit_peers_v133.py  ★ 与三个同类插件（gmp/gmv/qfm）**逐条源码核对**零冲突：
+                       工具名不重名 / 平台门禁互斥 / 无 monkeypatch / 钩子不覆盖，
+                       外加四个既有合作插件回归。
+  audit_tools_v133.py  ★ v1.3.3 分组开关（不需权限默认开 / 需权限默认关）、
+                       内邀自动探测、通讯录 mentions 来源、存量升级无感、文案规范。
+  audit_tools_v133b.py ★ v1.3.3 新工具的**报文级**行为 + 错误人话化 + 守卫不发请求。
+  audit_intent_timing.py ★ 时序仿真：复现「适配器先连、插件后加载」，验证重连时
+                       实际发出的鉴权报文带上了额外订阅位（1<<24 / 1<<26）。
+  audit_recall_intent.py ★ 撤回 id 反查（展示态 qqo-xxx → 官方真实 id）+
+                       intent 注入点（ws_identify 正主 / send_msg 探针 / Client.start）。
+  audit_identity.py    ★ 私聊昵称：跨场景共享（群里认识过的人私聊也认得）+ 自动更新
+                       （改名跟随）+ 引用消息学昵称 + 旧数据自动迁移。
   audit_hint_render.py ★ 配置文案渲染安全：hint 经过 JSON 层 / 核心层 / 前端两套
                        渲染路径（{{ }} 纯文本 与 v-html+escapeHtml）后不破版；
                        校验「只用中文引号、不写裸尖括号、不写 markdown 标记」。
@@ -47,7 +70,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py", "audit_hint_render.py"]
+          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py"]
 
 rc = 0
 for suite in SUITES:

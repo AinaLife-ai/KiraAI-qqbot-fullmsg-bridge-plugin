@@ -339,9 +339,15 @@ async def main():
     req, tags = FakeReq(), FakeTagSet()
     plugin.inject_tools_and_tags(FakeEvent(adapter.info), req, tags)
     names = sorted(t.name for t in req.tool_set.tools)
-    check("群管理工具已注入",
-          {"recall_qq_msg", "set_qq_group_ban", "get_group_mute_state", "get_qq_bot_state"} <= set(names),
+    check("无需权限的工具已注入（默认配置）",
+          {"recall_qq_msg", "get_qq_group_info", "find_qq_group_member",
+           "read_qq_attached_file", "get_qq_bot_state"} <= set(names),
           str(names))
+    check("★ 需管理员权限的工具默认不注入",
+          not ({"set_qq_group_ban", "get_group_mute_state",
+                "manage_qq_group_join_request", "kick_qq_group_member",
+                "get_qq_group_member_roster",
+                "manage_qq_group_blacklist"} & set(names)), str(names))
     tag_names = sorted(t.name for t in tags.tags)
     check("markdown / keyboard 标签已注册", {"markdown", "keyboard"} <= set(tag_names), str(tag_names))
     check("标签描述会进提示词", "markdown" in tags.to_prompt() and "keyboard" in tags.to_prompt())

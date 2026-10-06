@@ -42,10 +42,13 @@ print("\n[B1] 文档/PR 里承诺过的行为")
 check("B1-1 intent 自愈：有健康检查函数", "def _health_check_intents" in main_src)
 check("B1-2 intent 自愈：巡检循环里真的会调",
       "self._health_check_intents()" in main_src)
-check("B1-3 intent 自愈：能真正读到网关状态（探针）",
-      "def _install_gateway_probe" in main_src and "BotWebSocket" in main_src)
-check("B1-4 intent 自愈：还原时同时摘掉探针",
-      "_kira_bridge_probe" in main_src and main_src.count("_kira_bridge_probe") >= 3)
+check("B1-3 intent 自愈：能真正读到网关状态（借 send_msg 探针抓网关）",
+      "def _install_intent_patches" in main_src and "BotWebSocket.send_msg" in main_src
+      and "_can_reconnect" in main_src)
+check("B1-4 intent 自愈：还原时同时摘掉三个补丁",
+      main_src.count("_kira_bridge_probe") >= 3
+      and "_kira_bridge_intent" in main_src
+      and "ws_identify" in main_src)
 
 # 承诺 2：3 秒内回执
 check("B1-5 互动回执有超时保护（不死等）", "wait_for" in int_src and "_ACK_TIMEOUT" in int_src)
@@ -107,7 +110,7 @@ import json
 sk = set()
 for sec in json.loads(schema).values():
     sk |= set(sec.get("fields", {}))
-ck = set(re.findall(r'(?:basic|proactive)\.get\("([a-z_0-9]+)"', main_src))
+ck = set(re.findall(r'(?:basic|proactive|member|admin)\.get\("([a-z_0-9]+)"', main_src))
 rk = set(re.findall(r"^\| `([a-z_0-9]+)` \|", readme, re.M))
 check("B4-1 代码读取的键都在 schema", not (ck - sk), str(sorted(ck - sk)))
 check("B4-2 schema 的键都被读取", not (sk - ck), str(sorted(sk - ck)))

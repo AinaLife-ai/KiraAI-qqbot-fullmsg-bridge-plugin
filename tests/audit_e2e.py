@@ -165,7 +165,15 @@ async def main():
     from admin_tools import build_tools
 
     ev_tool = FakeToolEvent()
-    tools = {t.name: t(ctx=p4.ctx) for t in build_tools({})}
+    # v1.3.3：需管理员权限的工具默认关，这里按"全开"构建以覆盖全部 12 个工具
+    tools = {t.name: t(ctx=p4.ctx) for t in build_tools({
+        "recall_enabled": True, "group_info_enabled": True,
+        "member_query_enabled": True, "receive_files": True,
+        "bot_state_enabled": True,
+        "admin_tools_enabled": True, "mute_enabled": True,
+        "mute_state_enabled": True, "join_approval_enabled": True,
+        "kick_enabled": True, "roster_enabled": True, "blacklist_enabled": True,
+    })}
 
     r1 = await tools["recall_qq_msg"].execute(ev_tool, message_id="ROBOT1.0_x")
     recall_call = next((c for c in calls if c["method"] == "DELETE"), None)
