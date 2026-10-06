@@ -139,7 +139,7 @@ schema = json.loads((ROOT / "schema.json").read_text(encoding="utf-8"))
 schema_keys = set()
 for sec in schema.values():
     schema_keys |= set(sec.get("fields", {}))
-code_keys = set(re.findall(r'(?:basic|proactive)\.get\("([a-z_0-9]+)"', main_src))
+code_keys = set(re.findall(r'(?:basic|proactive|member|admin)\.get\("([a-z_0-9]+)"', main_src))
 readme_keys = set(re.findall(r"^\| `([a-z_0-9]+)` \|", (ROOT / "README.md").read_text(encoding="utf-8"), re.M))
 check("代码读的键都在 schema", not (code_keys - schema_keys), str(sorted(code_keys - schema_keys)))
 check("schema 的键都被读", not (schema_keys - code_keys), str(sorted(schema_keys - code_keys)))

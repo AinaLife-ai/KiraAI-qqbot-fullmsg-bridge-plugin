@@ -239,9 +239,15 @@ def main():
     # ---------------- B. 工具共存 ----------------
     print("\n[B] 工具共存")
     tools = sorted(t.name for t in req.tool_set.tools)
-    check("bridge 的 4 个群管理工具已注入",
-          {"recall_qq_msg", "set_qq_group_ban", "get_group_mute_state",
+    check("bridge 的无需权限工具已注入（默认配置）",
+          {"recall_qq_msg", "get_qq_group_info", "find_qq_group_member",
+           "read_qq_attached_file", "send_qq_file",
            "get_qq_bot_state"} <= set(tools), str(tools))
+    check("★ 需管理员权限的工具默认不注入（v1.3.3 分组）",
+          not ({"set_qq_group_ban", "get_group_mute_state",
+                "manage_qq_group_join_request", "kick_qq_group_member",
+                "get_qq_group_member_roster",
+                "manage_qq_group_blacklist"} & set(tools)), str(tools))
 
     # ---------------- C. Z 版补丁目标 ----------------
     print("\n[C] Z 版（Default Chat Z）补丁目标与 bridge 无重叠")

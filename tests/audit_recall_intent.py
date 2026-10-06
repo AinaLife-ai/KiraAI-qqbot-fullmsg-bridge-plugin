@@ -165,7 +165,7 @@ def main():
           "intent" in src_identify and "|" in src_identify, src_identify[:80])
 
     # 关掉开关时不应该动
-    p2 = bridge_main.QQOfficialGroupBridge(FakeCtx(adapter), {"section_basic": {}})
+    p2 = bridge_main.QQOfficialGroupBridge(FakeCtx(adapter), {"section_basic": {"extra_intents": False}})
     fc2 = FakeClient()
     p2._upgrade_live_client(adapter, "qq", fc2)
     check("extra_intents 关时不改客户端", fc2.intents == (1 << 25), bin(fc2.intents))

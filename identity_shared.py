@@ -51,15 +51,19 @@ class IdentityStore:
     真正的写盘由插件用 ``asyncio.to_thread`` 调 :meth:`save`。
     """
 
-    __slots__ = ("path", "max_entries", "_store", "_dirty", "_last_seen")
+    __slots__ = ("path", "max_entries", "_store", "_dirty", "_roles")
 
-    #: 数据格式版本（v2 = 跨场景共享；v1 = 旧的按场景隔离）
+    #: 数据格式版本（v2 = 跨场景共享 + 群内角色；v1 = 旧的按场景隔离）
     FORMAT = 2
+
+    #: 群内角色的中文说法
+    ROLE_TEXT = {"owner": "群主", "admin": "管理员", "member": "普通成员"}
 
     def __init__(self, path: Optional[str] = None, max_entries: int = 4000):
         self.path = path
         self.max_entries = int(max_entries)
         self._store: "OrderedDict[str, tuple]" = OrderedDict()   # key -> (name, ts)
+        self._roles: "OrderedDict[str, str]" = OrderedDict()     # key -> role
         self._dirty = False
         if path:
             self.load()
@@ -107,6 +111,113 @@ class IdentityStore:
         """只查不写（给需要"顺带看一眼"的地方用）。"""
         item = self._store.get(self._key(adapter, uid))
         return item[0] if item else None
+
+    # ------------------------------------------------------------------ #
+    # ★ 第三个免费来源：@ 消息的 `mentions[]`
+    # ------------------------------------------------------------------ #
+    def remember_from_mentions(self, adapter: str, mentions: Any) -> int:
+        """从群 @ 消息的 `mentions[]` 里学昵称**和群内角色**（免费的第三来源）。
+
+        官方 `GROUP_AT_MESSAGE_CREATE` 事件文档原文：
+
+            mentions [] User  消息中@的用户列表（不含@机器人自身）
+            User: id / username / bot / union_openid / union_user_account /
+                  user_openid / member_openid / member_role
+
+        为什么值得单独做：**@ 是群里最常见的动作**，所以这条路径能让通讯录
+        明显变厚；而且 `member_role` 是**官方唯一免费给出的角色信息**
+        （群主/管理员/普通成员），正好补上"想知道谁是管理员"的需求
+        —— `GET .../members` 那个接口是内邀档，多数机器人用不了。
+
+        零额外请求：`mentions` 本来就在事件里，我们只是**以前没拿它学昵称**。
+
+        :returns: 新学到/更新了几条。
+        """
+        if not isinstance(mentions, list):
+            return 0
+        learned = 0
+        for item in mentions:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("username")
+            uid = (item.get("member_openid") or item.get("user_openid")
+                   or item.get("id"))
+            if not uid:
+                continue
+            if isinstance(name, str) and name.strip():
+                if self.remember(adapter, "any", str(uid), name.strip()):
+                    learned += 1
+            role = item.get("member_role")
+            if isinstance(role, str) and role:
+                if self._remember_role(adapter, str(uid), role):
+                    learned += 1
+        return learned
+
+    def _remember_role(self, adapter: str, uid: str, role: str) -> bool:
+        key = self._key(adapter, uid)
+        if self._roles.get(key) == role:
+            return False
+        self._roles[key] = role
+        self._roles.move_to_end(key)
+        while len(self._roles) > self.max_entries:
+            self._roles.popitem(last=False)
+        self._dirty = True
+        return True
+
+    def role_of(self, adapter: str, uid: str) -> str:
+        """取群内角色的中文说法；没记过返回空串。"""
+        return self.ROLE_TEXT.get(self._roles.get(self._key(adapter, uid), ""), "")
+
+    def search(self, adapter: str, keyword: str, limit: int = 20) -> list:
+        """按关键词在**本机器人见过的成员**里找人。
+
+        匹配范围：昵称（子串、忽略大小写）、以及 openid（支持前缀）。
+        返回 ``[{"uid", "name", "role"}...]``；**按最近活跃度排序**
+        （`_store` 是 OrderedDict，`lookup` 会 move_to_end，所以越靠后越新）。
+
+        ⚠ 诚实边界：官方机器人**拿不到全群名册**（`members` 接口属"内邀接入中"），
+        所以我们只能搜"发过言 / 被引用过 / 被 @ 过"的人。调用方应如实告知用户。
+        """
+        kw = (keyword or "").strip()
+        if not kw:
+            return []
+        low = kw.lower()
+        prefix = f"{adapter}|"
+        hits = []
+        # 从新到旧遍历（逆序 = 最近活跃在前）
+        for key in reversed(list(self._store.keys())):
+            if not key.startswith(prefix):
+                continue
+            item = self._store.get(key)
+            if not item:
+                continue
+            name, _ts = item[0], item[1]
+            uid = key[len(prefix):]
+            if low in (name or "").lower() or uid.lower().startswith(low):
+                hits.append({
+                    "uid": uid,
+                    "name": name,
+                    "role": self.role_of(adapter, uid),
+                })
+                if len(hits) >= limit:
+                    break
+        return hits
+
+    def all_members(self, adapter: str, limit: int = 0) -> list:
+        """列出本机器人见过的全部成员（新的在前）。`limit<=0` 表示不限。"""
+        prefix = f"{adapter}|"
+        out = []
+        for key in reversed(list(self._store.keys())):
+            if not key.startswith(prefix):
+                continue
+            item = self._store.get(key)
+            if not item:
+                continue
+            uid = key[len(prefix):]
+            out.append({"uid": uid, "name": item[0], "role": self.role_of(adapter, uid)})
+            if limit and len(out) >= limit:
+                break
+        return out
 
     def remember_from_quoted(self, adapter: str, elements: Any) -> int:
         """从引用消息的 `msg_elements[]` 里学昵称（免费的第二来源）。
@@ -158,8 +269,13 @@ class IdentityStore:
 
         migrated = False
         store = self._store
-        # 新格式：{"version": 2, "names": {key: [name, ts]}}
+        # 新格式：{"version": 2, "names": {key: [name, ts]}, "roles": {key: role}}
         names = data.get("names") if isinstance(data.get("names"), dict) else data
+        roles = data.get("roles")
+        if isinstance(roles, dict):
+            for k, v in roles.items():
+                if isinstance(k, str) and isinstance(v, str) and v:
+                    self._roles[k] = v
 
         def looks_like_openid(text: str) -> bool:
             """32 位 hex ⇒ 旧数据里"没学到名字"的占位（当时回退成了 uid）。"""
@@ -209,6 +325,7 @@ class IdentityStore:
             payload = {
                 "version": self.FORMAT,
                 "names": {k: [v[0], v[1]] for k, v in self._store.items()},
+                "roles": dict(self._roles),
             }
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:

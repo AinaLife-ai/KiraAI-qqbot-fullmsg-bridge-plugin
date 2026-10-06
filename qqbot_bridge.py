@@ -943,7 +943,18 @@ def build_event(
                     pass
             except Exception:
                 pass
-        # ③ 跨场景共享查表（scope 参数已不参与 key，传 gm/dm 只为兼容旧签名）
+        # ★ ③ @ 消息里的 mentions[] —— 免费的第三来源（也是**唯一免费给角色**的地方）
+        #   官方 GROUP_AT_MESSAGE_CREATE 的 mentions[] 每项都是完整 User：
+        #   username + member_role(owner/admin/member)。@ 是群里最常见的动作，
+        #   所以这条路径能显著加厚通讯录；顺带学到"谁是管理员"。
+        #   注意：文档说 mentions「不含 @ 机器人自身」，所以不会把机器人自己记进去。
+        mentions = body.get("mentions")
+        if mentions:
+            try:
+                identities.remember_from_mentions(adapter_name, mentions)
+            except Exception:
+                pass
+        # ④ 跨场景共享查表（scope 参数已不参与 key，传 gm/dm 只为兼容旧签名）
         nickname = identities.remember(
             adapter_name, "gm" if is_group else "dm", uid, nickname
         ) or ""

@@ -110,7 +110,7 @@ import json
 sk = set()
 for sec in json.loads(schema).values():
     sk |= set(sec.get("fields", {}))
-ck = set(re.findall(r'(?:basic|proactive)\.get\("([a-z_0-9]+)"', main_src))
+ck = set(re.findall(r'(?:basic|proactive|member|admin)\.get\("([a-z_0-9]+)"', main_src))
 rk = set(re.findall(r"^\| `([a-z_0-9]+)` \|", readme, re.M))
 check("B4-1 代码读取的键都在 schema", not (ck - sk), str(sorted(ck - sk)))
 check("B4-2 schema 的键都被读取", not (sk - ck), str(sorted(sk - ck)))

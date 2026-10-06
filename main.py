@@ -263,12 +263,32 @@ class QQOfficialGroupBridge(BasePlugin):
         self.markdown_enabled = bool(basic.get("markdown_enabled", True))
         self.keyboard_enabled = bool(basic.get("keyboard_enabled", True))
         self.interaction_enabled = bool(basic.get("interaction_enabled", True))
-        self.admin_tools_enabled = bool(basic.get("admin_tools_enabled", True))
-        self.member_notice_enabled = bool(basic.get("member_notice_enabled", True))
+        # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
+        # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
+        # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
+        #   （plugin_registry._ensure_plugin_config），已保存的值一律保留。
+        member = cfg.get("section_member", {}) or {}
+        admin = cfg.get("section_admin", {}) or {}
+        self.group_info_enabled = bool(member.get("group_info_enabled", True))
+        self.member_query_enabled = bool(member.get("member_query_enabled", True))
+        self.member_notice_enabled = bool(member.get("member_notice_enabled", True))
+        self.join_request_notice_enabled = bool(member.get("join_request_notice_enabled", True))
+        self.receive_files = bool(member.get("receive_files", True))
+
+        # 群管理总闸（默认关）+ 各细项
+        self.admin_tools_enabled = bool(admin.get("admin_tools_enabled", False))
+        self.admin_mute = bool(admin.get("admin_mute", False))
+        self.admin_mute_state = bool(admin.get("admin_mute_state", False))
+        self.admin_join_approval = bool(admin.get("admin_join_approval", False))
+        self.admin_recall_others = bool(admin.get("admin_recall_others", False))
+        self.admin_send_file = bool(admin.get("admin_send_file", True))
+        self.admin_member_roster = bool(admin.get("admin_member_roster", False))
+        self.admin_kick = bool(admin.get("admin_kick", False))
+        self.admin_blacklist = bool(admin.get("admin_blacklist", False))
         #: 多订阅两个 intent 位（成员事件 1<<24 / 互动回调 1<<26）。
         #: **默认关**：多订阅若被平台拒绝，botpy 会 _can_reconnect=False 反复失败，
         #: 那会连"能收消息"这个基本盘一起搞挂。单独开关 + 自愈还原。
-        self.extra_intents = bool(basic.get("extra_intents", False))
+        self.extra_intents = bool(basic.get("extra_intents", True))
 
         proactive = cfg.get("section_proactive", {}) or {}
         self.proactive_enabled = bool(proactive.get("proactive_enabled", True))
@@ -279,6 +299,13 @@ class QQOfficialGroupBridge(BasePlugin):
 
         self.dedup = MessageDedup(ttl=self.dedup_ttl)
         self.identities = IdentityStore(path=_identity_path() if self.remember_nicknames else None)
+        #: 把通讯录挂到 ctx 上，供 L1 的「按名字找人」工具读取
+        #   （工具是独立类，只拿得到 ctx；挂载失败不影响主流程）
+        try:
+            if self.ctx is not None:
+                setattr(self.ctx, "_bridge_identities", self.identities)
+        except Exception:
+            pass
 
         self._task = None
         self._stop = asyncio.Event()
@@ -367,8 +394,30 @@ class QQOfficialGroupBridge(BasePlugin):
                 "开" if self.proactive_enabled else "关",
             )
             logger.info(
+                "[QQBOT-BRIDGE] 无需权限的能力：群信息=%s；按名字找人=%s；读文件=%s；发文件=%s；"
+                "成员事件=%s；加群申请提醒=%s；额外订阅位=%s",
+                "开" if self.group_info_enabled else "关",
+                "开" if self.member_query_enabled else "关",
+                "开" if self.receive_files else "关",
+                "开" if self.admin_send_file else "关",
+                "开" if self.member_notice_enabled else "关",
+                "开" if self.join_request_notice_enabled else "关",
+                "开" if self.extra_intents else "关",
+            )
+            logger.info(
+                "[QQBOT-BRIDGE] 需管理员的能力（总闸=%s）：禁言=%s；禁言查询=%s；加群审批=%s；"
+                "成员名册=%s；踢人=%s；黑名单=%s",
+                "开" if self.admin_tools_enabled else "关",
+                "开" if self.admin_mute else "关",
+                "开" if self.admin_mute_state else "关",
+                "开" if self.admin_join_approval else "关",
+                "开" if self.admin_member_roster else "关",
+                "开" if self.admin_kick else "关",
+                "开" if self.admin_blacklist else "关",
+            )
+            logger.info(
                 "[QQBOT-BRIDGE] 增强能力：群名=%s；markdown=%s；键盘=%s；互动回调=%s；"
-                "群管理工具=%s；成员事件=%s；额外订阅位(需重启+可能被平台拒)=%s",
+                "群管理总闸=%s；成员事件=%s；额外订阅位(需重启+可能被平台拒)=%s",
                 "开" if self.group_name_enabled else "关",
                 "开" if self.markdown_enabled else "关",
                 "开" if self.keyboard_enabled else "关",
@@ -607,18 +656,30 @@ class QQOfficialGroupBridge(BasePlugin):
             return
 
         # ---- L1 工具（跨世代通用：Route 直发，不依赖任何补丁）----
-        if self.admin_tools_enabled:
-            try:
-                tool_set = getattr(request, "tool_set", None)
-                if tool_set is not None:
-                    for cls in build_admin_tools({
-                        "recall_enabled": True,
-                        "mute_enabled": True,
-                        "bot_state_enabled": True,
-                    }):
-                        tool_set.add(cls(ctx=self.ctx))
-            except Exception as exc:
-                logger.debug("[QQBOT-BRIDGE] 注入群管理工具失败: %s", exc)
+        #   分层：不需要权限的始终按开关注入；需要管理员权限的还受总闸约束。
+        try:
+            tool_set = getattr(request, "tool_set", None)
+            if tool_set is not None:
+                for cls in build_admin_tools({
+                    # 无需权限
+                    "recall_enabled": True,
+                    "group_info_enabled": self.group_info_enabled,
+                    "member_query_enabled": self.member_query_enabled,
+                    "receive_files": self.receive_files,
+                    "send_file_enabled": self.admin_send_file,
+                    "bot_state_enabled": True,
+                    # 需要管理员（再受总闸约束）
+                    "admin_tools_enabled": self.admin_tools_enabled,
+                    "mute_enabled": self.admin_mute,
+                    "mute_state_enabled": self.admin_mute_state,
+                    "join_approval_enabled": self.admin_join_approval,
+                    "roster_enabled": self.admin_member_roster,
+                    "kick_enabled": self.admin_kick,
+                    "blacklist_enabled": self.admin_blacklist,
+                }):
+                    tool_set.add(cls(ctx=self.ctx))
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 注入 L1 工具失败: %s", exc)
 
         # ---- markdown / keyboard 标签（description 会进 format 提示词）----
         for cls, desc, wanted in (

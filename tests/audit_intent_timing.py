@@ -180,7 +180,7 @@ def main():
     if getattr(botpy.Client.start, "_kira_bridge_intents", False):
         delattr(botpy.Client, "start")
 
-    p2 = bridge_main.QQOfficialGroupBridge(FakeCtx(adapter), {"section_basic": {}})
+    p2 = bridge_main.QQOfficialGroupBridge(FakeCtx(adapter), {"section_basic": {"extra_intents": False}})
     check("extra_intents 关时不装 ws_identify 补丁",
           not getattr(BotWebSocket.ws_identify, "_kira_bridge_intent", False))
     check("extra_intents 关时不装探针",

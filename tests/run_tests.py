@@ -28,6 +28,12 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_peers_v133.py  ★ 与三个同类插件（gmp/gmv/qfm）**逐条源码核对**零冲突：
+                       工具名不重名 / 平台门禁互斥 / 无 monkeypatch / 钩子不覆盖，
+                       外加四个既有合作插件回归。
+  audit_tools_v133.py  ★ v1.3.3 分组开关（不需权限默认开 / 需权限默认关）、
+                       内邀自动探测、通讯录 mentions 来源、存量升级无感、文案规范。
+  audit_tools_v133b.py ★ v1.3.3 新工具的**报文级**行为 + 错误人话化 + 守卫不发请求。
   audit_intent_timing.py ★ 时序仿真：复现「适配器先连、插件后加载」，验证重连时
                        实际发出的鉴权报文带上了额外订阅位（1<<24 / 1<<26）。
   audit_recall_intent.py ★ 撤回 id 反查（展示态 qqo-xxx → 官方真实 id）+
@@ -53,7 +59,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py"]
+          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py"]
 
 rc = 0
 for suite in SUITES:
