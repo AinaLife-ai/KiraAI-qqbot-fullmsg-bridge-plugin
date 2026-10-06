@@ -551,7 +551,9 @@ class FindGroupMemberTool(_ApiTool):
         if store is None:
             return "查找失败：成员名单尚未就绪，请稍后再试"
         name = getattr(getattr(event, "session", None), "adapter_name", "") or ""
-        hits = store.search(str(name), keyword, limit=20)
+        # 角色是**按群**的，所以必须带上当前群
+        gid = self._target_id(event)
+        hits = store.search(str(name), keyword, limit=20, group_id=gid)
         if not hits:
             return (
                 f"没找到与“{keyword}”匹配的成员。\n"
@@ -562,7 +564,9 @@ class FindGroupMemberTool(_ApiTool):
         lines = [f"找到 {len(hits)} 位（只含本机器人见过的成员）："]
         for h in hits:
             role = f"｜{h['role']}" if h.get("role") else ""
-            lines.append(f"- {h['name']}｜编号 {h['uid']}{role}")
+            # 机器人自己被搜到时明确标注（用户确认"能搜自己不是坏事"）
+            who = "（这是我自己）" if h.get("is_self") else ""
+            lines.append(f"- {h['name']}｜编号 {h['uid']}{role}{who}")
         if len(hits) >= 20:
             lines.append("（结果已达上限 20 条，可换更精确的关键词）")
         return "\n".join(lines)

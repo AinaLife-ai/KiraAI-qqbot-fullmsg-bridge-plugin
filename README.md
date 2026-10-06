@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.4
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -447,6 +447,51 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.3.5</b> — ★ 角色改为「按群」存（真 bug）+ 机器人自己也能被搜到（用户拍板）</summary>
+
+### 修正一：群内角色被「跨群串味」（我引入的真 bug）
+
+v1.3.3 新增「从 `mentions` 学群内角色」时，我把角色和昵称存在了**同一个键**上
+（`adapter|uid`）。但——
+
+> **昵称是全局的**（同一个人昵称到哪都一样），
+> **角色却是按群的**：张三在 A 群是管理员、在 B 群可能只是普通成员。
+
+所以两个群会**互相覆盖**：在 A 群问「谁是管理员」，可能因为最近一次是在 B 群
+看到张三，而把他报成普通成员。
+
+**修正**：角色单独存，键改成 `adapter|群|uid`；`search` / `all_members` /
+`role_of` 都新增 `group_id` 参数，工具与事件构造都会带上当前群。
+**昵称仍然全局共享**（这部分原本就是对的）。
+
+> 这是用户一句「能搜自己也不是坏事吧（）」带出来的 —— 顺着那条线复查角色存储时发现的。
+
+### 修正二：机器人自己现在**会被搜到**，并标注出来
+
+官方文档写 `mentions`「**不含 @ 机器人自身**」，但**实测会带**：
+
+```json
+"mentions": [{"id": "0A0B9F32…", "is_you": true, "bot": true,
+              "username": "香里", "member_role": "admin"}]
+```
+
+v1.3.4 我把它**排除**了（怕机器人自己被搜出来）。但这其实**扔掉了一份有用信息**：
+
+* 这条 mentions 恰恰携带**机器人自己的 `member_role`**
+  —— 这是**官方唯一免费给出机器人自身角色**的地方；
+* 用户明确拍板：**能搜到自己不是坏事**。
+
+**修正**：照记，并用 `is_self` 标记区分，呈现时显示成 `（这是我自己）`。
+这样「我是谁、我在这个群是什么身份」也能一眼查到。
+
+### 数据格式 v3
+
+`identities.json` 升到 `version: 3`：新增 `roles`（按群）与 `selfs` 两个字段。
+**旧数据自动兼容**（v1 / v2 都能读，不丢昵称）。
+
+</details>
+
+<details>
 <summary><b>v1.3.4</b> — ★ 与框架 / S 版 / Z 版对照后的两处修正（昵称防污染 + 去掉重复的发文件）</summary>
 
 ### 修正一：机器人自己会被写进昵称通讯录（真 bug）

@@ -951,7 +951,8 @@ def build_event(
         mentions = body.get("mentions")
         if mentions:
             try:
-                identities.remember_from_mentions(adapter_name, mentions)
+                identities.remember_from_mentions(adapter_name, mentions,
+                                                    group_id=target_id if is_group else "")
             except Exception:
                 pass
         # ④ 跨场景共享查表（scope 参数已不参与 key，传 gm/dm 只为兼容旧签名）

@@ -168,19 +168,43 @@ def main():
     st2 = IdentityStore(path=st.path)
     check("★ 角色落盘后可回读", st2.role_of("qq", "B2") == "群主", st2.role_of("qq", "B2"))
 
-    # ★★ 防回归：机器人自己**会出现在 mentions 里**（用户日志实证），
-    #    文档写"不含@机器人自身"与实测不符。若不跳过 is_you，
-    #    机器人自己会被写进通讯录、被 find_qq_group_member 搜出来。
+    # ★★ 机器人自己**会出现在 mentions 里**（用户日志实证），
+    #    文档写"不含@机器人自身"与实测不符。
+    #    **用户拍板："能搜自己也不是坏事"** —— 而且这条 mentions 恰恰带着
+    #    机器人自己的 member_role（官方唯一免费给出自身角色的地方）。
+    #    所以现在**照记**，用 is_self 标记区分。
     st3 = IdentityStore(path=os.path.join(tempfile.mkdtemp(), "i3.json"))
     st3.remember_from_mentions("qq", [
-        {"id": "ROBOTSELF", "is_you": True, "bot": True, "username": "香里"},
+        {"id": "ROBOTSELF", "is_you": True, "bot": True,
+         "username": "香里", "member_role": "admin"},
         {"member_openid": "U1", "username": "真人", "member_role": "member"},
-    ])
-    selfs = [m for m in st3.all_members("qq") if m["uid"] == "ROBOTSELF"]
-    check("★★ 机器人自己（is_you）不被记进通讯录", not selfs, str(st3.all_members("qq")))
-    check("★ 真人仍正常记入", bool(st3.search("qq", "真人")))
+    ], group_id="G1")
+    members = st3.all_members("qq", group_id="G1")
+    me = [m for m in members if m.get("is_self")]
+    check("★★ 机器人自己被记入通讯录（用户拍板：能搜自己不是坏事）",
+          bool(me) and me[0]["uid"] == "ROBOTSELF", str(members))
+    check("★★ 并带上机器人自己的群内角色（官方唯一免费来源）",
+          me and me[0]["role"] == "管理员", str(me))
+    check("★ 真人能区分出来（is_self=False）",
+          any(m["name"] == "真人" and not m["is_self"] for m in members), str(members))
     st3.remember_from_mentions("qq", [{"member_openid": "PLACE", "username": "PLACE"}])
     check("★ 名字=自己 openid 的占位不记", not st3.lookup("qq", "PLACE"))
+
+    # ★★★ 防回归：角色**必须按群存**（真 bug —— 同一人在 A 群管理员、B 群普通成员）
+    st4 = IdentityStore(path=os.path.join(tempfile.mkdtemp(), "i4.json"))
+    st4.remember_from_mentions(
+        "qq", [{"member_openid": "ZH", "username": "张三", "member_role": "admin"}],
+        group_id="A")
+    st4.remember_from_mentions(
+        "qq", [{"member_openid": "ZH", "username": "张三", "member_role": "member"}],
+        group_id="B")
+    check("★★★ A 群里张三是管理员", st4.role_of("qq", "ZH", "A") == "管理员",
+          st4.role_of("qq", "ZH", "A"))
+    check("★★★ B 群里张三是普通成员（不被 A 群覆盖）",
+          st4.role_of("qq", "ZH", "B") == "普通成员", st4.role_of("qq", "ZH", "B"))
+    a_hits = st4.search("qq", "张三", group_id="A")
+    check("★★★ 在 A 群搜索时显示 A 群的角色",
+          a_hits and a_hits[0]["role"] == "管理员", str(a_hits))
 
     # ---------------- 9. 存量用户升级无感（核心的补默认值语义） ----------------
     print("\n[9] 存量用户升级无感")

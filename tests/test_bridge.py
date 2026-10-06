@@ -771,11 +771,11 @@ def test_identity_store():
         check("落盘文件已生成", os.path.exists(path))
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        # v1.3.0 起格式升级为 v2（跨场景共享）：key 不再带 gm/dm，
-        # 因为私聊的 user_openid 与群里的 member_openid 是同一个值（见 audit_identity.py）。
+        # v1.3.3 起格式升级为 v3：key 仍不带 gm/dm（跨场景共享），
+        # 另加 `roles`（**按群**存，key = adapter|group|uid）与 `selfs`（机器人自己）。
         names = data.get("names", {})
-        check("内容是 用户id -> 昵称 映射（v2 格式，跨场景共享）",
-              data.get("version") == 2 and names.get("qqo|U1", [None])[0] == "小明"
+        check("内容是 用户id -> 昵称 映射（v3 格式，跨场景共享）",
+              data.get("version") == 3 and names.get("qqo|U1", [None])[0] == "小明"
               and len(names) == 2, str(data))
         s2 = B.IdentityStore(path=path)
         check("重新加载后仍记得", s2.remember("qqo", "gm", "U1", None) == "小明")

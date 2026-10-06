@@ -141,7 +141,8 @@ def main():
     st = IdentityStore(path=os.path.join(tempfile.mkdtemp(), "i.json"))
     st.remember_from_mentions("qq", [
         {"member_openid": "AAA", "username": "小明", "member_role": "admin"},
-        {"member_openid": "BBB", "username": "小红", "member_role": "owner"}])
+        {"member_openid": "BBB", "username": "小红", "member_role": "owner"}],
+        group_id="G1")   # ★ 角色按群存，必须带上群
 
     class CtxWithStore(FakeCtx):
         pass

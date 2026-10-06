@@ -130,7 +130,7 @@ def main():
     s7.save()
     with open(p3, encoding="utf-8") as fh:
         raw = json.load(fh)
-    check("落盘格式带版本号（便于将来再迁移）", raw.get("version") == 2, str(raw)[:60])
+    check("落盘格式带版本号（便于将来再迁移）", raw.get("version") == 3, str(raw)[:60])
     os.unlink(p3)
 
     s8 = B.IdentityStore(max_entries=10)

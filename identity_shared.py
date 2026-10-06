@@ -51,10 +51,10 @@ class IdentityStore:
     真正的写盘由插件用 ``asyncio.to_thread`` 调 :meth:`save`。
     """
 
-    __slots__ = ("path", "max_entries", "_store", "_dirty", "_roles")
+    __slots__ = ("path", "max_entries", "_store", "_dirty", "_roles", "_selfs")
 
-    #: 数据格式版本（v2 = 跨场景共享 + 群内角色；v1 = 旧的按场景隔离）
-    FORMAT = 2
+    #: 数据格式版本（v3 = 角色按群存 + 机器人自身进通讯录；v2 = 角色全局；v1 = 按场景隔离）
+    FORMAT = 3
 
     #: 群内角色的中文说法
     ROLE_TEXT = {"owner": "群主", "admin": "管理员", "member": "普通成员"}
@@ -62,8 +62,13 @@ class IdentityStore:
     def __init__(self, path: Optional[str] = None, max_entries: int = 4000):
         self.path = path
         self.max_entries = int(max_entries)
-        self._store: "OrderedDict[str, tuple]" = OrderedDict()   # key -> (name, ts)
-        self._roles: "OrderedDict[str, str]" = OrderedDict()     # key -> role
+        self._store: "OrderedDict[str, tuple]" = OrderedDict()   # adapter|uid -> (name, ts)
+        #: ★ 角色必须**按群**存 —— 同一个人在 A 群是管理员、在 B 群可能只是普通成员，
+        #:   （用户指出"能搜自己不是坏事"时连带发现的真 bug：原来按 adapter|uid 存角色，
+        #:   在两个群之间会互相覆盖）。key = adapter|group_id|uid
+        self._roles: "OrderedDict[str, str]" = OrderedDict()
+        #: 机器人自己的 (adapter|uid) —— 从 mentions 的 is_you 学到
+        self._selfs: set = set()
         self._dirty = False
         if path:
             self.load()
@@ -115,7 +120,8 @@ class IdentityStore:
     # ------------------------------------------------------------------ #
     # ★ 第三个免费来源：@ 消息的 `mentions[]`
     # ------------------------------------------------------------------ #
-    def remember_from_mentions(self, adapter: str, mentions: Any) -> int:
+    def remember_from_mentions(self, adapter: str, mentions: Any,
+                              group_id: str = "") -> int:
         """从群 @ 消息的 `mentions[]` 里学昵称**和群内角色**（免费的第三来源）。
 
         官方 `GROUP_AT_MESSAGE_CREATE` 事件文档原文：
@@ -146,9 +152,11 @@ class IdentityStore:
         for item in mentions:
             if not isinstance(item, dict):
                 continue
-            # ★ 跳过机器人自己（is_you 是平台明确的标记；bot 兜底再判一次）
-            if item.get("is_you") is True:
-                continue
+            # ★ 机器人自己**也记**（用户拍板：能搜到自己不是坏事）——
+            #   而且这条 mentions 恰恰带着**机器人自己的 member_role**，
+            #   是官方唯一免费给出机器人自身角色的地方。用 is_self 标记区分，
+            #   呈现时由调用方决定（工具里显示成"我自己"）。
+            is_self = item.get("is_you") is True
             name = item.get("username")
             uid = (item.get("member_openid") or item.get("user_openid")
                    or item.get("id"))
@@ -157,17 +165,26 @@ class IdentityStore:
             # 别把"名字恰好等于自己 openid"这类占位也记进去
             if isinstance(name, str) and name.strip() and name.strip() == str(uid):
                 name = None
+            if is_self:
+                self._selfs.add(self._key(adapter, str(uid)))
+                self._dirty = True
             if isinstance(name, str) and name.strip():
                 if self.remember(adapter, "any", str(uid), name.strip()):
                     learned += 1
             role = item.get("member_role")
             if isinstance(role, str) and role:
-                if self._remember_role(adapter, str(uid), role):
+                if self._remember_role(adapter, str(uid), role, group_id):
                     learned += 1
         return learned
 
-    def _remember_role(self, adapter: str, uid: str, role: str) -> bool:
-        key = self._key(adapter, uid)
+    @staticmethod
+    def _role_key(adapter: str, group_id: str, uid: str) -> str:
+        """角色**按群**存：``adapter|group|uid``（没群时退化成 ``adapter|*|uid``）。"""
+        return f"{adapter}|{group_id or '*'}|{uid}"
+
+    def _remember_role(self, adapter: str, uid: str, role: str,
+                       group_id: str = "") -> bool:
+        key = self._role_key(adapter, group_id, uid)
         if self._roles.get(key) == role:
             return False
         self._roles[key] = role
@@ -177,15 +194,25 @@ class IdentityStore:
         self._dirty = True
         return True
 
-    def role_of(self, adapter: str, uid: str) -> str:
-        """取群内角色的中文说法；没记过返回空串。"""
-        return self.ROLE_TEXT.get(self._roles.get(self._key(adapter, uid), ""), "")
+    def is_self(self, adapter: str, uid: str) -> bool:
+        """这个 uid 是不是机器人自己（由 mentions 的 is_you 学到）。"""
+        return self._key(adapter, str(uid)) in self._selfs
 
-    def search(self, adapter: str, keyword: str, limit: int = 20) -> list:
+    def role_of(self, adapter: str, uid: str, group_id: str = "") -> str:
+        """取群内角色的中文说法；没记过返回空串。
+
+        ★ `group_id` 是关键：同一个人在 A 群可能是管理员、在 B 群只是普通成员。
+        不传就退化成"不区分群"的键（私聊等无群场景用）。
+        """
+        return self.ROLE_TEXT.get(
+            self._roles.get(self._role_key(adapter, group_id, uid), ""), "")
+
+    def search(self, adapter: str, keyword: str, limit: int = 20,
+               group_id: str = "") -> list:
         """按关键词在**本机器人见过的成员**里找人。
 
         匹配范围：昵称（子串、忽略大小写）、以及 openid（支持前缀）。
-        返回 ``[{"uid", "name", "role"}...]``；**按最近活跃度排序**
+        返回 ``[{"uid", "name", "role", "is_self"}...]``；**按最近活跃度排序**
         （`_store` 是 OrderedDict，`lookup` 会 move_to_end，所以越靠后越新）。
 
         ⚠ 诚实边界：官方机器人**拿不到全群名册**（`members` 接口属"内邀接入中"），
@@ -210,13 +237,14 @@ class IdentityStore:
                 hits.append({
                     "uid": uid,
                     "name": name,
-                    "role": self.role_of(adapter, uid),
+                    "role": self.role_of(adapter, uid, group_id),
+                    "is_self": self.is_self(adapter, uid),
                 })
                 if len(hits) >= limit:
                     break
         return hits
 
-    def all_members(self, adapter: str, limit: int = 0) -> list:
+    def all_members(self, adapter: str, limit: int = 0, group_id: str = "") -> list:
         """列出本机器人见过的全部成员（新的在前）。`limit<=0` 表示不限。"""
         prefix = f"{adapter}|"
         out = []
@@ -227,7 +255,9 @@ class IdentityStore:
             if not item:
                 continue
             uid = key[len(prefix):]
-            out.append({"uid": uid, "name": item[0], "role": self.role_of(adapter, uid)})
+            out.append({"uid": uid, "name": item[0],
+                        "role": self.role_of(adapter, uid, group_id),
+                        "is_self": self.is_self(adapter, uid)})
             if limit and len(out) >= limit:
                 break
         return out
@@ -289,6 +319,11 @@ class IdentityStore:
             for k, v in roles.items():
                 if isinstance(k, str) and isinstance(v, str) and v:
                     self._roles[k] = v
+        selfs = data.get("selfs")
+        if isinstance(selfs, list):
+            for k in selfs:
+                if isinstance(k, str) and k:
+                    self._selfs.add(k)
 
         def looks_like_openid(text: str) -> bool:
             """32 位 hex ⇒ 旧数据里"没学到名字"的占位（当时回退成了 uid）。"""
@@ -339,6 +374,7 @@ class IdentityStore:
                 "version": self.FORMAT,
                 "names": {k: [v[0], v[1]] for k, v in self._store.items()},
                 "roles": dict(self._roles),
+                "selfs": sorted(self._selfs),
             }
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
