@@ -28,6 +28,8 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_join_request_flow.py ★ 把「模型眼里的成员事件/加群申请」完整跑出来：
+                       notice 原文 → list 返回 → approve/decline 实际请求。
   audit_peer_misuse.py  ★ 实测：同类插件的工具在**官 bot 会话**里被误选会怎样
                        （工具是全局注册的 → 会被看到；但被平台判定/能力缺失拦住，
                         且框架兜住异常 ⇒ 不会真的误用）。
@@ -66,7 +68,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py"]
+          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py"]
 
 rc = 0
 for suite in SUITES:
