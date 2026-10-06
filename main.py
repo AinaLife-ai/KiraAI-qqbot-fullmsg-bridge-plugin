@@ -1832,17 +1832,32 @@ class KeyboardTag(_BridgeTag):
 # --------------------------------------------------------------------------- #
 # 插件钩子注册
 #
-# ⚠ `on.llm_request` 装饰器用的是「声明所在模块 ⇒ 插件 id」的静态映射，
-#   在**类体内**使用会把 id 认成框架模块，所以这里改成"先用 __module__ 指向本文件的
-#   普通函数"注册，再绑回类 —— 这样 get_obj_plugin_id 能正确定位到本插件。
+# ⚠⚠ 这里有一个**必须遵守的硬约束**（核心 `plugin_registry.py` 的
+#    `_register_plugin_hooks_for` 决定的）：
+#
+#        if plugin_instance is not None and hasattr(plugin_instance, bound_handler.__name__):
+#            bound_handler = getattr(plugin_instance, bound_handler.__name__)
+#
+#    框架**只按函数 `__name__` 去插件实例上找同名属性**来绑定 self。
+#    因此「注册用的函数名」必须与「绑到类上的属性名」**完全一致** ——
+#    否则框架会注册一个**未绑定的裸函数**，调用时 self 错位（self 变成 event、
+#    event 变成 request…），每次都抛异常并被 `exec_handler` 吞掉 ——
+#    表现就是**工具与标签永远注入不进去**，而日志里只有一行 traceback。
+#    （这个坑本次复审实测踩到：函数名 `_hook_llm_request` vs 属性名 `on_llm_request`。）
+#
+#    另外：装饰器 `on.llm_request` 靠 `inspect.getmodule(func)` 的模块名查
+#    `_module_to_plugin` 映射来判定插件归属，模块级函数能正确定位到本插件。
 # --------------------------------------------------------------------------- #
-async def _hook_llm_request(self, event, request, tag_set, *_, **__):
-    """ON_LLM_REQUEST：注入 L1 工具 + markdown/keyboard 标签 + 3.0 增量。"""
+async def on_llm_request(self, event, request, tag_set, *_, **__):
+    """ON_LLM_REQUEST：注入 L1 工具 + markdown/keyboard 标签 + 3.0 增量。
+
+    注意：函数名 `on_llm_request` **必须**与下面绑到类上的属性名一致（见上方说明）。
+    """
     try:
         self.inject_tools_and_tags(event, request, tag_set)
     except Exception as exc:
         logger.debug("[QQBOT-BRIDGE] 注入失败（忽略）: %s: %s", type(exc).__name__, exc)
 
 
-on.llm_request(priority=Priority.MEDIUM)(_hook_llm_request)
-QQOfficialGroupBridge.on_llm_request = _hook_llm_request
+on.llm_request(priority=Priority.MEDIUM)(on_llm_request)
+QQOfficialGroupBridge.on_llm_request = on_llm_request

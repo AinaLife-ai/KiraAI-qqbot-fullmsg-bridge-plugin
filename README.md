@@ -472,6 +472,39 @@ contextvar **不串味**、畸形群名 / 缺字段互动事件 / 超限键盘�
 键盘闭环（发键盘 → 点击 → 3 秒回执 → 转消息）、群名（拉取 → 缓存 → 会话标题）、
 群管理工具（4 个工具的真实 URL 路径参数绑定与错误翻译）、成员事件。
 
+### 第三轮复审：抓到并修掉一个「新功能完全失效」的静默 bug
+
+与 `accelerator` / `xml_tag_fixer` / `session_merger` / `sustained_chat` 四个插件做
+共存审查时，发现一个**不会让任何既有测试变红**的真问题：
+
+**核心注册插件钩子时，只按函数的 `__name__` 去插件实例上找同名属性来绑定 `self`**
+（`plugin_registry.py:_register_plugin_hooks_for`）：
+
+```python
+if plugin_instance is not None and hasattr(plugin_instance, bound_handler.__name__):
+    bound_handler = getattr(plugin_instance, bound_handler.__name__)
+```
+
+而本插件的钩子函数名是 `_hook_llm_request`、绑定到类上的属性名却是 `on_llm_request`
+—— **对不上** ⇒ 框架注册的是**未绑定的裸函数** ⇒ 调用时 `self` 错位
+（self 变成 event、event 变成 request…）⇒ 每次都抛异常并被 `exec_handler` 吞掉
+⇒ **L1 工具与 `<markdown>` / `<keyboard>` 标签永远注入不进去**，日志里只有一行 traceback。
+
+已把函数名改成与属性名一致（`on_llm_request`），并加了反向验证确认修复有效。
+新增 `tests/audit_hooks.py`（16 项）专门走**真实框架注册路径**防回归 ——
+之前的测试都是直接调 `inject_tools_and_tags`，**从没验证过钩子真会被框架调用**，
+这正是它潜伏下来的原因。
+
+**四个合作插件的共存结论（逐项核对真代码）**：
+
+| 插件 | 结论 |
+|---|---|
+| **accelerator** | ✅ 无冲突。它 patch 的是核心 `MessageProcessor.send_xml_messages`（比本插件的层更**外层**），但它的"抢发"走 `message_processor.send_message_chain` → `adapter.send_group_message`，**正好经过本插件包装的那一层** ⇒ `<markdown>` / `<keyboard>` 照常生效 |
+| **xml_tag_fixer** | ✅ 无冲突。它只改 `resp.text_response`（不碰 MessageChain）。实测它的 `fix_xml` 对 `<markdown>` / `<keyboard>` **两种注册顺序都安全**（完整闭合块不会被转义或破坏）。它缓存的 tag_set 快照是**只读**的 |
+| **session_merger** | ✅ 无冲突。`after_xml_parse` 只打 debug 日志，不改消息链；不 monkeypatch 适配器 |
+| **sustained_chat** | ✅ 无冲突。不 patch 核心发送链；定时任务走 `message_processor.handle_im_message`（标准入口） |
+| 平台门禁 | ✅ qq-enhance 是 `platform == "QQ"`，官方 bot 是 `"QQ Official"` ⇒ 天然互斥，同名工具永不重叠 |
+
 </details>
 
 <details>

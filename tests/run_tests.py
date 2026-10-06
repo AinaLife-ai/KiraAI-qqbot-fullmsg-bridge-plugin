@@ -24,6 +24,10 @@
   audit_promises.py    承诺核对：文档与 PR 里说过的行为逐条对照代码，防"说了没做"。
   audit_e2e.py         端到端链路：@ 消息全链路 / 键盘闭环 / 群名 / 群管理工具 /
                        成员事件，从入口走到出口。
+  audit_hooks.py       ★ 钩子契约：走**真实框架注册路径**验证 self 绑定正确、
+                       工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
+                       （accelerator / xml_tag_fixer / session_merger / sustained_chat）
+                       的共存前提（补丁目标不重叠、标签不被破坏）。
 """
 import pathlib
 import subprocess
@@ -34,7 +38,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "test_proactive_fallback.py", "smoke_real_core.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
-          "audit_edge.py", "audit_promises.py", "audit_e2e.py"]
+          "audit_edge.py", "audit_promises.py", "audit_e2e.py",
+          "audit_hooks.py"]
 
 rc = 0
 for suite in SUITES:
