@@ -28,6 +28,9 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_hint_render.py ★ 配置文案渲染安全：hint 经过 JSON 层 / 核心层 / 前端两套
+                       渲染路径（{{ }} 纯文本 与 v-html+escapeHtml）后不破版；
+                       校验「只用中文引号、不写裸尖括号、不写 markdown 标记」。
   audit_chat_compat.py 聊天插件共存 + 真实生效：内置 kira-ai（DefaultPlugin）的标签
                        与 bridge 的 markdown/keyboard 真的共存于同一 TagSet、
                        Default-Chat-Z 补丁目标不重叠、markdown/键盘/引用**真的发出去**。
@@ -44,7 +47,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py"]
+          "audit_chat_compat.py", "audit_hint_render.py"]
 
 rc = 0
 for suite in SUITES:
