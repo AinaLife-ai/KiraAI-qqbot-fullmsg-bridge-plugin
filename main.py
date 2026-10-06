@@ -1971,6 +1971,18 @@ class QQOfficialGroupBridge(BasePlugin):
         self._proactive_count += 1
         result_id = getattr(adapter, "_result_message_id", None)
         message_id = result_id(result) if callable(result_id) else None
+        # ★ 登记这条消息的 id → 展示态 id 映射，否则模型以后【撤回自己刚发的】
+        #   会反查不到（官方只推「新消息」事件，历史 id 我们见不到）。
+        #   核心在「适配器自己发送」的路径里会登记（`_send_message` 里调
+        #   `_remember_reply_id`），但**这里的主动通道绕过了适配器**，
+        #   直接打 `client.api`，所以必须我们自己补上。
+        remember = getattr(adapter, "_remember_reply_id", None)
+        if message_id and callable(remember):
+            try:
+                # 两版签名一致：_remember_reply_id(is_group, target_id, message_id)
+                remember(bool(is_group), str(target_id), message_id)
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 登记主动消息 id 失败（忽略）: %s", exc)
         logger.info("[QQBOT-BRIDGE] 主动消息已发送（今日第 %d 条）", self._proactive_count)
         return KiraIMSentResult(message_id=message_id)
 

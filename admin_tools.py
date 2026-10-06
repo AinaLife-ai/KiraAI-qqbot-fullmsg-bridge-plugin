@@ -157,31 +157,60 @@ class RecallQQMsgTool(_ApiTool):
         #   不是官方要求的那种长 id。直接拿它去请求会得到
         #   `40061001 请求参数无效`（实测）。官方适配器内部维护着一张
         #   「展示态 id → 真实 id」的表（`_reply_id_aliases`），必须反查一次。
-        raw_id = self._to_raw_message_id(event, target, message_id, is_group)
+        resolved, found = self._to_raw_message_id(event, target, message_id, is_group)
 
         path = ("/v2/groups/{group_openid}/messages/{message_id}" if is_group
                 else "/v2/users/{user_openid}/messages/{message_id}")
         # 路径参数名两版官方文档不一致（群用 group_openid，单聊用 user_openid）
         key = {"group_openid": target} if is_group else {"user_openid": target}
-        key["message_id"] = raw_id
+        key["message_id"] = resolved
         try:
             await self._request(event, "DELETE", path, **key)
         except Exception as exc:
-            return f"撤回失败：{humanize_error(exc)}"
+            hint = humanize_error(exc)
+            # ★ 查不到映射时的**可操作提示**（实测的高频失败原因）：
+            #   官方只推「新消息」事件，历史消息的 id 我们本来见不到；
+            #   别名表是**内存态**（每条会话最多 100 条），所以
+            #   ① 重启过 KiraAI，或 ② 之后又聊了 100 条以上，
+            #   那条 id 就被清掉了 ⇒ 反查不到 ⇒ 只能拿展示态 id 去试 ⇒ 40061001。
+            if (not found) and "40061001" in str(exc):
+                return (
+                    "撤回失败：这条消息的原始 ID 已经查不到了（40061001）。\n"
+                    "原因：机器人在本会话里能记住的「最近消息 ID」是有限的"
+                    "（约 100 条，且重启后会清空）；这条太早，记录已被清掉。\n"
+                    "请告诉用户：这条撤不回来了，需要撤回请尽快说；"
+                    "或者让群管理员手动撤回。**不要反复重试**。"
+                )
+            return f"撤回失败：{hint}"
         return "撤回成功"
 
-    def _to_raw_message_id(self, event, target: str, message_id: str, is_group: bool) -> str:
-        """把展示态 id 反查成官方要求的真实 id；查不到就原样返回（让官方报错）。
+    def _alias_table_stats(self, adapter) -> str:
+        """诊断用：把别名表的规模读出来（只用于日志/排查，不影响行为）。"""
+        try:
+            aliases = getattr(adapter, "_reply_id_aliases", None)
+            lrus = getattr(adapter, "_reply_alias_lrus", None)
+            n = len(aliases) if isinstance(aliases, dict) else -1
+            m = len(lrus) if isinstance(lrus, dict) else -1
+            return f"别名表 {n} 条 / 会话 {m} 个"
+        except Exception:
+            return "别名表不可读"
+
+    def _to_raw_message_id(self, event, target: str, message_id: str,
+                           is_group: bool) -> tuple:
+        """把展示态 id 反查成官方要求的真实 id。
+
+        :returns: ``(raw_id, found)`` —— **found=False 表示没查到**，
+            调用方据此给出可操作的提示（而不是干巴巴的报错）。
 
         两版核心的表都在适配器上：
           * 2.x：`adapter._reply_id_aliases[(is_group, target, display_id)] -> raw_id`
           * 3.0：同一张表搬到了 `adapter.get_capability(IMCapability)` 上
-        所以这里两处都找一遍（用 getattr 防御，拿不到就返回原值）。
+        所以这里两处都找一遍（用 getattr 防御）。
         """
         mid = str(message_id or "")
         # 只有形如 qqo-xxxx 的才需要反查（真实 id 长得完全不一样）
         if not mid.startswith("qqo-"):
-            return mid
+            return mid, True        # 本来就是真实 id，照用
         holders = []
         adapter = self._adapter(event)
         if adapter is not None:
@@ -198,8 +227,17 @@ class RecallQQMsgTool(_ApiTool):
                 continue
             raw = aliases.get((is_group, str(target), mid))
             if raw:
-                return str(raw)
-        return mid
+                return str(raw), True
+            # ★ 兜底：主表被 LRU 淘汰时，会话级 LRU 里可能还有
+            #   （`_reply_alias_lrus[(is_group,target)] = OrderedDict(display->raw)`）
+            lrus = getattr(holder, "_reply_alias_lrus", None)
+            if isinstance(lrus, dict):
+                conv = lrus.get((is_group, str(target)))
+                if isinstance(conv, dict):
+                    raw2 = conv.get(mid)
+                    if raw2:
+                        return str(raw2), True
+        return mid, False
 
 
 # --------------------------------------------------------------------------- #

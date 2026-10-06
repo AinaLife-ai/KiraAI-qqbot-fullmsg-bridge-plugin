@@ -28,6 +28,9 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_recall_alias.py  ★ 撤回「图片/表情」失败(40061001) 的根因与修复：
+                       反查命中/未命中、found 标记、LRU 兜底、可操作提示、
+                       以及「主动通道补登记」这个我们自己的缺口。
   audit_join_request_injection.py ★ 加群申请/成员通知的**防注入**（借鉴群管插件做法：
                         截断 + 明标不可信 + 明确说别当指令）+ 带上 openid。
   audit_join_request_flow.py ★ 把「模型眼里的成员事件/加群申请」完整跑出来：
@@ -70,7 +73,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py"]
+          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py", "audit_recall_alias.py"]
 
 rc = 0
 for suite in SUITES:

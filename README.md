@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.8
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.9
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -447,6 +447,56 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.3.9</b> — ★ 撤回「图片/表情」仍报 40061001 的根因与修复</summary>
+
+### 现象
+
+```
+[tool_use] recall_qq_msg args: {'message_id': 'qqo-ad248e7d21'}
+接口请求异常… {'message': '请求参数无效', 'code': 40061001}
+→ 撤回失败：请求参数无效
+```
+
+**偶尔**失败，不是每次——这提示是「反查表里正好没有这一条」。
+
+### 根因（三层）
+
+1. **展示态 id 必须反查成真实 id**（`qqo-xxxx` 是真实 id 的 sha256 前 10 位）。
+   表是 `adapter._reply_id_aliases[(is_group, target, display_id)] -> raw`。
+   **查得到就成功；查不到就把 `qqo-xxx` 直接发给官方 ⇒ 40061001。**
+2. **这张表是内存态，条目会丢**：
+   * 每个会话最多 100 条（`QQ_OFFICIAL_MAX_REPLY_IDS_PER_CONVERSATION`）；
+   * 表在适配器实例上 ⇒ **重启 KiraAI 就清空**。
+3. **我们自己顶掉了核心的事件处理器**（2.x，`allow_shadow=True`）：
+   核心在事件路径里的 `_remember_reply_id` **不会执行**，
+   只剩我们 `build_event` 里补的那一次登记（**只登记"本条消息"**）。
+   再加一个我们自己的缺口：**主动消息通道绕过适配器**直接打 `client.api`，
+   核心的发送后登记也不会发生。
+
+> 顺带说明：**官方撤回本来就有 2 分钟硬时限**，所以"落盘持久化"价值有限 ——
+> 真正的问题是**失败时的提示太没用**，模型只会看到"请求参数无效"然后反复重试。
+
+### 修复
+
+1. `_to_raw_message_id` 改为返回 `(raw_id, found)`，让调用方知道"是否反查到了"；
+2. **未命中时给可操作提示**（不再是干巴巴一句"参数无效"）：
+
+   > 撤回失败：这条消息的原始 ID 已经查不到了（40061001）。
+   > 原因：机器人在本会话里能记住的「最近消息 ID」是有限的（约 100 条，且重启后会清空）；这条太早，记录已被清掉。
+   > 请告诉用户：这条撤不回来了，需要撤回请尽快说；或者让群管理员手动撤回。**不要反复重试**。
+
+3. 反查时**顺带扫会话级 LRU**（`_reply_alias_lrus`），多一层兜底；
+4. **主动消息发送后补登记**别名（补上我们自己的缺口）。
+
+### 测试
+
+新增 `tests/audit_recall_alias.py`（14 项）：命中/未命中、`found` 语义、
+LRU 兜底、可操作提示的四个要点、别名表的固有限制（上限 + 重启清空）、
+以及"主动通道已补登记"。**双核心 2.x / 3.0 均通过。**
+
+</details>
+
+<details>
 <summary><b>v1.3.8</b> — 精简 manifest 描述（恢复原有风格，三句说完）</summary>
 
 v1.3.3 扩功能时我把 `manifest.description` 写成了一份**功能清单**
