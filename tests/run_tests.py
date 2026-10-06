@@ -28,6 +28,10 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_chat_compat.py 聊天插件共存 + 真实生效：内置 kira-ai（DefaultPlugin）的标签
+                       与 bridge 的 markdown/keyboard 真的共存于同一 TagSet、
+                       Default-Chat-Z 补丁目标不重叠、markdown/键盘/引用**真的发出去**。
+                       会按 KIRA_CORE 自动选 2.x / 3.0 分支。
 """
 import pathlib
 import subprocess
@@ -39,7 +43,8 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "test_proactive_fallback.py", "smoke_real_core.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
-          "audit_hooks.py"]
+          "audit_hooks.py",
+          "audit_chat_compat.py"]
 
 rc = 0
 for suite in SUITES:

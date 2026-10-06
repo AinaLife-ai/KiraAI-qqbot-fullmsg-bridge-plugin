@@ -357,6 +357,8 @@ python3 tests/run_tests.py
 | `tests/audit_edge.py` | **边界复审**：核心重建 payload 时键盘是否丢 / 并发串味 / 脏数据 / 异常分类 | **19/19** |
 | `tests/audit_promises.py` | **承诺核对**：文档与 PR 说过的行为逐条对照代码，防「说了没做」 | **45/45** |
 | `tests/audit_e2e.py` | **端到端链路**：@ 全链路 / 键盘闭环 / 群名 / 群管理工具 / 成员事件 | **31/31** |
+| `tests/audit_hooks.py` | **钩子契约**：走真实框架注册路径验证 self 绑定 + 与四个插件共存前提 | **16/16** |
+| `tests/audit_chat_compat.py` | **聊天插件共存 + 真实生效**：内置 kira-ai 标签共存 / Z 版不重叠 / 双框架报文级验证 | **2.x 18 / 3.0 20** |
 | `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **85/85** |
 
 ```bash
@@ -504,6 +506,30 @@ if plugin_instance is not None and hasattr(plugin_instance, bound_handler.__name
 | **session_merger** | ✅ 无冲突。`after_xml_parse` 只打 debug 日志，不改消息链；不 monkeypatch 适配器 |
 | **sustained_chat** | ✅ 无冲突。不 patch 核心发送链；定时任务走 `message_processor.handle_im_message`（标准入口） |
 | 平台门禁 | ✅ qq-enhance 是 `platform == "QQ"`，官方 bot 是 `"QQ Official"` ⇒ 天然互斥，同名工具永不重叠 |
+
+**聊天插件共存（内置 kira-ai + Default-Chat-Z）。** 实测（`tests/audit_chat_compat.py`）：
+
+- **内置聊天插件**（`core/plugin/builtin_plugins/kira-ai`，类名 `DefaultPlugin`）与本插件的
+  `llm_request` 钩子**同时真实调用**后，合并的标签集是
+  `['at','emoji','img','keyboard','markdown','reply','text']`（3.0 还多一个 `selfie`）
+  ⇒ **两边标签都完整保留，零覆盖**；提示词里同时含两边描述。
+- **Default-Chat-Z（v1.9.0）**：它只 patch 框架的 `desc_img`（媒体识别），
+  与本插件的层**无重叠**；它不碰 `tag_set`；它唯一的工具集操作是
+  `_filter_tools(req.tool_set, ["manage_ignore"], "exact")` —— **只移除它自己的
+  `manage_ignore`，不会动本插件的 4 个群管理工具**。
+- Z 版与本插件都是 `@on.llm_request`，优先级不同（Z 版 MEDIUM/HIGH、本插件 MEDIUM），
+  **各注册各的，互不覆盖**。
+
+**★ 双框架真实生效已实测**（不是"代码看起来对"，而是报文层面确认）：
+
+| 链路 | 2.x | 3.0 |
+|---|---|---|
+| markdown 发出 | ✅ 报文 `msg_type=2` + `markdown.content` | ✅ 同 |
+| 键盘发出 | ✅ 报文带 `keyboard` 字段 | ✅ 同 |
+| 引用注入 | ✅ 链里有 `Reply` 时带 `message_reference` | ✅ 同 |
+| 无引用时不注入（防刷屏） | ✅ 反向验证通过 | ✅ 同 |
+| 核心机制 | ✅ 补 botpy 解析器（修 `_parser unknown event`） | ✅ api 层补丁 + `publish` 包装（3.0 上 `_send_message` 不存在也能装） |
+| 群名 | ✅ 事件构造时填 | ✅ `publish` 时换（会话标题同步） |
 
 </details>
 
