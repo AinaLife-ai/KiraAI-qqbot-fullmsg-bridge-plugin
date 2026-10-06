@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.2.0
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -20,6 +20,34 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 ---
 
 ## 它做了什么
+
+**一句话**：**同一份代码**，在 KiraAI 2.x 上是"补丁型增强"（核心缺的要补），
+在 **KiraAI 3.0 上是"纯增强插件"**（核心已做的一律不碰，只做核心没做的）。
+装完即用，**不需要改任何配置**。
+
+## 版本定位（2.x / 3.0 自动适配）
+
+| 核心 | 桥接的角色 | 说明 |
+|---|---|---|
+| **KiraAI 3.0** | **纯增强** | 3.0 已把「全量群消息 / 真昵称 / @ 解析 / 引用收发 / 去重 / 语音·卡片·表情归一化」全做完，桥接**绝不重复接管、绝不另造事件**，只补下面 6 项核心没做的 |
+| **KiraAI 2.x** | **补丁型增强** | 核心缺全量群消息解析器、昵称写成 OpenID，桥接必须补上并接管 |
+| 认不出世代 | 降级 | 只启用「群管理工具 + markdown/键盘 + 引用」这些不依赖核心内部结构的增强 |
+
+> 世代靠**结构探测**（有没有 IMCapability、方法在 adapter 还是在能力对象上）判断，
+> 不依赖版本号字符串，所以 KiraAI 以后改版本号也不会误判。
+
+## 新增能力（2.x 与 3.0 都有，因为两家核心都没有）
+
+| 能力 | 说明 |
+|---|---|
+| **群名** | 后台调官方接口把会话标题从群 OpenID 换成中文群名。接口是**白名单（内邀）**，拿不到就自动降级为 OpenID（**只提示一次**），**用户不需要在 QQ 那边做任何设置** |
+| **markdown** | `<markdown>` 标签 → 模型能发富文本。官方 2026-04-23 起，单聊/群聊自定义 markdown **对所有机器人开放**，无需申请模板；失败自动退纯文本 |
+| **内联按钮** | `<keyboard>` 标签 → 消息下方挂按钮；带完整 JSON 校验（行/列/长度），非法直接拒绝并告知模型 |
+| **按钮点击回调** | 用户点按钮 → **3 秒内回执**（官方硬要求，否则客户端一直转圈）→ 转成一条消息给模型 |
+| **群管理工具** | `recall_qq_msg`（撤回，2 分钟窗口）/ `set_qq_group_ban`（禁言·解禁，需群管理员）/ `get_group_mute_state` / `get_qq_bot_state`。**直接调官方接口，不依赖框架内部结构，跨版本可用** |
+| **成员事件** | 有人进群/退群/申请加群 → 作为 System 消息告诉模型（需打开 `extra_intents`，默认关） |
+| **3.0 引用唤醒补洞** | 3.0 判断"这条引用是不是在叫机器人"用的是**内存里自己发过的消息**，**重启后失效**。桥接改读平台下发的 `author.bot`，重启后依然成立 |
+
 
 | 问题 | 处理 |
 |---|---|
@@ -70,6 +98,9 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 
 ## 配置
 
+> 新增的 7 项（群名 / markdown / 键盘 / 互动 / 群管理工具 / 成员通知 / 额外订阅位）
+> **除 `extra_intents` 外全部默认开**，一般不需要动。
+
 ### 基础设置
 
 | 键 | 默认 | 说明 |
@@ -90,6 +121,13 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `at_markup_style` | **legacy** | @ 标记形态：`legacy` = `<@openid>`（**默认**，平台自己下发用的那种）/ `new` = `<qqbot-at-user id="…" />`（官方文档推荐，但实测部分环境会被当纯文本原样显示） |
 | `enhance_rich_content` | 开 | **富内容归一化**：语音（含平台免费 ASR）/ 结构化卡片 / QQ 表情标记 → 都能读 |
 | `self_openid` | 空 | 通常留空＝全自动。只有自动识别猜错时才把它钉死 |
+| `group_name_enabled` | 开 | 后台把会话标题从群 OpenID 换成中文群名。该接口是**白名单（内邀）**，拿不到就自动降级为 OpenID（只提示一次），**用户不需要在 QQ 那边做任何设置** |
+| `markdown_enabled` | 开 | 注册 `<markdown>` 标签，让模型能发富文本（官方 2026-04-23 起自定义 markdown 对所有机器人开放，无需申请模板） |
+| `keyboard_enabled` | 开 | 注册 `<keyboard>` 标签，让模型能在消息下挂内联按钮 |
+| `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
+| `admin_tools_enabled` | 开 | 4 个官方能力工具：撤回 / 禁言解禁 / 禁言查询 / 机器人群内状态 |
+| `member_notice_enabled` | 开 | 成员进出/加群申请作为 System 消息告诉模型（需 `extra_intents`） |
+| `extra_intents` | **关** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；**默认关**是因为个别环境多订阅会导致连接反复失败，打开后需**重启 KiraAI**才生效 |
 
 ### 主动消息通道（默认开）
 
@@ -314,6 +352,13 @@ python3 tests/run_tests.py
 | `tests/test_version_bump.py` | 版本一致性：manifest ⇄ README 标题 ⇄ 最新变更小节 | **5/5** |
 | `tests/test_consistency.py` | 一致性 & 静态不变量：schema ⇄ 代码 ⇄ README、裸 await、未用导入、以及几条「踩坑后立的规矩」 | **22/22** |
 | `tests/test_bridge.py` | 解析表补丁（含**真实 qq-botpy** 对照）、事件语义、昵称兜底、**@（收发双向，含防冒充）**、**引用（收发+唤醒）**、**富内容归一化（语音/卡片/表情）**、**链类型保留**、REFIDX 提取、**热重载接替**、去重、边界、能力降级、性能与内存、**可逆性** | **173/173** |
+| `tests/smoke_v3.py` | **KiraAI 3.0 专项**：世代探测 / 不顶替核心处理器 / 群名 / 引用唤醒补洞（含反向验证）/ markdown·键盘端到端 / 按钮回调 / 工具注入 / 可逆性 | **37/37** |
+| `tests/audit_quality.py` | **质量审计**：性能 / 内存有界 / 不阻塞 / 可逆性 / 功能完整性清单 | **48/48** |
+| `tests/audit_edge.py` | **边界复审**：核心重建 payload 时键盘是否丢 / 并发串味 / 脏数据 / 异常分类 | **19/19** |
+| `tests/audit_promises.py` | **承诺核对**：文档与 PR 说过的行为逐条对照代码，防「说了没做」 | **45/45** |
+| `tests/audit_e2e.py` | **端到端链路**：@ 全链路 / 键盘闭环 / 群名 / 群管理工具 / 成员事件 | **31/31** |
+| `tests/audit_hooks.py` | **钩子契约**：走真实框架注册路径验证 self 绑定 + 与四个插件共存前提 | **16/16** |
+| `tests/audit_chat_compat.py` | **聊天插件共存 + 真实生效**：内置 kira-ai 标签共存 / Z 版不重叠 / 双框架报文级验证 | **2.x 18 / 3.0 20** |
 | `tests/smoke_real_core.py` | **真实 KiraAI core + 真实 qq-botpy + 真实 `QQOfficialAdapter`** 全链路：原始 payload → 真 `ConnectionState.parsers` → 真 `Client.ws_dispatch` → 真 `KiraMessageEvent`；含 100 条消息压测、「关闭后还原」、**标准 At 渲染与防冒充**、**引用收发**、**发出的 @ 标记**、**语音 ASR / 卡片 / 表情归一化**、跨事件重复观测 | **85/85** |
 
 ```bash
@@ -342,6 +387,153 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.3.0</b> — ★ KiraAI 3.0 兼容（纯增强定位）+ 群名 / markdown / 按钮 / 群管理工具</summary>
+
+### 定位：同一份代码，两种角色
+
+| 核心 | 角色 | 做什么 |
+|---|---|---|
+| **KiraAI 3.0** | **纯增强插件** | 3.0 已自带全量群消息、真昵称、@ 解析、引用收发、去重、富内容归一化 → 桥接**一律不碰、不另造事件**，只补核心没有的 |
+| **KiraAI 2.x** | **补丁型增强** | 核心缺全量群消息解析器、昵称写成 OpenID → 桥接必须补上并接管 |
+
+世代靠**结构探测**（`core_profiles.py`）判断，不看版本号字符串，用户零配置。
+
+### 修掉一个会让 3.0 用户炸掉的问题（重要）
+
+**改造前：把本插件装到 KiraAI 3.0 上，桥接会整体停用**——
+3.0 把 IM 相关的一切搬进了 `QQOfficialIMCapability`，`adapter._send_message` /
+`_message_chain` 等**全部不存在**，于是 `check_adapter_capabilities` 判定"缺接口"，
+桥接打一条 error 后直接 return：主动兜底、引用注入、@ 转 markdown **全部静默失效**。
+
+**更危险的是一颗地雷**：桥接原本对 @ / C2C 事件用了"顶替核心处理器"的策略。
+一旦 3.0 给 adapter 补上转发壳，桥接就会顶掉 3.0 原生的 `on_group_at_message_create`，
+再用 **2.x 的字段名**造事件 ⇒ **所有 @ 消息静默丢失**。本版按世代严格区分：
+
+* **2.x**：必须接管（核心的昵称实现是 OpenID，顶掉它才修得好）
+* **3.0**：必须让位（核心实现已完整，顶掉它等于自杀）
+
+### 新增能力（两家核心都没有）
+
+| 能力 | 说明 |
+|---|---|
+| **群名** | 后台调 `GET /v2/groups/{openid}/info` 把会话标题换成中文群名。该接口是**白名单（内邀）**，非白名单返回 `11253` → **自动降级为 OpenID（只提示一次，不重试）**，**用户不需要在 QQ 那边做任何设置**；日后加白即自动生效 |
+| **markdown** | `<markdown>` 标签 → 富文本。官方 2026-04-23 起，单聊/群聊自定义 markdown **对所有机器人开放，无需申请模板**；被拒（`304036`/`40034127`…）自动退回纯文本并剥掉平台标记 |
+| **内联按钮** | `<keyboard>` 标签 → 消息下方挂按钮，带完整校验（行 ≤5 / 每行 ≤5 / `data` ≤100 字符） |
+| **按钮点击** | INTERACTION_CREATE → **3 秒内回执**（官方硬要求）→ 转成一条消息给模型 |
+| **群管理工具** | `recall_qq_msg` / `set_qq_group_ban` / `get_group_mute_state` / `get_qq_bot_state`，**Route 直发、跨世代可用**，错误码翻译成人话 |
+| **成员事件** | 进群/退群/加群申请 → System 消息（需 `extra_intents`，默认关） |
+| **3.0 引用唤醒补洞** | 3.0 判"引用是否在叫机器人"用的是**内存里自己发过的消息**，**重启后失效**（实测 `is_mentioned=False`）；桥接改读平台下发的 `author.bot`，重启后仍成立 |
+
+### 架构改造（Phase 0 地基）
+
+* `core_profiles.py`：世代探测 + 落点收敛（adapter vs IMCapability），未知世代只跑工具层；
+* **L3 发送增强解耦**：从 `adapter._send_message` 挪到 `client.api.post_*`（两版结构一致），
+  3.0 上也能装上；
+* **3.0 事件增强**：包 `adapter.publish`（命中缓存才改群名，零 await / 零 I/O）；
+* **intent 注入点修正**：包 `botpy.Client.start`（3.0 的 `adapter.start()` 是**阻塞到连接结束**的，
+  不能在那里注入）；
+* `extra_intents` 默认关 —— 个别环境多订阅会被平台拒并导致连接反复失败，不能拿"能收消息"冒险。
+
+### 测试
+
+| 套件 | 2.x | 3.0 |
+|---|---|---|
+| `test_bridge.py` | 173 | 173 |
+| `smoke_real_core.py` | 88 | 按世代断言 |
+| `test_proactive_fallback.py` | 11 | 11 |
+| `test_consistency.py` / `test_version_bump.py` | PASSED | PASSED |
+| `smoke_v3.py`（新增，3.0 专项） | — | **37** |
+| `audit_quality.py`（新增，性能/内存/不阻塞/可逆/功能完整性） | — | **48** |
+
+性能实测：群名查缓存 **0.57 µs/次**、富内容提取 **0.86–1.27 µs/次**、键盘校验 **3.3 µs/次**；
+消息路径 3000 次净增长 **0.7 KB**（无泄漏）；群名拉取排队 **0.03 ms** 返回（不阻塞）。
+
+### 全量复审（第二轮）发现并修掉的问题
+
+发布前又做了一轮"逐模块精读 + 承诺核对 + 边界注入 + 端到端链路"复审（新增 3 个套件：
+`audit_edge` / `audit_promises` / `audit_e2e`），抓到 **3 个问题**：
+
+1. **承诺未兑现（最严重）**：README 与日志都写着"`extra_intents` 若把连接搞挂，插件会尝试
+   自动回退"，但**代码里只写了日志、没有回退逻辑**。现已真正实现：
+   包一次 `botpy.gateway.BotWebSocket.__init__` 用弱引用收集网关实例，
+   巡检时读 `_can_reconnect`（botpy **只在** `WS_INVALID_SESSION` 时置 False，
+   这正是"平台拒绝订阅"的确切信号）或"所有 socket 已关且未重连"，
+   命中就自动摘掉 intent 补丁并提示关配置 —— 保住"能收消息"这个基本盘。
+2. **作用域保护是死代码**：`api_send` 文档承诺"只对登记过的 api 生效、绝不误伤同进程
+   其它 botpy 客户端"，但 `owns()` 从未被调用（`_OWNED` 只写不读）。现已接进补丁入口，
+   还原后残留引用也只会原样透传。
+3. **死参数/死常量**：`install()` 的 `md_mode / allow_ref / allow_at_md / store_ref`
+   四个参数从未被使用（行为其实由插件配置统一决定），以及 `_URL_REJECT` / `_AT_MARKUP` /
+   `_self_of` 三处死代码。已全部删除，避免"两套配置各说各话"。
+
+**边界注入验证通过**（19 项）：3.0 核心重建 payload 时键盘**不会丢**、并发发送时
+contextvar **不串味**、畸形群名 / 缺字段互动事件 / 超限键盘都**不崩**、
+非 markdown 权限类错误**不会被误判成无权限**去静默退纯文本。
+
+**端到端链路验证通过**（31 项）：@ 消息全链路（事件 → 引用 → 真 @ 发出）、
+键盘闭环（发键盘 → 点击 → 3 秒回执 → 转消息）、群名（拉取 → 缓存 → 会话标题）、
+群管理工具（4 个工具的真实 URL 路径参数绑定与错误翻译）、成员事件。
+
+### 第三轮复审：抓到并修掉一个「新功能完全失效」的静默 bug
+
+与 `accelerator` / `xml_tag_fixer` / `session_merger` / `sustained_chat` 四个插件做
+共存审查时，发现一个**不会让任何既有测试变红**的真问题：
+
+**核心注册插件钩子时，只按函数的 `__name__` 去插件实例上找同名属性来绑定 `self`**
+（`plugin_registry.py:_register_plugin_hooks_for`）：
+
+```python
+if plugin_instance is not None and hasattr(plugin_instance, bound_handler.__name__):
+    bound_handler = getattr(plugin_instance, bound_handler.__name__)
+```
+
+而本插件的钩子函数名是 `_hook_llm_request`、绑定到类上的属性名却是 `on_llm_request`
+—— **对不上** ⇒ 框架注册的是**未绑定的裸函数** ⇒ 调用时 `self` 错位
+（self 变成 event、event 变成 request…）⇒ 每次都抛异常并被 `exec_handler` 吞掉
+⇒ **L1 工具与 `<markdown>` / `<keyboard>` 标签永远注入不进去**，日志里只有一行 traceback。
+
+已把函数名改成与属性名一致（`on_llm_request`），并加了反向验证确认修复有效。
+新增 `tests/audit_hooks.py`（16 项）专门走**真实框架注册路径**防回归 ——
+之前的测试都是直接调 `inject_tools_and_tags`，**从没验证过钩子真会被框架调用**，
+这正是它潜伏下来的原因。
+
+**四个合作插件的共存结论（逐项核对真代码）**：
+
+| 插件 | 结论 |
+|---|---|
+| **accelerator** | ✅ 无冲突。它 patch 的是核心 `MessageProcessor.send_xml_messages`（比本插件的层更**外层**），但它的"抢发"走 `message_processor.send_message_chain` → `adapter.send_group_message`，**正好经过本插件包装的那一层** ⇒ `<markdown>` / `<keyboard>` 照常生效 |
+| **xml_tag_fixer** | ✅ 无冲突。它只改 `resp.text_response`（不碰 MessageChain）。实测它的 `fix_xml` 对 `<markdown>` / `<keyboard>` **两种注册顺序都安全**（完整闭合块不会被转义或破坏）。它缓存的 tag_set 快照是**只读**的 |
+| **session_merger** | ✅ 无冲突。`after_xml_parse` 只打 debug 日志，不改消息链；不 monkeypatch 适配器 |
+| **sustained_chat** | ✅ 无冲突。不 patch 核心发送链；定时任务走 `message_processor.handle_im_message`（标准入口） |
+| 平台门禁 | ✅ qq-enhance 是 `platform == "QQ"`，官方 bot 是 `"QQ Official"` ⇒ 天然互斥，同名工具永不重叠 |
+
+**聊天插件共存（内置 kira-ai + Default-Chat-Z）。** 实测（`tests/audit_chat_compat.py`）：
+
+- **内置聊天插件**（`core/plugin/builtin_plugins/kira-ai`，类名 `DefaultPlugin`）与本插件的
+  `llm_request` 钩子**同时真实调用**后，合并的标签集是
+  `['at','emoji','img','keyboard','markdown','reply','text']`（3.0 还多一个 `selfie`）
+  ⇒ **两边标签都完整保留，零覆盖**；提示词里同时含两边描述。
+- **Default-Chat-Z（v1.9.0）**：它只 patch 框架的 `desc_img`（媒体识别），
+  与本插件的层**无重叠**；它不碰 `tag_set`；它唯一的工具集操作是
+  `_filter_tools(req.tool_set, ["manage_ignore"], "exact")` —— **只移除它自己的
+  `manage_ignore`，不会动本插件的 4 个群管理工具**。
+- Z 版与本插件都是 `@on.llm_request`，优先级不同（Z 版 MEDIUM/HIGH、本插件 MEDIUM），
+  **各注册各的，互不覆盖**。
+
+**★ 双框架真实生效已实测**（不是"代码看起来对"，而是报文层面确认）：
+
+| 链路 | 2.x | 3.0 |
+|---|---|---|
+| markdown 发出 | ✅ 报文 `msg_type=2` + `markdown.content` | ✅ 同 |
+| 键盘发出 | ✅ 报文带 `keyboard` 字段 | ✅ 同 |
+| 引用注入 | ✅ 链里有 `Reply` 时带 `message_reference` | ✅ 同 |
+| 无引用时不注入（防刷屏） | ✅ 反向验证通过 | ✅ 同 |
+| 核心机制 | ✅ 补 botpy 解析器（修 `_parser unknown event`） | ✅ api 层补丁 + `publish` 包装（3.0 上 `_send_message` 不存在也能装） |
+| 群名 | ✅ 事件构造时填 | ✅ `publish` 时换（会话标题同步） |
+
+</details>
+
+<details>
 <summary><b>v1.2.0</b> — ★ msg_id 过期不再丢消息（主动消息兜底覆盖 40034005，默认开）</summary>
 
 **根因**（线上实测复现）：官方 bot 的被动回复依赖「最近一次收到消息的 msg_id」，
