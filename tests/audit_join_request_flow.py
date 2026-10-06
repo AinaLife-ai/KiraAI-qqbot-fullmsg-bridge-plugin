@@ -65,7 +65,7 @@ def main():
         (B.EVENT_GROUP_MEMBER_REMOVE, {"group_openid": "G1", "member_openid": "C3D4E5F6"}),
     ]
     for ev_name, body in cases:
-        txt = B.describe_member_event(ev_name, body, gn, "qqo")
+        txt = B.describe_member_event(ev_name, body, gn, "qqo", identities=None)
         print(f"    {ev_name:26s} →  {txt}")
         SEEN[ev_name] = txt
 
@@ -78,6 +78,12 @@ def main():
           "主动申请" in SEEN[B.EVENT_GROUP_JOIN_REQUEST])
     check("★ 前缀是 [System ...]（模型能识别这是系统通知而非某人在说话）",
           SEEN[B.EVENT_GROUP_JOIN_REQUEST].startswith("[System"))
+    # ★ 用户 2026-10-07：成员进出通知也要**带上 openid**（不只是裸 id 或什么都没有）
+    add_txt = SEEN[B.EVENT_GROUP_MEMBER_ADD]
+    rm_txt = SEEN[B.EVENT_GROUP_MEMBER_REMOVE]
+    check("★ 成员加入通知带 member_openid", "member_openid=C3D4E5F6" in add_txt, add_txt)
+    check("★ 成员退出通知带 member_openid", "member_openid=C3D4E5F6" in rm_txt, rm_txt)
+    check("★ 成员通知也带群名", "读书分享会" in add_txt and "读书分享会" in rm_txt)
     # 诚实说明：事件体里**没有**验证消息，所以第一条只给昵称+来源
     check("（诚实）加群申请事件体不含验证消息 ⇒ 首条通知里没有它",
           "老同学" not in SEEN[B.EVENT_GROUP_JOIN_REQUEST])

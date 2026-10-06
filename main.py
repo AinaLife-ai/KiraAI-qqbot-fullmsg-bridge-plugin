@@ -1656,7 +1656,8 @@ class QQOfficialGroupBridge(BasePlugin):
         elif not self.member_notice_enabled:
             return
         body = normalize_body(payload) or {}
-        text = describe_member_event(event_name, body, self.group_names, name)
+        text = describe_member_event(event_name, body, self.group_names, name,
+                                     identities=self.identities)
         if not text:
             return
         group_id = str(body.get("group_openid") or "")
