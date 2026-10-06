@@ -28,6 +28,10 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_intent_timing.py ★ 时序仿真：复现「适配器先连、插件后加载」，验证重连时
+                       实际发出的鉴权报文带上了额外订阅位（1<<24 / 1<<26）。
+  audit_recall_intent.py ★ 撤回 id 反查（展示态 qqo-xxx → 官方真实 id）+
+                       intent 注入点（ws_identify 正主 / send_msg 探针 / Client.start）。
   audit_identity.py    ★ 私聊昵称：跨场景共享（群里认识过的人私聊也认得）+ 自动更新
                        （改名跟随）+ 引用消息学昵称 + 旧数据自动迁移。
   audit_hint_render.py ★ 配置文案渲染安全：hint 经过 JSON 层 / 核心层 / 前端两套
@@ -49,7 +53,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py"]
+          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py"]
 
 rc = 0
 for suite in SUITES:

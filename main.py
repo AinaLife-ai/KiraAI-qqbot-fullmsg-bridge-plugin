@@ -337,6 +337,16 @@ class QQOfficialGroupBridge(BasePlugin):
         self._intents_patched_at = 0.0
         self._intents_reverted = False
 
+        # ★ 立刻装 `botpy.Client.start` 补丁（**早于任何 await**）。
+        #   核心的启动顺序是「适配器先连、插件后加载」（lifecycle.py:153-233），
+        #   等到 initialize() 里的巡检才装就已经晚了 —— 首连拿不到额外订阅位。
+        #   这里在构造函数里装，覆盖"插件加载之后才连接"的全部场景。
+        if self.extra_intents:
+            try:
+                self._install_intent_patches()
+            except Exception as exc:  # pragma: no cover
+                logger.debug("[QQBOT-BRIDGE] 预装 intent 补丁失败（忽略）: %s", exc)
+
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
@@ -1287,121 +1297,218 @@ class QQOfficialGroupBridge(BasePlugin):
         """
         if not self.extra_intents:
             return
-        flag = self.profiles.setdefault("__intents__", {})
-        if flag.get("done"):
-            return
-        try:
-            import botpy
+        # 装类级补丁（幂等；构造函数里已经装过一次）
+        self._install_intent_patches()
+        # 对**已经连上**的客户端补救：改它的 intents，让下次重连带上新订阅
+        self._upgrade_live_client(adapter, name, client)
 
-            original_start = getattr(botpy.Client, "start", None)
-            if not callable(original_start) or getattr(original_start, "_kira_bridge_intents", False):
-                flag["done"] = True
-                return
-            plugin = self
+    #: 额外订阅位：1<<24 成员事件（GROUP_MEMBER_EVENT）/ 1<<26 互动回调（INTERACTION）
+    _EXTRA_INTENT_BITS = (1 << 24) | (1 << 26)
+    #: 注入后多久开始请重连（给启动流程留时间，避免打扰初始化）
+    _RECONNECT_DELAY = 4.0
+    #: 还没抓到存活网关时，隔多久再看一次（心跳最长约 45s 一次）
+    _RECONNECT_RETRY = 20.0
+    _RECONNECT_MAX_WAIT = 300.0
 
-            async def patched_start(self, appid, secret, ret_coro=False, _orig=original_start):
-                try:
-                    target = getattr(self, "adapter", None)
-                    if target is not None and plugin._is_qq_official(target):
-                        self.intents |= (1 << 24) | (1 << 26)
-                        conn = getattr(self, "_connection", None)
-                        for session in getattr(conn, "_session_list", []) or []:
-                            if isinstance(session, dict):
-                                session["intent"] = self.intents
-                except Exception as exc:
-                    logger.debug("[QQBOT-BRIDGE] 注入 intent 失败: %s", exc)
-                return await _orig(self, appid, secret, ret_coro)
+    # ------------------------------------------------------------------ #
+    # 补丁安装（三个，都是类级、幂等、可还原）
+    # ------------------------------------------------------------------ #
+    def _install_intent_patches(self) -> None:
+        """装好三个类级补丁：ws_identify（正主）/ send_msg（探针）/ Client.start（顺带）。
 
-            setattr(patched_start, "_kira_bridge_intents", True)
-            botpy.Client.start = patched_start
-            flag["done"] = True
-            self._install_gateway_probe()
-            self._intents_patched_at = time.time()
-            logger.info(
-                "[QQBOT-BRIDGE] 已请求额外订阅位（1<<24 成员事件 / 1<<26 互动回调）—— "
-                "**需重启 KiraAI 后首次连接才生效**；若平台拒绝该订阅，连接会反复失败，"
-                "请把 extra_intents 关掉（插件会尝试自动回退）"
-            )
-        except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 安装 intent 补丁失败: %s", exc)
-
-    #: 注入后多久才开始判定连接是否健康（给足建连时间）
-    _INTENT_PROBE_DELAY = 25.0
-
-    def _install_gateway_probe(self) -> None:
-        """包一次 `BotWebSocket.__init__`，用弱引用收集网关实例。
-
-        这是唯一能可靠读到 `_can_reconnect` 的办法 —— 该对象在 botpy 里是局部变量。
-        幂等 + 可还原（`_revert_extra_intents` 会摘掉）。
+        幂等：用函数上的 `_kira_bridge_*` 标记判断是否已装。
         """
         flag = self.profiles.setdefault("__intents__", {})
-        if flag.get("probe_done"):
+        if flag.get("patched"):
             return
         try:
             import weakref
 
+            import botpy
             from botpy.gateway import BotWebSocket
 
-            original = BotWebSocket.__init__
-            if getattr(original, "_kira_bridge_probe", False):
-                flag["probe_done"] = True
-                return
-            collected = flag.setdefault("gateways", [])
+            bits = self._EXTRA_INTENT_BITS
+            gateways = flag.setdefault("gateways", [])
 
-            def patched_init(gw_self, session, connection, *a, **kw):
-                try:
-                    collected.append(weakref.ref(gw_self))
-                    if len(collected) > 64:      # 只留最近的一批
-                        del collected[:-32]
-                except Exception:
-                    pass
-                return original(gw_self, session, connection, *a, **kw)
+            # ---- ① 正主：在 intent 真正发出去之前或上订阅位 ----
+            orig_identify = BotWebSocket.ws_identify
+            if not getattr(orig_identify, "_kira_bridge_intent", False):
+                async def ws_identify(gw, _orig=orig_identify):
+                    try:
+                        sess = getattr(gw, "_session", None)
+                        if isinstance(sess, dict):
+                            sess["intent"] = int(sess.get("intent") or 0) | bits
+                    except Exception:
+                        pass
+                    return await _orig(gw)
 
-            patched_init._kira_bridge_probe = True
-            patched_init._kira_bridge_orig = original
-            BotWebSocket.__init__ = patched_init
-            flag["probe_done"] = True
+                ws_identify._kira_bridge_intent = True
+                ws_identify._kira_bridge_orig = orig_identify
+                BotWebSocket.ws_identify = ws_identify
+
+            # ---- ② 探针：借每次心跳/鉴权抓住存活网关（弱引用，不拖住对象） ----
+            orig_send = BotWebSocket.send_msg
+            if not getattr(orig_send, "_kira_bridge_probe", False):
+                async def send_msg(gw, event_json, _orig=orig_send):
+                    try:
+                        gateways.append(weakref.ref(gw))
+                        if len(gateways) > 64:
+                            del gateways[:-32]
+                    except Exception:
+                        pass
+                    return await _orig(gw, event_json)
+
+                send_msg._kira_bridge_probe = True
+                send_msg._kira_bridge_orig = orig_send
+                BotWebSocket.send_msg = send_msg
+
+            # ---- ③ 顺带：新客户端构造/启动时也把 intents 置位，保持状态一致 ----
+            orig_start = getattr(botpy.Client, "start", None)
+            if callable(orig_start) and not getattr(orig_start, "_kira_bridge_intents", False):
+                plugin = self
+
+                async def patched_start(self, appid, secret, ret_coro=False, _orig=orig_start):
+                    try:
+                        target = getattr(self, "adapter", None)
+                        if target is not None and plugin._is_qq_official(target):
+                            self.intents = int(getattr(self, "intents", 0) or 0) | bits
+                    except Exception as exc:
+                        logger.debug("[QQBOT-BRIDGE] 注入 intent 失败: %s", exc)
+                    return await _orig(self, appid, secret, ret_coro)
+
+                patched_start._kira_bridge_intents = True
+                patched_start._kira_bridge_orig = orig_start
+                botpy.Client.start = patched_start
+
+            flag["patched"] = True
         except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 安装网关探针失败（忽略）: %s", exc)
+            logger.debug("[QQBOT-BRIDGE] 安装 intent 补丁失败: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # 对"已经连上"的客户端：补状态 + 请一次重连
+    # ------------------------------------------------------------------ #
+    def _upgrade_live_client(self, adapter, name: str, client) -> None:
+        """适配器先于插件连接时，让新订阅位**立刻**生效。
+
+        为什么必须主动重连：`ws_identify` 只在**建连时**发一次 intent，
+        当前这条连接早就鉴权过了 ⇒ 不重连就永远收不到成员事件。
+        用户会以为"开了开关没用"（实测现象）。
+        """
+        if client is None or not self.extra_intents:
+            return
+        try:
+            bits = self._EXTRA_INTENT_BITS
+            before = int(getattr(client, "intents", 0) or 0)
+            if before & bits == bits:
+                return                      # 已经带上（说明我们的补丁在首连就生效了）
+            client.intents = before | bits
+            self._intents_patched_at = time.time()
+            logger.info(
+                "[QQBOT-BRIDGE] %s: 适配器先于插件连接，正在为其开通额外订阅"
+                "（成员进出 / 加群申请 / 按钮回调）…", name,
+            )
+            self._request_reconnect(name, reason="初始订阅")
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 补写 intent 失败（忽略）: %s", exc)
+
+    def _request_reconnect(self, name: str, reason: str = "") -> None:
+        """请 botpy 断一次线，让它带着新订阅位重新鉴权。
+
+        安全性：延迟数秒执行（避开启动高峰）；只做一次；
+        失败只记日志。断线后 botpy 自己会重连 ——
+        `ws_connect` 循环 break → `on_closed` 把 session 放回列表 →
+        `_pool_init` 再跑一轮 `multi_run` → `ws_identify` 带上新位。
+        """
+        flag = self.profiles.setdefault("__intents__", {})
+        if flag.get("reconnect_started"):
+            return
+        flag["reconnect_started"] = True
+        plugin = self
+
+        async def _worker():
+            waited = 0.0
+            try:
+                await asyncio.sleep(plugin._RECONNECT_DELAY)
+                while waited < plugin._RECONNECT_MAX_WAIT:
+                    gateways = [r() for r in (flag.get("gateways") or [])]
+                    gateways = [g for g in gateways if g is not None]
+                    alive = [g for g in gateways
+                             if not getattr(getattr(g, "_conn", None), "closed", True)]
+                    if alive:
+                        closed = 0
+                        for gw in alive:
+                            sess = getattr(gw, "_session", None)
+                            if isinstance(sess, dict):
+                                sess["intent"] = int(sess.get("intent") or 0) | \
+                                    plugin._EXTRA_INTENT_BITS
+                            try:
+                                await gw._conn.close()
+                                closed += 1
+                            except Exception:
+                                pass
+                        if closed:
+                            logger.info(
+                                "[QQBOT-BRIDGE] %s: 已请 botpy 重连（%s，%d 条连接）—— "
+                                "重连后成员进出 / 加群申请 / 按钮回调即可收到",
+                                name, reason or "更新订阅", closed,
+                            )
+                            return
+                    await asyncio.sleep(plugin._RECONNECT_RETRY)
+                    waited += plugin._RECONNECT_RETRY
+                logger.info(
+                    "[QQBOT-BRIDGE] %s: 额外订阅位已就位 —— 将在下一次连接时自动生效"
+                    "（若此刻收不到成员事件，重启 KiraAI 即可）", name,
+                )
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 请求重连失败（忽略）: %s", exc)
+
+        try:
+            asyncio.get_running_loop().create_task(_worker())
+        except RuntimeError:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # 自愈：若额外订阅位把连接搞挂，自动回退
+    # ------------------------------------------------------------------ #
+    #: 注入后多久才开始判定连接是否健康（给足建连/重连时间）
+    _INTENT_PROBE_DELAY = 30.0
 
     def _health_check_intents(self) -> None:
         """若额外订阅位把连接搞挂了，自动回退（保住「能收消息」这个基本盘）。
 
         触发条件（同时满足才回退，宁可不回退也不误伤）：
-          1. `extra_intents` 开着、确实注入过、且还没回退过；
-          2. 距注入已超过 `_INTENT_PROBE_DELAY`（给足建连/重连时间）；
-          3. 观察到网关进入"不可恢复"状态：
+          1. `extra_intents` 开着、补丁已装、还没回退过；
+          2. 距上次注入已超过 `_INTENT_PROBE_DELAY`；
+          3. 从探针抓到过网关，且它们进入"不可恢复"状态：
              * `_can_reconnect is False` —— botpy **只在** `WS_INVALID_SESSION`
-               时这么设，这正是"平台拒绝订阅/鉴权失败"的确切信号；或
-             * 所有已知网关的 socket 都已 closed（连不上且无存活连接）。
+               时这么设（`gateway.py:_is_system_event`），
+               这正是"平台拒绝订阅/鉴权失败"的确切信号；或
+             * 所有已知网关的 socket 都已关闭（连不上且无存活连接）。
         """
         if not self.extra_intents or self._intents_reverted:
             return
-        flag = self.profiles.get("__intents__")
-        if not flag or not flag.get("done") or not self._intents_patched_at:
+        flag = self.profiles.get("__intents__") or {}
+        if not flag.get("patched") or not self._intents_patched_at:
             return
         if time.time() - self._intents_patched_at < self._INTENT_PROBE_DELAY:
             return
 
-        gateways = [ref() for ref in (flag.get("gateways") or [])]
+        gateways = [r() for r in (flag.get("gateways") or [])]
         gateways = [g for g in gateways if g is not None]
         if not gateways:
             return
 
-        refused = [g for g in gateways if getattr(g, "_can_reconnect", True) is False]
-        if refused:
+        if any(getattr(g, "_can_reconnect", True) is False for g in gateways):
             self._intents_reverted = True
             logger.warning(
-                "[QQBOT-BRIDGE] 检测到平台拒绝了额外订阅位（botpy 标记 _can_reconnect=False，"
-                "通常来自 WS_INVALID_SESSION）—— 已自动回退 intent 补丁，"
-                "保证正常收发消息不受影响。请把配置项 extra_intents 关掉（重启后生效）"
+                "[QQBOT-BRIDGE] 检测到平台拒绝了额外订阅（botpy 标记 _can_reconnect=False，"
+                "来自 WS_INVALID_SESSION）—— 已自动回退 intent 补丁，保证正常收发消息不受影响。"
+                "请把配置项 extra_intents 关掉（重启后生效）"
             )
             self._revert_extra_intents()
             return
 
-        alive = [g for g in gateways
-                 if not getattr(getattr(g, "_conn", None), "closed", False)]
-        if not alive:
+        if not any(not getattr(getattr(g, "_conn", None), "closed", True) for g in gateways):
             self._intents_reverted = True
             logger.warning(
                 "[QQBOT-BRIDGE] 检测到网关 socket 全部关闭且未重连（疑与额外订阅位有关）—— "
@@ -1421,15 +1528,17 @@ class QQOfficialGroupBridge(BasePlugin):
                 delattr(botpy.Client, "start")
             from botpy.gateway import BotWebSocket
 
-            probe = getattr(BotWebSocket, "__init__", None)
-            if getattr(probe, "_kira_bridge_probe", False):
-                original = getattr(probe, "_kira_bridge_orig", None)
-                if original is not None:
-                    BotWebSocket.__init__ = original
+            for attr, mark in (("ws_identify", "_kira_bridge_intent"),
+                               ("send_msg", "_kira_bridge_probe"),
+                               ("__init__", "_kira_bridge_probe")):
+                cur = getattr(BotWebSocket, attr, None)
+                if getattr(cur, mark, False):
+                    original = getattr(cur, "_kira_bridge_orig", None)
+                    if original is not None:
+                        setattr(BotWebSocket, attr, original)
         except Exception:
             pass
-        flag["done"] = False
-        flag["probe_done"] = False
+        flag.clear()
         flag["gateways"] = []
         logger.warning("[QQBOT-BRIDGE] 已回退额外订阅位（成员事件 / 互动回调将不再收到）")
 

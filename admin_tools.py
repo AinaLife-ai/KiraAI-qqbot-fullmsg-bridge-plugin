@@ -152,16 +152,54 @@ class RecallQQMsgTool(_ApiTool):
         if not target or not message_id:
             return "撤回失败：缺少会话或消息 ID"
         is_group = self._is_group(event)
+
+        # ★ 关键：模型看到的 id 是 KiraAI 的**展示态 id**（形如 `qqo-bc01c473a3`），
+        #   不是官方要求的那种长 id。直接拿它去请求会得到
+        #   `40061001 请求参数无效`（实测）。官方适配器内部维护着一张
+        #   「展示态 id → 真实 id」的表（`_reply_id_aliases`），必须反查一次。
+        raw_id = self._to_raw_message_id(event, target, message_id, is_group)
+
         path = ("/v2/groups/{group_openid}/messages/{message_id}" if is_group
                 else "/v2/users/{user_openid}/messages/{message_id}")
         # 路径参数名两版官方文档不一致（群用 group_openid，单聊用 user_openid）
         key = {"group_openid": target} if is_group else {"user_openid": target}
-        key["message_id"] = message_id
+        key["message_id"] = raw_id
         try:
             await self._request(event, "DELETE", path, **key)
         except Exception as exc:
             return f"撤回失败：{humanize_error(exc)}"
         return "撤回成功"
+
+    def _to_raw_message_id(self, event, target: str, message_id: str, is_group: bool) -> str:
+        """把展示态 id 反查成官方要求的真实 id；查不到就原样返回（让官方报错）。
+
+        两版核心的表都在适配器上：
+          * 2.x：`adapter._reply_id_aliases[(is_group, target, display_id)] -> raw_id`
+          * 3.0：同一张表搬到了 `adapter.get_capability(IMCapability)` 上
+        所以这里两处都找一遍（用 getattr 防御，拿不到就返回原值）。
+        """
+        mid = str(message_id or "")
+        # 只有形如 qqo-xxxx 的才需要反查（真实 id 长得完全不一样）
+        if not mid.startswith("qqo-"):
+            return mid
+        holders = []
+        adapter = self._adapter(event)
+        if adapter is not None:
+            holders.append(adapter)
+            try:
+                from core.adapter.capabilities import IMCapability
+
+                holders.append(adapter.get_capability(IMCapability))
+            except Exception:
+                pass
+        for holder in holders:
+            aliases = getattr(holder, "_reply_id_aliases", None)
+            if not isinstance(aliases, dict):
+                continue
+            raw = aliases.get((is_group, str(target), mid))
+            if raw:
+                return str(raw)
+        return mid
 
 
 # --------------------------------------------------------------------------- #

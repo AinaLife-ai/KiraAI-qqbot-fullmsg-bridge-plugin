@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.1
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -412,57 +412,6 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
-<summary><b>v1.3.1</b> — ★ 修私聊昵称：跨场景共享 + 自动跟随改名</summary>
-
-### 问题
-
-群里昵称正常，**私聊却显示那串 32 位 OpenID**（WebUI 会话列表里也是）。
-
-### 根因：这是平台设计，不是解析漏了
-
-- 官方《单聊消息事件》页对 `author` 的说明只有一句：「发送者（**user_openid 有值**）」；
-- 同页**官方示例**就是 `"author": {…, "username": "", …}` —— 空字符串
-  （对比群消息示例 `"username": "小明"`，有值）；
-- botpy 的 `C2CMessage._User` 更是只保留了 `user_openid` 一个字段；
-- **OpenAPI 里没有任何「按 openid 查用户资料」的接口** ——
-  用户类只有 `/users/@me`（查机器人自己），单聊侧只有发消息/流式/上传文件；
-  `union_openid`/`union_user_account` 需特殊申请且为内邀。
-  （已全网 + 官方接口索引逐条查证，确认无其他路径。）
-
-### 解法：把昵称通讯录从「按场景隔离」改成「按人共享」
-
-关键事实：**私聊的 `user_openid` 与群里的 `member_openid` 是同一个值**（用户日志实证），
-而**群消息是带昵称的**。于是：
-
-> 群里认识过的人，私聊也认得。
-
-另加一个免费的第二来源：**引用消息**（`message_type=103`）里的 `msg_elements[].author`
-是完整 User 对象、带昵称 —— 私聊里对方引用自己的话时也能学到。
-
-### 自动更新 / 自动维护
-
-- 每次见到新名字就写入，**与已记录的不同就覆盖** ⇒ **用户改名自动跟随**；
-- 落盘仍是「内存 + 脏标记 + 后台 `to_thread`」，**消息路径零 I/O**；
-- 数据格式升级为 v2（`adapter|uid -> [名字, 时间]`），**旧数据读取时自动迁移**，
-  且冲突时**群名优先**（旧数据里私聊那条常常就是 openid 本身，是"没学到"的占位）。
-
-### 边界（如实说明）
-
-**从没在群里说过话的人，私聊第一次仍是 OpenID**，等他在群里冒泡后自动补上。
-这是平台不给接口导致的，没有别的办法。
-
-### 测试
-
-新增 `tests/audit_identity.py`（2.x 17 项 / 3.0 16 项），覆盖跨场景共享、
-改名跟随、引用学习、不编造、旧数据迁移取舍（群名优先于 openid 占位）、落盘回读、
-条数封顶，以及**端到端**（`build_event` 里私聊真的拿到群名）。
-`test_bridge.py` 的通讯录断言随格式升级同步更新（173 → 174）。
-
-双核心全量：2.x 571 项 / 3.0 573 项，`ALL TEST SUITES PASSED`。
-
-</details>
-
-<details>
 <summary><b>v1.3.0</b> — ★ KiraAI 3.0 兼容（纯增强定位）+ 群名 / markdown / 按钮 / 群管理工具</summary>
 
 ### 定位：同一份代码，两种角色
