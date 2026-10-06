@@ -402,6 +402,10 @@ class QQOfficialGroupBridge(BasePlugin):
                 await self._tick()
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 巡检异常（忽略）: %s", exc)
+            try:
+                self._health_check_intents()
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] intent 健康检查异常（忽略）: %s", exc)
             await self._flush_identities()
             await self._flush_group_names()
 
@@ -1311,6 +1315,7 @@ class QQOfficialGroupBridge(BasePlugin):
             setattr(patched_start, "_kira_bridge_intents", True)
             botpy.Client.start = patched_start
             flag["done"] = True
+            self._install_gateway_probe()
             self._intents_patched_at = time.time()
             logger.info(
                 "[QQBOT-BRIDGE] 已请求额外订阅位（1<<24 成员事件 / 1<<26 互动回调）—— "
@@ -1319,6 +1324,90 @@ class QQOfficialGroupBridge(BasePlugin):
             )
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 安装 intent 补丁失败: %s", exc)
+
+    #: 注入后多久才开始判定连接是否健康（给足建连时间）
+    _INTENT_PROBE_DELAY = 25.0
+
+    def _install_gateway_probe(self) -> None:
+        """包一次 `BotWebSocket.__init__`，用弱引用收集网关实例。
+
+        这是唯一能可靠读到 `_can_reconnect` 的办法 —— 该对象在 botpy 里是局部变量。
+        幂等 + 可还原（`_revert_extra_intents` 会摘掉）。
+        """
+        flag = self.profiles.setdefault("__intents__", {})
+        if flag.get("probe_done"):
+            return
+        try:
+            import weakref
+
+            from botpy.gateway import BotWebSocket
+
+            original = BotWebSocket.__init__
+            if getattr(original, "_kira_bridge_probe", False):
+                flag["probe_done"] = True
+                return
+            collected = flag.setdefault("gateways", [])
+
+            def patched_init(gw_self, session, connection, *a, **kw):
+                try:
+                    collected.append(weakref.ref(gw_self))
+                    if len(collected) > 64:      # 只留最近的一批
+                        del collected[:-32]
+                except Exception:
+                    pass
+                return original(gw_self, session, connection, *a, **kw)
+
+            patched_init._kira_bridge_probe = True
+            patched_init._kira_bridge_orig = original
+            BotWebSocket.__init__ = patched_init
+            flag["probe_done"] = True
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 安装网关探针失败（忽略）: %s", exc)
+
+    def _health_check_intents(self) -> None:
+        """若额外订阅位把连接搞挂了，自动回退（保住「能收消息」这个基本盘）。
+
+        触发条件（同时满足才回退，宁可不回退也不误伤）：
+          1. `extra_intents` 开着、确实注入过、且还没回退过；
+          2. 距注入已超过 `_INTENT_PROBE_DELAY`（给足建连/重连时间）；
+          3. 观察到网关进入"不可恢复"状态：
+             * `_can_reconnect is False` —— botpy **只在** `WS_INVALID_SESSION`
+               时这么设，这正是"平台拒绝订阅/鉴权失败"的确切信号；或
+             * 所有已知网关的 socket 都已 closed（连不上且无存活连接）。
+        """
+        if not self.extra_intents or self._intents_reverted:
+            return
+        flag = self.profiles.get("__intents__")
+        if not flag or not flag.get("done") or not self._intents_patched_at:
+            return
+        if time.time() - self._intents_patched_at < self._INTENT_PROBE_DELAY:
+            return
+
+        gateways = [ref() for ref in (flag.get("gateways") or [])]
+        gateways = [g for g in gateways if g is not None]
+        if not gateways:
+            return
+
+        refused = [g for g in gateways if getattr(g, "_can_reconnect", True) is False]
+        if refused:
+            self._intents_reverted = True
+            logger.warning(
+                "[QQBOT-BRIDGE] 检测到平台拒绝了额外订阅位（botpy 标记 _can_reconnect=False，"
+                "通常来自 WS_INVALID_SESSION）—— 已自动回退 intent 补丁，"
+                "保证正常收发消息不受影响。请把配置项 extra_intents 关掉（重启后生效）"
+            )
+            self._revert_extra_intents()
+            return
+
+        alive = [g for g in gateways
+                 if not getattr(getattr(g, "_conn", None), "closed", False)]
+        if not alive:
+            self._intents_reverted = True
+            logger.warning(
+                "[QQBOT-BRIDGE] 检测到网关 socket 全部关闭且未重连（疑与额外订阅位有关）—— "
+                "已自动回退 intent 补丁以保证收发消息；若仍异常请把 extra_intents 关掉"
+            )
+            self._revert_extra_intents()
 
     def _revert_extra_intents(self) -> None:
         flag = self.profiles.get("__intents__")
@@ -1330,9 +1419,18 @@ class QQOfficialGroupBridge(BasePlugin):
             current = getattr(botpy.Client, "start", None)
             if getattr(current, "_kira_bridge_intents", False):
                 delattr(botpy.Client, "start")
+            from botpy.gateway import BotWebSocket
+
+            probe = getattr(BotWebSocket, "__init__", None)
+            if getattr(probe, "_kira_bridge_probe", False):
+                original = getattr(probe, "_kira_bridge_orig", None)
+                if original is not None:
+                    BotWebSocket.__init__ = original
         except Exception:
             pass
         flag["done"] = False
+        flag["probe_done"] = False
+        flag["gateways"] = []
         logger.warning("[QQBOT-BRIDGE] 已回退额外订阅位（成员事件 / 互动回调将不再收到）")
 
     # ------------------------------------------------------------------ #

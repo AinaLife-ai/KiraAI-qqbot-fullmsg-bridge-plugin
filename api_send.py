@@ -31,7 +31,6 @@
 from __future__ import annotations
 
 import contextvars
-import re
 from typing import Any, Optional
 
 #: 这一次发送要引用哪条消息（REFIDX）。用 contextvar 传给 api 层包装，
@@ -45,13 +44,10 @@ PENDING_MD: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
 PENDING_KB: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
     "qqbot_bridge_pending_kb", default=None)
 
-#: markdown 被拒时的错误码（退纯文本的依据）
+#: markdown 被拒时的错误码（= 可以安全退回纯文本的信号）。
+#: 只有这些码才回退 —— 其它异常必须原样抛出，否则会吞掉真问题。
 MD_REJECT_CODES = ("304036", "40034127", "40034011", "40034008", "40034009",
                    "40034124", "40034010", "22006", "340069")
-#: "不允许发送 URL" —— 纯文本与 md 策略不同，退回时不要因此再失败
-_URL_REJECT = "40054010"
-
-_AT_MARKUP = re.compile(r'<@!?([^<>\s]+)>|<qqbot-at-user\s+id=["\']([^"\']+)["\']\s*/?>')
 
 
 def looks_like_md_reject(exc: Any) -> bool:
@@ -72,10 +68,13 @@ class ApiSendPatcher:
         self._flags: dict = {}          # name -> dict（一次性日志标记）
 
     # ------------------------------------------------------------------ #
-    def install(self, adapter: Any, name: str, client: Any,
-                *, md_mode: str = "auto", allow_ref: bool = True,
-                allow_at_md: bool = True, store_ref: bool = True) -> bool:
-        """安装补丁（幂等）。返回是否新装上了。"""
+    def install(self, adapter: Any, name: str, client: Any) -> bool:
+        """安装补丁（幂等）。返回是否新装上了。
+
+        行为开关（markdown / 键盘 / 引用 / @自动转md）统一由插件实例上的
+        配置决定 —— 见 `_send`，**不接受 per-install 参数**，避免"装了一套行为、
+        跑的时候又按另一套行为"的双份配置漂移。
+        """
         api = getattr(client, "api", None)
         if api is None:
             return False
@@ -102,7 +101,13 @@ class ApiSendPatcher:
 
             bridge = self
 
-            async def _patched(*args, _orig=orig, _is_group=is_group, _flags=flags, **kwargs):
+            async def _patched(*args, _orig=orig, _is_group=is_group, _flags=flags,
+                               _api=api, **kwargs):
+                # 作用域保护：只对我们**当前登记**的 api 生效。
+                # 还原（restore）会把 id 从白名单摘掉 —— 之后即使函数引用还残留在
+                # 某个对象上（热重载/多实例），也只会原样透传，绝不误伤别的 botpy 客户端。
+                if not bridge.owns(_api):
+                    return await _orig(*args, **kwargs)
                 return await bridge._send(adapter, _orig, _is_group, _flags, *args, **kwargs)
 
             setattr(_patched, "_kira_bridge_send", True)
@@ -219,10 +224,6 @@ class ApiSendPatcher:
         except Exception as exc:
             self.logger.debug("[QQBOT-BRIDGE] 记录已发送消息的 ref_idx 失败: %s", exc)
         return result
-
-
-def _self_of(fn: Any) -> Any:
-    return getattr(fn, "__self__", None)
 
 
 def _extract_ref_idx(result: Any) -> Optional[str]:

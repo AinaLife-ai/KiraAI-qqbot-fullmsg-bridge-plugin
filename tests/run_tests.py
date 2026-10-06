@@ -19,6 +19,11 @@
   audit_quality.py     质量审计：性能 / 内存有界 / 不阻塞 / 可逆性 / 功能完整性。
   audit_static.py      静态审计：未使用导入 / 裸 await / TODO 残留 /
                        重复定义 / schema⇄代码⇄README 一致 / 无功能丢失清单。
+  audit_edge.py        边界复审：核心重建 payload 时键盘是否丢 / 并发 contextvar 串味 /
+                       脏数据（畸形群名、缺字段互动、超限键盘）/ 异常分类是否正确。
+  audit_promises.py    承诺核对：文档与 PR 里说过的行为逐条对照代码，防"说了没做"。
+  audit_e2e.py         端到端链路：@ 消息全链路 / 键盘闭环 / 群名 / 群管理工具 /
+                       成员事件，从入口走到出口。
 """
 import pathlib
 import subprocess
@@ -28,7 +33,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "test_proactive_fallback.py", "smoke_real_core.py",
-          "smoke_v3.py", "audit_quality.py", "audit_static.py"]
+          "smoke_v3.py", "audit_quality.py", "audit_static.py",
+          "audit_edge.py", "audit_promises.py", "audit_e2e.py"]
 
 rc = 0
 for suite in SUITES:
