@@ -36,6 +36,14 @@ logs = re.findall(r"<summary><b>v(\d+\.\d+\.\d+)</b>", readme)
 check("README 有变更小节", bool(logs), str(logs))
 check("最新变更小节 == manifest.version", bool(logs) and logs[0] == version,
       f"最新={logs[0] if logs else None} manifest={version}")
+# manifest.description 的风格约束（用户 2026-10-08 要求）：
+#   保持原有风格（口语、面向用户、不用功能清单口吻），**三句话内**说完亮点。
+_desc = json.loads((PLUGIN / "manifest.json").read_text(encoding="utf-8")).get("description", "")
+_sents = [x for x in re.split(r"[。！？]", _desc) if x.strip()]
+check("description 三句以内", len(_sents) <= 3, f"{len(_sents)} 句")
+check("description 长度克制（<=220 字）", len(_desc) <= 220, f"{len(_desc)} 字")
+check("description 不用功能清单口吻（不出现 markdown 列表符）",
+      "\n-" not in _desc and "\n*" not in _desc)
 check("变更小节按版本降序",
       logs == sorted(logs, key=lambda v: [int(i) for i in v.split(".")], reverse=True), str(logs))
 

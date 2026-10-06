@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.7
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -447,6 +447,19 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.3.8</b> — 精简 manifest 描述（恢复原有风格，三句说完）</summary>
+
+v1.3.3 扩功能时我把 `manifest.description` 写成了一份**功能清单**
+（258 字、四大段），丢掉了原有的口语风格。这里恢复：
+
+> 三句话说完亮点，长度回到 171~175 字区间。
+
+新增防回归断言（`test_version_bump.py`）：
+**三句以内 / ≤220 字 / 不用功能清单口吻**。
+
+</details>
+
+<details>
 <summary><b>v1.3.7</b> — ★ 申请/成员通知：带上 openid + 防提示词注入</summary>
 
 两个都来自你的提醒，都采纳了。
