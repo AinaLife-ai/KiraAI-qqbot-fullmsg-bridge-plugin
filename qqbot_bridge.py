@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 from collections import OrderedDict
@@ -259,73 +258,14 @@ class MessageDedup:
 # --------------------------------------------------------------------------- #
 # Nickname directory (automatic, zero maintenance)
 # --------------------------------------------------------------------------- #
-class IdentityStore:
-    """Remembers ``(adapter, scope, uid) -> nickname``.
-
-    Nicknames arrive with almost every event, so this is a *fallback* for the
-    rare payload that has no ``author.username`` -- and it keeps the last known
-    name across sessions.  Nothing here is maintained by hand.
-
-    **Persistence never runs on the message path**: ``remember()`` only marks the
-    store dirty; :meth:`save` (called from a worker thread by the plugin) does
-    the write.
-    """
-
-    __slots__ = ("path", "max_entries", "_store", "_dirty")
-
-    def __init__(self, path: Optional[str] = None, max_entries: int = 4000):
-        self.path = path
-        self.max_entries = int(max_entries)
-        self._store: "OrderedDict[str, str]" = OrderedDict()
-        self._dirty = False
-        if path:
-            self.load()
-
-    def remember(self, adapter: str, scope: str, uid: str, nickname: Optional[str]) -> Optional[str]:
-        """Record a nickname (when present) and return the best known one."""
-        key = f"{adapter}|{scope}|{uid}"
-        store = self._store
-        if nickname:
-            if store.get(key) != nickname:
-                self._dirty = True
-            store[key] = nickname
-            store.move_to_end(key)
-            while len(store) > self.max_entries:
-                store.popitem(last=False)
-            return nickname
-        return store.get(key)
-
-    @property
-    def dirty(self) -> bool:
-        return self._dirty
-
-    def load(self) -> None:
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, dict):
-                self._store = OrderedDict((str(k), str(v)) for k, v in data.items())
-                self._dirty = False
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-
-    def save(self) -> bool:
-        """Flush to disk.  Blocking by design -- call it off the event loop."""
-        if not self.path or not self._dirty:
-            return False
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(dict(self._store), fh, ensure_ascii=False)
-            os.replace(tmp, self.path)
-            self._dirty = False
-            return True
-        except Exception:
-            return False
-
+#: 跨场景共享的昵称通讯录 —— 见 `identity_shared.py` 顶部的完整说明。
+#:
+#: 一句话：私聊事件里 `author.username` **恒为空**（官方文档示例就是 `"username": ""`），
+#: 且 OpenAPI 没有任何"按 openid 查用户资料"的接口 ⇒ 私聊本来拿不到昵称。
+#: 但**私聊的 user_openid 与群里的 member_openid 是同一个值**，而群消息带 username ⇒
+#: 把通讯录做成"按人共享"（不再按 gm/dm 隔离），群里认识过的人私聊也认得。
+#: 每次见到新名字就覆盖 ⇒ **改名自动跟随**。
+from identity_shared import IdentityStore  # noqa: E402  (同目录模块)
 
 # --------------------------------------------------------------------------- #
 # @ 标记解析 / 机器人自我身份
@@ -988,9 +928,25 @@ def build_event(
         # 内容里出现"自己的 @"——比 mentions 更硬的一条唤醒证据
         is_mentioned, source = True, "self_at_markup"
 
+    # 昵称解析顺序（从最可靠到兜底）：
+    #   ① 本事件自带的 author.username（群消息才有；私聊**恒为空**）
+    #   ② 引用消息里的作者昵称（message_type=103 时 msg_elements[].author 是完整 User）
+    #   ③ 跨场景通讯录（群里认识过的同一 id ⇒ 私聊也认得）
+    #   ④ 兜底：openid 本身
     nickname = str(author.get("username") or "").strip()
     if identities is not None:
-        nickname = identities.remember(str(adapter.info.name), "gm" if is_group else "dm", uid, nickname) or ""
+        adapter_name = str(adapter.info.name)
+        if not nickname:
+            # ② 私聊拿不到昵称时，看看这条是不是引用消息（免费的第二来源）
+            try:
+                if identities.remember_from_quoted(adapter_name, body.get("msg_elements")):
+                    pass
+            except Exception:
+                pass
+        # ③ 跨场景共享查表（scope 参数已不参与 key，传 gm/dm 只为兼容旧签名）
+        nickname = identities.remember(
+            adapter_name, "gm" if is_group else "dm", uid, nickname
+        ) or ""
     if not nickname:
         nickname = stable_alias(uid) if alias_ids else uid
 
