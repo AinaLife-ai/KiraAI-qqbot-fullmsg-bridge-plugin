@@ -217,7 +217,6 @@ async def main():
         "群信息（含人数）": p5.group_info_enabled,
         "按名字找人": p5.member_query_enabled,
         "读附件文件": p5.receive_files,
-        "加群申请提醒": p5.join_request_notice_enabled,
         "成员事件开关": p5.member_notice_enabled,
         "引用回复注入": p5.quote_reply,
         "发出的 @ 是真 @": p5.send_at_mention,
@@ -240,7 +239,6 @@ async def main():
         "group_info_enabled": default_plugin.group_info_enabled,
         "member_query_enabled": default_plugin.member_query_enabled,
         "receive_files": default_plugin.receive_files,
-        "join_request_notice_enabled": default_plugin.join_request_notice_enabled,
         "member_notice_enabled": default_plugin.member_notice_enabled,
         "proactive_enabled": default_plugin.proactive_enabled,
         "enabled": default_plugin.enabled,
@@ -259,6 +257,8 @@ async def main():
         "admin_member_roster": default_plugin.admin_member_roster,
         "admin_kick": default_plugin.admin_kick,
         "admin_blacklist": default_plugin.admin_blacklist,
+        # ★ 2026-10-07 复查官方文档后归入此类：加群申请事件需要群管理员
+        "join_request_notice_enabled": default_plugin.join_request_notice_enabled,
     }.items():
         check(f"★ 默认关闭（需管理员权限）：{k}", bool(v) is False)
 

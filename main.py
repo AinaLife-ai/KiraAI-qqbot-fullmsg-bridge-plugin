@@ -272,7 +272,10 @@ class QQOfficialGroupBridge(BasePlugin):
         self.group_info_enabled = bool(member.get("group_info_enabled", True))
         self.member_query_enabled = bool(member.get("member_query_enabled", True))
         self.member_notice_enabled = bool(member.get("member_notice_enabled", True))
-        self.join_request_notice_enabled = bool(member.get("join_request_notice_enabled", True))
+        # ⚠ 加群申请事件**需要机器人是群管理员**（官方原文：
+        #   "只有当机器人是群管理员时才可以收到此事件"）⇒ 归入管理组、默认关。
+        self.join_request_notice_enabled = bool(
+            admin.get("admin_join_request_notice", False))
         self.receive_files = bool(member.get("receive_files", True))
 
         # 群管理总闸（默认关）+ 各细项
@@ -394,20 +397,20 @@ class QQOfficialGroupBridge(BasePlugin):
             )
             logger.info(
                 "[QQBOT-BRIDGE] 无需权限的能力：群信息=%s；按名字找人=%s；读文件=%s；"
-                "成员事件=%s；加群申请提醒=%s；额外订阅位=%s",
+                "成员进出通知=%s（成员进出事件不需要管理员）；额外订阅位=%s",
                 "开" if self.group_info_enabled else "关",
                 "开" if self.member_query_enabled else "关",
                 "开" if self.receive_files else "关",
                 "开" if self.member_notice_enabled else "关",
-                "开" if self.join_request_notice_enabled else "关",
                 "开" if self.extra_intents else "关",
             )
             logger.info(
-                "[QQBOT-BRIDGE] 需管理员的能力（总闸=%s）：禁言=%s；禁言查询=%s；加群审批=%s；"
-                "成员名册=%s；踢人=%s；黑名单=%s",
+                "[QQBOT-BRIDGE] 需管理员的能力（总闸=%s）：禁言=%s；禁言查询=%s；"
+                "加群申请提醒=%s；加群审批=%s；成员名册=%s；踢人=%s；黑名单=%s",
                 "开" if self.admin_tools_enabled else "关",
                 "开" if self.admin_mute else "关",
                 "开" if self.admin_mute_state else "关",
+                "开" if self.join_request_notice_enabled else "关",
                 "开" if self.admin_join_approval else "关",
                 "开" if self.admin_member_roster else "关",
                 "开" if self.admin_kick else "关",
@@ -1630,7 +1633,27 @@ class QQOfficialGroupBridge(BasePlugin):
         return _handler
 
     async def _on_member_event(self, adapter, name: str, payload, event_name: str) -> None:
-        if not self.enabled or not self.member_notice_enabled:
+        """成员事件（1<<24）：成员进出 + 加群申请。
+
+        ⚠ **两个开关是分开的**，因为官方门槛不同：
+
+        | 事件 | 门槛 | 开关 |
+        |---|---|---|
+        | `GROUP_MEMBER_ADD` / `GROUP_MEMBER_REMOVE` | 无（文档未要求管理员） | `member_notice_enabled`（默认开） |
+        | `GROUP_JOIN_REQUEST` | ★ **需要机器人是群管理员** | `admin_join_request_notice`（默认关） |
+
+        官方「用户申请加群事件」文档原文：
+        「**1.只有当机器人是群管理员时才可以收到此事件。**」
+        所以机器人不是管理员时，平台**根本不会推**这个事件过来 ——
+        这个开关打开也收不到，但不该因此把它算作"无需权限"。
+        """
+        if not self.enabled:
+            return
+        is_join_request = "join_request" in str(event_name or "")
+        if is_join_request:
+            if not self.join_request_notice_enabled:
+                return
+        elif not self.member_notice_enabled:
             return
         body = normalize_body(payload) or {}
         text = describe_member_event(event_name, body, self.group_names, name)

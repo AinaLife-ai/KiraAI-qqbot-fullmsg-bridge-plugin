@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.5
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -144,8 +144,7 @@ QQ 官方适配器**两版都原生实现上传**（2.x `qq_official.py:_upload_
 |---|---|---|
 | `group_info_enabled` | 开 | `get_qq_group_info`：查群名 / 简介 / 分类 / 标签 / **成员人数**。走官方白名单接口，群名能显示就说明已通过 |
 | `member_query_enabled` | 开 | `find_qq_group_member`：按昵称 / 身份编号在**本机器人见过的成员**里找人（含新接入的 @ 消息 `mentions` 来源，顺带学到群内角色）。官方拿不到全群名册，搜不到没露过面的人是正常的 |
-| `member_notice_enabled` | 开 | 成员进出 / 加群申请作为 System 消息告诉模型（需 `extra_intents`） |
-| `join_request_notice_enabled` | 开 | 有人申请加群时提醒一声（**只提醒不操作**）。要它自己批准，去「群管理」里打开审批 |
+| `member_notice_enabled` | 开 | **成员加入/退出**作为 System 消息告诉模型（需 `extra_intents`）。这两个事件官方文档未要求管理员权限 |
 | `receive_files` | 开 | `read_qq_attached_file`：用户发来的文本类文件按需读取。图片/语音/视频核心已能直接看，不受此开关影响 |
 
 ### 群管理（需机器人是群管理员，默认全关）
@@ -158,6 +157,7 @@ QQ 官方适配器**两版都原生实现上传**（2.x `qq_official.py:_upload_
 | `admin_tools_enabled` | **关** | 群管理工具总闸 |
 | `admin_mute` | 关 | `set_qq_group_ban`：禁言 / 解禁（≤30 天，单次 ≤20 人） |
 | `admin_mute_state` | 关 | `get_group_mute_state`：查全员禁言模式与禁言中成员（**只能查不能改** —— 官方 POST 只支持成员级） |
+| `admin_join_request_notice` | **关** | 有人申请加群时提醒模型一声（只提醒不操作）。★ 官方原文「**只有当机器人是群管理员时才可以收到此事件**」⇒ 属"需管理员"类，默认关 |
 | `admin_join_approval` | 关 | `manage_qq_group_join_request`：查 / 批准 / 拒绝加群申请（**仅需管理员，不属内邀**） |
 | `admin_recall_others` | 关 | 撤回**他人**消息（官方限 2 分钟内） |
 | `admin_member_roster` | 关 | `get_qq_group_member_roster`：全群名册 / 成员详情。官方标注**内邀接入中**，不可用时自动记住并不再重试 |
@@ -447,6 +447,42 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.3.6</b> — ★ 更正：「加群申请提醒」其实**需要群管理员**（我放错组了）</summary>
+
+### 我搞错了一件事，这里更正
+
+v1.3.3 我把「加群申请提醒」放进了**「成员与信息」组、默认开**，理由写的是
+"只提醒不操作，不需要管理员权限"。
+
+**这是错的。** 官方「用户申请加群事件」文档原文：
+
+> 用户申请加群请求触发此事件。
+> **1. 只有当机器人是群管理员时才可以收到此事件。**
+
+也就是说，机器人不是管理员时，**平台根本不会把这个事件推过来** ——
+开关打开也收不到。它不属于"无需权限"。
+
+### 更正内容
+
+* 「加群申请提醒」移入**「群管理」组**（`admin_join_request_notice`），**默认关**；
+* 代码里把**加群申请**与**成员进出**两个事件**分开门控**：
+
+| 事件 | 门槛 | 开关 |
+|---|---|---|
+| `GROUP_MEMBER_ADD` / `GROUP_MEMBER_REMOVE` | 无（文档未要求管理员） | `member_notice_enabled`（默认开）✅ |
+| `GROUP_JOIN_REQUEST` | ★ **需要群管理员** | `admin_join_request_notice`（默认关） |
+
+### 所以之前那个"太酷了"要收回去
+
+**真正"不需要管理员"的只有成员进出通知**（有人加群/退群时报一声）；
+**加群申请**（外面的人申请进来）是需要管理员身份的。
+
+不过换个角度看，**"审批加群申请"本来就只需管理员、不属内邀**，这点没错 ——
+一旦机器人当上管理员，「提醒」和「审批」就**同时可用**了。
+
+</details>
+
+<details>
 <summary><b>v1.3.5</b> — ★ 角色改为「按群」存（真 bug）+ 机器人自己也能被搜到（用户拍板）</summary>
 
 ### 修正一：群内角色被「跨群串味」（我引入的真 bug）

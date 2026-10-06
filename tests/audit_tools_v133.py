@@ -62,7 +62,18 @@ def main():
     check("★ 群信息默认开", dflt("section_member", "group_info_enabled") is True)
     check("★ 读文件默认开", dflt("section_member", "receive_files") is True)
     check("★ 成员进出通知默认开", dflt("section_member", "member_notice_enabled") is True)
-    check("★ 加群申请提醒默认开（只读）", dflt("section_member", "join_request_notice_enabled") is True)
+    # ★ 修正（2026-10-07 复查官方文档后）：
+    #   加群申请事件**需要机器人是群管理员** —— 官方原文：
+    #   「1.只有当机器人是群管理员时才可以收到此事件。」
+    #   所以它归入「群管理」组、默认关，**不能**算作"无需权限"。
+    check("★★ 加群申请提醒在「群管理」组（需管理员）",
+          "admin_join_request_notice" in schema["section_admin"]["fields"]
+          and "join_request_notice_enabled" not in schema["section_member"]["fields"])
+    check("★★ 加群申请提醒默认关（需管理员）",
+          dflt("section_admin", "admin_join_request_notice") is False)
+    check("★ 成员进出通知仍在「成员与信息」组且默认开"
+          "（成员加入/退出事件文档未要求管理员）",
+          dflt("section_member", "member_notice_enabled") is True)
 
     # ---------------- 2. 需要权限的一律默认关 ----------------
     print("\n[2] 需要群管权限的功能：一律默认关")
