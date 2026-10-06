@@ -1,30 +1,37 @@
-"""QQ官方bot兼容与增强补丁 — KiraAI plugin.
+"""QQ官方bot兼容与增强补丁 — KiraAI plugin（2.x / 3.0 双世代）。
 
-把 QQ 官方机器人适配器对齐到 NapCat 语义：
+定位
+----
+* **2.x**：核心缺东西 ⇒ 补丁型增强（补解析器、接管事件、补发送链）。
+* **3.0**：核心已把「全量群消息 / 真昵称 / @ 解析 / 引用收发 / 去重 / 富内容归一化」
+  都做完了 ⇒ **纯增强插件**，只做核心没做的部分，绝不重复接管、绝不造事件。
+* **同一份代码**靠 `core_profiles.detect()` 自动判世代，用户零配置。
 
-  ① **修掉 `_parser unknown event group_message_create`** —— 为 qq-botpy 补上
-     群全量消息解析器，让不 @ 机器人的消息也能进 KiraAI（围观 / 关键词唤醒）；
-  ② **@ 消息与单聊也统一接管** —— 原生实现把 `nickname` 写成 32 位 OpenID，
-     这里改成事件自带的 `author.username`（真实 QQ 昵称）；
-  ③ `is_mentioned` 按 NapCat 语义判定（只有真 @ 才算唤醒）；
-  ④ 同一 `msg_id` 去重（官方明说会重推）；跨事件重复按「绝不丢唤醒」处理，并留了
-     一个可选的等待窗口（`at_grace_seconds`，默认 0）；
-  ⑤ 自动记住昵称通讯录（零维护，改名自动跟随）；
-  ⑥ 可选：官方「主动消息」通道，兜底超出 5 分钟被动窗口的持续/主动回复。
+在 2.x 上补什么
+------------
+  ① `_parser unknown event group_message_create` —— 给 qq-botpy 补群全量消息解析器；
+  ② @ 消息与单聊统一接管（昵称取真实 QQ 昵称，而非 32 位 OpenID）；
+  ③ `is_mentioned` 按 NapCat 语义判定；④ 同一 msg_id 去重；
+  ⑤ 自动记住昵称；⑥ 主动消息兜底（被动窗口失效时）。
 
-设计要点见 `qqbot_bridge.py` 的模块说明。本文件只负责 KiraAI 侧的生命周期、
-配置、适配器定位与补丁安装。
+两版都做的新增能力（3.0 也没有）
+--------------------------
+  A. **群名**：`GET /v2/groups/{openid}/info` 后台拉一次 + 本地缓存
+     （白名单接口，失败自动降级为 openid，用户无需任何操作）；
+  B. **markdown / 键盘**：`<markdown>` / `<keyboard>` 标签 → 发送层分流
+     （纯文本消息没有 @ 能力，markdown = 能排版 + 能真 @）；
+  C. **互动回调**：INTERACTION_CREATE → 3 秒内回执 → 转成一条消息给模型；
+  D. **群管理工具**：撤回 / 禁言 / 禁言查询 / 机器人群内状态（Route 直发，跨世代通用）；
+  E. **成员事件**（需 `extra_intents` 开关）：成员进出 / 加群申请；
+  F. **3.0 引用唤醒补洞**：核心判据只认内存里"自己发过的消息"，重启即失效。
 
 性能、阻塞与可逆性约定
 ----------------------
-* 消息路径上**没有同步 I/O、没有锁、没有无界循环**：每条消息只有几次 dict
-  查找 + 一次有界 LRU 更新（实测约 6.5 µs/条）；
-* 昵称通讯录落盘走 `asyncio.to_thread`，且只在「脏了」的时候写；
+* 消息路径上**没有同步 I/O、没有锁、没有无界循环**；
+* 群名拉取一律 `create_task` 后台执行；昵称/群名落盘走 `asyncio.to_thread`；
 * 每个异常都被兜住并降级成一条日志，绝不把异常抛回 botpy 的事件循环；
-* 所有 KiraAI 私有属性都用 `getattr` 防御式读取，框架版本变动只会打一条清晰的
-  错误然后停用桥接，不会每条消息崩一次；
-* **补丁可逆**：把 `enabled` 关掉（或关掉对应 unify 开关）后，下一次巡检会把
-  botpy 解析器与客户端处理器**还原成框架原生实现**，不需要重启进程。
+* 所有 KiraAI 私有属性都用 `getattr` 防御式读取；
+* **补丁全部可逆**：把 `enabled` 关掉后，下一次巡检会把所有补丁还原成框架原生实现。
 """
 
 from __future__ import annotations
@@ -33,7 +40,6 @@ import asyncio
 import importlib
 import json
 import os
-import contextvars
 import sys
 import time
 from collections import OrderedDict
@@ -49,9 +55,78 @@ if "qqbot_bridge" in sys.modules:
         pass
 
 from core.plugin import BasePlugin, logger
+
+try:  # 钩子装饰器与优先级：老/裁剪过的 core 可能没有 → 降级为"不注入工具与标签"
+    from core.plugin import Priority, on
+
+    _HOOKS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    Priority = None  # type: ignore
+    on = None  # type: ignore
+    _HOOKS_AVAILABLE = False
+
+try:  # 标签基类：同上
+    from core.tag import BaseTag
+except Exception:  # pragma: no cover
+    class BaseTag:  # type: ignore
+        name = None
+        description = None
+        parent = "msg"
+
+        def __init__(self, ctx=None, **kwargs):
+            self.ctx = ctx
+
+        def __init_subclass__(cls, **kw):
+            super().__init_subclass__(**kw)
+
+if not _HOOKS_AVAILABLE:
+    def _noop_hook(*_a, **_kw):
+        def _inner(func):
+            return func
+
+        return _inner
+
+    class _OnStub:
+        llm_request = staticmethod(_noop_hook)
+
+    on = _OnStub()  # type: ignore
+
+    class _PriorityStub:
+        MEDIUM = 0
+        SYS_HIGH = 100
+
+    Priority = _PriorityStub  # type: ignore
 from core.chat import Group, User
 from core.chat.message_elements import At, File, Image, Reply, Text
 from core.chat.message_utils import KiraIMMessage, KiraMessageEvent, KiraIMSentResult
+
+from core_profiles import (
+    GEN_UNKNOWN,
+    GEN_V2,
+    GEN_V3,
+    CoreProfile,
+    detect as detect_profile,
+    is_allowed as profile_is_allowed,
+    message_types_of,
+)
+from group_names import GroupInfoCache
+from rich_content import (
+    KEYBOARD_TAG_DESCRIPTION,
+    KeyboardMarker,
+    MarkdownText,
+    MARKDOWN_TAG_DESCRIPTION,
+    split_markdown_and_keyboard,
+    validate_keyboard,
+)
+from interactions import InteractionBridge
+from api_send import (
+    PENDING_KB,
+    PENDING_MD,
+    QUOTE_REF,
+    ApiSendPatcher,
+)
+from admin_tools import build_tools as build_admin_tools
+from v3_support import V3Enhancer
 
 from qqbot_bridge import (
     EVENT_C2C_MESSAGE,
@@ -72,12 +147,16 @@ from qqbot_bridge import (
     drop_live_parser,
     at_user_markup,
     collect_self_identity,
+    describe_member_event,
     extract_msg_idx,
     extract_sent_ref_idx,
     normalize_outgoing_markup,
     strip_at_markup,
     inject_live_parser,
     install_class_parser,
+    install_member_parser,
+    build_member_event,
+    MEMBER_EVENTS,
     normalize_body,
     normalize_mentions,
     restore_class_parser,
@@ -108,11 +187,6 @@ def ref_store_for(adapter):
     return _REF_STORES_BY_NAME.setdefault(name, OrderedDict())
 
 
-#: 这一次发送要引用哪条消息（REFIDX）。用 contextvar 传给 api 层的包装函数，
-#: 避免为了注入 message_reference 去复制一遍适配器的发送逻辑。
-_QUOTE_REF: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
-    "qqbot_bridge_quote_ref", default=None)
-
 
 def _plugin_version() -> str:
     try:
@@ -127,6 +201,19 @@ _WATCH_INTERVAL = 15.0
 
 _ALL_EVENTS = (EVENT_GROUP_MESSAGE, EVENT_GROUP_AT_MESSAGE, EVENT_C2C_MESSAGE)
 _HANDLERS = ("on_group_message_create", "on_group_at_message_create", "on_c2c_message_create")
+
+
+def _group_names_path():
+    """群名缓存落盘位置（与 identities.json 同目录）。"""
+    try:
+        from core.utils.path_utils import get_config_path
+
+        return str(get_config_path() / "plugins" / _SELF_PLUGIN_ID / "groups.json")
+    except Exception:
+        try:
+            return os.path.join(_PLUGIN_DIR, "data", "groups.json")
+        except Exception:
+            return None
 
 
 def _identity_path():
@@ -171,6 +258,17 @@ class QQOfficialGroupBridge(BasePlugin):
         self.at_markup_style = str(basic.get("at_markup_style", "legacy") or "legacy").lower()
         self.at_markdown = bool(basic.get("at_markdown", True))
         self.pinned_self_openid = str(basic.get("self_openid", "") or "").strip()
+        # ---- 新增：群名 / markdown / 键盘 / 互动 / 群管理工具（默认全开） ----
+        self.group_name_enabled = bool(basic.get("group_name_enabled", True))
+        self.markdown_enabled = bool(basic.get("markdown_enabled", True))
+        self.keyboard_enabled = bool(basic.get("keyboard_enabled", True))
+        self.interaction_enabled = bool(basic.get("interaction_enabled", True))
+        self.admin_tools_enabled = bool(basic.get("admin_tools_enabled", True))
+        self.member_notice_enabled = bool(basic.get("member_notice_enabled", True))
+        #: 多订阅两个 intent 位（成员事件 1<<24 / 互动回调 1<<26）。
+        #: **默认关**：多订阅若被平台拒绝，botpy 会 _can_reconnect=False 反复失败，
+        #: 那会连"能收消息"这个基本盘一起搞挂。单独开关 + 自愈还原。
+        self.extra_intents = bool(basic.get("extra_intents", False))
 
         proactive = cfg.get("section_proactive", {}) or {}
         self.proactive_enabled = bool(proactive.get("proactive_enabled", True))
@@ -214,6 +312,31 @@ class QQOfficialGroupBridge(BasePlugin):
         self._proactive_count = 0
         self._last_report = ""
 
+        # ---- 新增子系统 ----
+        #: 世代档案：适配器名 -> CoreProfile
+        self.profiles: dict = {}
+        #: 群名缓存（白名单接口，失败自动降级）
+        self.group_names = GroupInfoCache(
+            path=_group_names_path() if self.group_name_enabled else None
+        )
+        #: api 层发送补丁（markdown / keyboard / 引用）
+        self.api_send = ApiSendPatcher(self, logger)
+        #: 3.0 增量增强（群名 + 引用唤醒补丁）
+        self.v3 = V3Enhancer(self, logger)
+        #: 互动回调
+        self.interactions = InteractionBridge(self, logger)
+        #: 已安装 api 补丁的适配器名
+        self._api_send_installed: set = set()
+        #: 机器人身份（按群隔离，供 3.0 引用判据用）：target -> {"openid":…, "name":…}
+        self._self_ident_by_target: dict = {}
+        #: 互动事件计数（仅观测）
+        self._interactions_seen = 0
+        #: 成员/加群申请事件计数
+        self._member_events = 0
+        #: intent 自愈：记录最近一次注入时间，用于失败回退
+        self._intents_patched_at = 0.0
+        self._intents_reverted = False
+
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
@@ -233,6 +356,22 @@ class QQOfficialGroupBridge(BasePlugin):
                 self.at_markup_style,
                 "开" if self.proactive_enabled else "关",
             )
+            logger.info(
+                "[QQBOT-BRIDGE] 增强能力：群名=%s；markdown=%s；键盘=%s；互动回调=%s；"
+                "群管理工具=%s；成员事件=%s；额外订阅位(需重启+可能被平台拒)=%s",
+                "开" if self.group_name_enabled else "关",
+                "开" if self.markdown_enabled else "关",
+                "开" if self.keyboard_enabled else "关",
+                "开" if self.interaction_enabled else "关",
+                "开" if self.admin_tools_enabled else "关",
+                "开" if self.member_notice_enabled else "关",
+                "开" if self.extra_intents else "关",
+            )
+            if not self.extra_intents:
+                logger.info(
+                    "[QQBOT-BRIDGE] 提示：成员进出 / 加群申请 事件需要打开配置项 "
+                    "extra_intents（默认关，为避免个别环境下多订阅被平台拒导致连接反复失败）"
+                )
         else:
             logger.info("[QQBOT-BRIDGE] 桥接已禁用（section_basic.enabled=false），已还原既有补丁")
 
@@ -246,6 +385,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 pass
         self._task = None
         await self._flush_identities(force=True)
+        await self._flush_group_names(force=True)
         logger.info(
             "[QQBOT-BRIDGE] 已停止（本次已处理 %d 条消息，其中 %d 条出现「全量+@」双副本，通常为 0；"
             "补丁保留给热重载，要彻底还原请把 enabled 设为 false 或重启 KiraAI）",
@@ -263,6 +403,18 @@ class QQOfficialGroupBridge(BasePlugin):
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 巡检异常（忽略）: %s", exc)
             await self._flush_identities()
+            await self._flush_group_names()
+
+    async def _flush_group_names(self, force: bool = False):
+        """群名缓存落盘 —— 同样走线程，不占事件循环。"""
+        if not self.group_name_enabled:
+            return
+        if not force and not self.group_names.dirty:
+            return
+        try:
+            await asyncio.to_thread(self.group_names.save)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 群名缓存落盘失败（忽略）: %s", exc)
 
     async def _flush_identities(self, force: bool = False):
         """落盘昵称通讯录 —— 走线程，绝不占用事件循环。"""
@@ -282,12 +434,22 @@ class QQOfficialGroupBridge(BasePlugin):
         if not self.enabled:
             self._restore_all()
             return
-        patches = self._ensure_class_patch()
         adapters = self._find_adapters()
         if not adapters:
             if report:
                 logger.info("[QQBOT-BRIDGE] 暂未发现 QQ Official 适配器实例（插件可能先于适配器加载）")
             return
+        # ⚠ 顺序很重要：**先探测世代**，再决定要不要补 botpy 解析器。
+        #   3.0 的核心已自带全量群消息（`_install_message_parsers`），桥接若还在
+        #   `ConnectionState` 类上注册解析器，属于多余的全局副作用。
+        for name, adapter in adapters:
+            profile = detect_profile(adapter)
+            if profile.is_known:
+                self.profiles[name] = profile
+        patches = {}
+        if any(getattr(p, "is_v2", False) for p in self.profiles.values()
+               if isinstance(p, CoreProfile)):
+            patches = self._ensure_class_patch()
         for name, adapter in adapters:
             self._attach(adapter, name, patches)
         names = ",".join(n for n, _ in adapters)
@@ -371,15 +533,200 @@ class QQOfficialGroupBridge(BasePlugin):
             if text_orig is not None:
                 adapter._text_content = text_orig
                 changed.append(f"{name}._text_content")
+            # 发送增强（api 层）
             for api, method_name, orig in self._api_patched.pop(name, []):
                 try:
                     setattr(api, method_name, orig)
                     changed.append(f"{name}.api.{method_name}")
                 except Exception:
                     pass
+            if self.api_send.restore(name):
+                self._api_send_installed.discard(name)
+                changed.append(f"{name}.api_send")
+            # 发送入口包装
+            self._unpatch_send_entry(adapter, name)
+            # 互动回调（标记与 qqbot_bridge.attach_client_handler 统一，便于还原）
+            current = getattr(client, "on_interaction_create", None)
+            if callable(current) and detach_client_handler(client, "on_interaction_create"):
+                changed.append(f"{name}.on_interaction_create")
+            for _event in MEMBER_EVENTS:
+                if detach_client_handler(client, "on_" + _event):
+                    changed.append(f"{name}.on_{_event}")
+            # 3.0 增量
+            if self.v3.restore(name):
+                changed.append(f"{name}.v3")
+        # intent 扩展
+        self._revert_extra_intents()
         if changed and not self._restore_reported:
             self._restore_reported = True
             logger.info("[QQBOT-BRIDGE] 已还原 %d 处补丁：%s", len(changed), ", ".join(changed[:6]))
+
+    # ------------------------------------------------------------------ #
+    # 插件钩子：工具 / 标签注入（L1 工具层 + markdown & keyboard 标签）
+    # ------------------------------------------------------------------ #
+    def _profile_for(self, event) -> CoreProfile:
+        name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+        profile = self.profiles.get(name)
+        if isinstance(profile, CoreProfile):
+            return profile
+        try:
+            adapter = self.ctx.adapter_mgr.get_adapter(name)
+        except Exception:
+            adapter = None
+        profile = detect_profile(adapter)
+        if profile.is_known:
+            self.profiles[name] = profile
+        return profile
+
+    def _is_qq_official_event(self, event) -> bool:
+        platform = str(getattr(getattr(event, "adapter", None), "platform", "") or "")
+        if platform == "QQ Official":
+            return True
+        name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+        return name in self.profiles and isinstance(self.profiles.get(name), CoreProfile)
+
+    def inject_tools_and_tags(self, event, request, tag_set) -> None:
+        """ON_LLM_REQUEST 钩子体（两版实参一致：event, request, tag_set）。"""
+        if not self.enabled or request is None or tag_set is None:
+            return
+        if not self._is_qq_official_event(event):
+            return
+
+        # ---- L1 工具（跨世代通用：Route 直发，不依赖任何补丁）----
+        if self.admin_tools_enabled:
+            try:
+                tool_set = getattr(request, "tool_set", None)
+                if tool_set is not None:
+                    for cls in build_admin_tools({
+                        "recall_enabled": True,
+                        "mute_enabled": True,
+                        "bot_state_enabled": True,
+                    }):
+                        tool_set.add(cls(ctx=self.ctx))
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 注入群管理工具失败: %s", exc)
+
+        # ---- markdown / keyboard 标签（description 会进 format 提示词）----
+        for cls, desc, wanted in (
+            (MarkdownTag, MARKDOWN_TAG_DESCRIPTION, self.markdown_enabled),
+            (KeyboardTag, KEYBOARD_TAG_DESCRIPTION, self.keyboard_enabled),
+        ):
+            if not wanted:
+                continue
+            try:
+                tag_set.register(cls(self.ctx, desc))
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 注册标签 %s 失败: %s", cls.__name__, exc)
+
+        # ---- 3.0 增量（群名 / 引用唤醒补洞），幂等 ----
+        profile = self._profile_for(event)
+        if profile.is_v3:
+            self._attach_v3(event, profile)
+
+    def _attach_v3(self, event, profile: CoreProfile) -> None:
+        name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+        if not name:
+            return
+        holders = self.profiles.setdefault("__inst__", {})
+        try:
+            adapter = self.ctx.adapter_mgr.get_adapter(name)
+        except Exception:
+            return
+        if adapter is None:
+            return
+        if holders.get(name) is adapter and self.v3.installed(name):
+            return
+        holders[name] = adapter
+        if self.v3.install(adapter, name, profile):
+            logger.info(
+                "[QQBOT-BRIDGE] %s：已装好 3.0 增量（群名=%s；引用唤醒补洞=%s）",
+                name,
+                "开" if self.group_name_enabled else "关",
+                "开" if self.reply_to_self_wakes else "关",
+            )
+
+    # ------------------------------------------------------------------ #
+    # 机器人身份 / 引用索引（供 3.0 判据与引用注入用）
+    # ------------------------------------------------------------------ #
+    def self_identity_for(self, target_id: str) -> dict:
+        return self._self_ident_by_target.get(str(target_id), {}) or {}
+
+    def remember_self_identity(self, target_id: str, openid=None, name=None) -> None:
+        if not target_id:
+            return
+        item = self._self_ident_by_target.setdefault(str(target_id), {})
+        if openid and not item.get("openid"):
+            item["openid"] = str(openid)
+        if name and not item.get("name"):
+            item["name"] = str(name)
+
+    def remember_sent_ref(self, adapter, target_id: str, sent_id: str,
+                          ref_idx: str, is_group: bool) -> None:
+        """记录机器人自己发出消息的 REFIDX（以后才能引用它）。"""
+        try:
+            display = adapter._display_message_id(str(sent_id))
+        except Exception:
+            return
+        sid = f"{getattr(adapter.info, 'name', '?')}:{'gm' if is_group else 'dm'}:{target_id}"
+        self._remember_ref(adapter, sid, display, ref_idx)
+
+    # ------------------------------------------------------------------ #
+    # 合成事件（互动回调 / 成员进出）
+    # ------------------------------------------------------------------ #
+    def publish_synthetic_event(self, *, target_id: str, sender_id: str, is_group: bool,
+                                text: str, is_notice: bool = True,
+                                target_holder: dict = None) -> bool:
+        """把非消息类事件（按钮点击 / 成员进出）转成一条标准 Kira 事件。
+
+        `is_notice=True` 与核心 `PluginContext.publish_notice` 同语义；内置 kira-ai
+        插件对 notice 有专门的消息格式化分支。
+        """
+        try:
+            from core.chat import Group, User, MessageChain
+            from core.chat.message_elements import Text
+            from core.chat.message_utils import KiraIMMessage, KiraMessageEvent
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 合成事件导入失败: %s", exc)
+            return False
+
+        holders = self.profiles.get("__inst__", {})
+        for adapter_name, adapter in self._find_adapters():
+            adapter = (target_holder or {}).get("adapter") or holders.get(adapter_name) or adapter
+            profile = self.profiles.get(adapter_name)
+            if not isinstance(profile, CoreProfile):
+                profile = detect_profile(adapter)
+            types = message_types_of(adapter, profile) or ["text"]
+            ts = int(time.time())
+            try:
+                event = KiraMessageEvent(
+                    adapter=adapter.info,
+                    message_types=list(types),
+                    message=KiraIMMessage(
+                        timestamp=ts,
+                        group=Group(
+                            group_id=str(target_id),
+                            group_name=self.group_names.lookup(adapter_name, str(target_id))
+                            or str(target_id),
+                        ) if is_group else None,
+                        sender=User(user_id=str(sender_id), nickname=None),
+                        is_mentioned=True,
+                        is_notice=is_notice,
+                        message_id="",
+                        self_id=getattr(adapter, "app_id", None),
+                        chain=MessageChain([Text(text)]),
+                    ),
+                    timestamp=ts,
+                )
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 构造合成事件失败: %s", exc)
+                return False
+            try:
+                adapter.publish(event)
+                return True
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 发布合成事件失败: %s", exc)
+                return False
+        return False
 
     def _find_adapters(self):
         found = []
@@ -406,17 +753,14 @@ class QQOfficialGroupBridge(BasePlugin):
         )
 
     def _attach(self, adapter, name: str, patches: dict):
-        missing = check_adapter_capabilities(adapter)
-        if missing:
-            if name not in self._broken_adapters:
-                self._broken_adapters.add(name)
-                logger.error(
-                    "[QQBOT-BRIDGE] %s: 适配器缺少必要接口 %s —— 桥接对该适配器停用。"
-                    "通常是 KiraAI core 版本变动导致，请到插件仓库反馈",
-                    name, missing,
-                )
-            return
+        """把补丁挂到一个适配器上（幂等，按世代选落点）。
 
+        世代分工（详见 core_profiles）：
+        * **2.x**：核心缺东西 —— 补解析器 + 接管三条事件 + 补发送链；
+        * **3.0**：核心已做完 —— **不接管、不造事件**，只装 api 层发送增强、
+          3.0 增量（群名 / 引用补洞）、互动回调和 L1 工具；
+        * **unknown**：只装 api 层 + L1 工具（两者都不依赖世代落点）。
+        """
         try:
             client = adapter.get_client()
         except Exception as exc:
@@ -425,16 +769,92 @@ class QQOfficialGroupBridge(BasePlugin):
         if client is None:
             return
 
+        profile = detect_profile(adapter)
+        if profile.is_known:
+            self.profiles[name] = profile
         conn = getattr(client, "_connection", None)
         state = getattr(conn, "state", None)
 
+        # ---- L3（发送增强）：无条件安装，两版结构一致 ----
+        self._install_api_send(adapter, name, client)
+        if self.markdown_enabled or self.keyboard_enabled or self.quote_reply:
+            self._patch_send_entry(adapter, name)
+
+        # ---- 互动回调（INTERACTION_CREATE）：两版都需要 ----
+        if self.interaction_enabled:
+            res = self.interactions.install(client)
+            if res == "attached":
+                logger.info("[QQBOT-BRIDGE] %s: 已挂载互动回调处理器", name)
+
+        # ---- intent 扩展（成员事件 / 互动回调位）----
+        self._apply_extra_intents(adapter, name, client)
+
+        # ---- 成员事件解析器（需要 intent 1<<24；缺解析器时补上）----
+        if self.extra_intents and self.member_notice_enabled and state is not None:
+            for event_name in MEMBER_EVENTS:
+                if inject_live_parser(state, event_name, force=False):
+                    logger.info("[QQBOT-BRIDGE] %s: 已为成员事件 %s 注入解析器", name, event_name)
+            for event_name in MEMBER_EVENTS:
+                attach_client_handler(
+                    client, "on_" + event_name,
+                    self._make_member_handler(adapter, name, event_name),
+                    allow_shadow=False, owner=self,
+                )
+
+        if profile.generation == GEN_UNKNOWN:
+            if name not in self._broken_adapters:
+                self._broken_adapters.add(name)
+                logger.warning(
+                    "[QQBOT-BRIDGE] %s: 认不出核心世代（%s）—— 只启用"
+                    "「群管理工具 + markdown/键盘 + 引用」这些不依赖核心内部结构的增强；"
+                    "事件层与群名显示保持不变。若功能异常请到插件仓库反馈",
+                    name, profile.detail,
+                )
+            return
+
+        if profile.is_v3:
+            # 3.0：核心已自带全量群消息/昵称/@/引用/去重 —— 桥接**绝不接管、绝不造事件**
+            self.v3.install(adapter, name, profile)
+            if name not in self._patched:
+                self._patched.add(name)
+                logger.info(
+                    "[QQBOT-BRIDGE] %s: 桥接就绪（KiraAI %s：核心已自带全量群消息与真昵称，"
+                    "桥接只做增量 —— 群名 / markdown / 键盘 / 互动 / 群管理工具）",
+                    name, profile.generation,
+                )
+            return
+
+        # ---- 以下仅 2.x ----
+        missing = check_adapter_capabilities(adapter)
+        if missing:
+            if name not in self._broken_adapters:
+                self._broken_adapters.add(name)
+                logger.error(
+                    "[QQBOT-BRIDGE] %s: 2.x 适配器缺少必要接口 %s —— 事件层停用"
+                    "（发送增强与工具层仍可用）。通常是 KiraAI core 版本变动导致，"
+                    "请到插件仓库反馈",
+                    name, missing,
+                )
+            return
+
         # (event, handler attr, kind, is_group, wanted, allow_shadow)
+        #
+        # ⚠ allow_shadow 的取舍（这里踩过两个方向的坑，说明白）：
+        #   * **2.x 必须为 True**：核心自带 on_group_at_message_create /
+        #     on_c2c_message_create，但实现是 `nickname = OpenID` —— 顶掉它
+        #     正是本插件的核心价值（真昵称修复）。设 False 会静默丢掉这个功能。
+        #   * **3.0 必须为 False**：核心实现已完整（真昵称 + @ 解析 + 引用 + 去重），
+        #     桥接若顶掉它，就会用 2.x 的字段名造事件 ⇒ 所有 @ 消息静默丢失。
+        #   由于 3.0 在上面的分支里已提前 return，不会走到这里；这里再显式限定
+        #   为「仅 v2」，双保险。
+        allow_shadow_events = profile.is_v2
         plan = [
-            (EVENT_GROUP_MESSAGE, "on_group_message_create", KIND_FULL, True, True, False),
+            (EVENT_GROUP_MESSAGE, "on_group_message_create", KIND_FULL, True,
+             True, allow_shadow_events),
             (EVENT_GROUP_AT_MESSAGE, "on_group_at_message_create", KIND_AT, True,
-             bool(self.unify_at), True),
+             bool(self.unify_at), allow_shadow_events),
             (EVENT_C2C_MESSAGE, "on_c2c_message_create", KIND_DM, False,
-             bool(self.unify_dm), True),
+             bool(self.unify_dm), allow_shadow_events),
         ]
 
         newly_attached = []
@@ -458,10 +878,11 @@ class QQOfficialGroupBridge(BasePlugin):
                 logger.info("[QQBOT-BRIDGE] %s: %s 已由框架原生实现，桥接让位", name, attr)
 
         if state is not None:
+            # 与上面同一取舍：2.x 要接管（force），其它世代让位
             live_plan = [
-                (EVENT_GROUP_MESSAGE, False, True),
-                (EVENT_GROUP_AT_MESSAGE, True, bool(self.unify_at)),
-                (EVENT_C2C_MESSAGE, True, bool(self.unify_dm)),
+                (EVENT_GROUP_MESSAGE, allow_shadow_events, True),
+                (EVENT_GROUP_AT_MESSAGE, allow_shadow_events, bool(self.unify_at)),
+                (EVENT_C2C_MESSAGE, allow_shadow_events, bool(self.unify_dm)),
             ]
             for event_name, forced, wanted in live_plan:
                 if not wanted:
@@ -481,6 +902,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 " + @消息" if self.unify_at else "",
                 " + 单聊" if self.unify_dm else "",
             )
+        # 2.x：发送链补丁挂在 adapter._send_message 上（3.0 没有这个方法）
         if self.proactive_enabled or self.quote_reply or self.send_at_mention:
             self._patch_send_path(adapter, name, client)
 
@@ -519,6 +941,12 @@ class QQOfficialGroupBridge(BasePlugin):
                     "若上下文里看到重复，把 at_grace_seconds 设为 1.5 即可消除"
                 )
 
+        group_name = None
+        if is_group:
+            try:
+                group_name = self._fill_group_name_v2(adapter, name, body)
+            except Exception:
+                group_name = None
         try:
             event, reason = build_event(
                 adapter,
@@ -542,6 +970,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 notes=rich_notes,
                 At=At,
                 Text=Text,
+                group_name=group_name,
             )
         except Exception as exc:
             logger.warning("[QQBOT-BRIDGE] 构造事件失败（%s）: %s: %s", kind, type(exc).__name__, exc)
@@ -552,6 +981,13 @@ class QQOfficialGroupBridge(BasePlugin):
                 logger.debug("[QQBOT-BRIDGE] 事件被丢弃（%s）: %s", kind, reason)
             return
 
+        try:
+            if is_group and ident.openid:
+                self.remember_self_identity(
+                    str(body.get("group_openid") or ""), ident.openid, ident.name
+                )
+        except Exception:
+            pass
         self._log_self_learned(name, ident)
         self._log_at_sample_once(raw_content, body, ident, event)
         for note in rich_notes:
@@ -739,6 +1175,225 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._ref_miss, list(body)[:14], scene,
             )
 
+    # ------------------------------------------------------------------ #
+    # L3：发送增强（api 层，两版通用）
+    # ------------------------------------------------------------------ #
+    def _install_api_send(self, adapter, name: str, client) -> None:
+        """把 markdown / keyboard / 引用补丁挂到 `client.api` 上。
+
+        为什么是 api 层：`adapter._send_message` 在 3.0 不存在，
+        而 `client.api.post_group_message` 两版结构一致，且 botpy 用
+        `payload = locals()` 组装请求体 —— 多传一个 kwarg 就进 JSON（已实测）。
+        """
+        if name in self._api_send_installed:
+            return
+        try:
+            if self.api_send.install(adapter, name, client):
+                self._api_send_installed.add(name)
+                logger.info(
+                    "[QQBOT-BRIDGE] %s: 已装好发送增强（markdown=%s；键盘=%s；引用=%s；@自动转md=%s）",
+                    name,
+                    "开" if self.markdown_enabled else "关",
+                    "开" if self.keyboard_enabled else "关",
+                    "开" if self.quote_reply else "关",
+                    "开" if self.at_markdown else "关",
+                )
+        except Exception as exc:
+            logger.warning("[QQBOT-BRIDGE] %s: 安装发送增强失败: %s: %s",
+                           name, type(exc).__name__, exc)
+
+    def _patch_send_entry(self, adapter, name: str) -> None:
+        """包装 adapter 的 send_group_message / send_direct_message（幂等）。"""
+        holder = self.profiles.setdefault("__send_entry__", set())
+        if name in holder:
+            return
+        ok = False
+        for method_name, is_group in (("send_group_message", True),
+                                      ("send_direct_message", False)):
+            current = getattr(adapter, method_name, None)
+            if not callable(current):
+                continue
+            if getattr(current, "_kira_bridge_entry", False):
+                continue
+            bridge = self
+                        # 把 chain 里的 <markdown>/<keyboard> 提取出来（同步、零 I/O）
+            async def wrapped(target_id, chain, _orig=current, _is_group=is_group, _name=name):
+                md_text = kb = ref = None
+                try:
+                    if bridge.markdown_enabled or bridge.keyboard_enabled:
+                        found_md, found_kb, changed = split_markdown_and_keyboard(chain)
+                        if changed:
+                            if bridge.markdown_enabled:
+                                md_text = found_md
+                            if bridge.keyboard_enabled:
+                                kb = found_kb
+                except Exception as exc:
+                    logger.debug("[QQBOT-BRIDGE] 提取 markdown/keyboard 失败: %s", exc)
+                if bridge.quote_reply:
+                    try:
+                        ref = bridge._quote_ref_for(adapter, str(target_id), chain, _is_group)
+                    except Exception as exc:
+                        logger.debug("[QQBOT-BRIDGE] 解析引用失败: %s", exc)
+
+                md_token = PENDING_MD.set(md_text)
+                kb_token = PENDING_KB.set(kb)
+                ref_token = QUOTE_REF.set(ref)
+                try:
+                    return await _orig(target_id, chain)
+                finally:
+                    try:
+                        PENDING_MD.reset(md_token)
+                        PENDING_KB.reset(kb_token)
+                        QUOTE_REF.reset(ref_token)
+                    except Exception:
+                        pass
+
+            setattr(wrapped, "_kira_bridge_entry", True)
+            setattr(adapter, method_name, wrapped)
+            ok = True
+        if ok:
+            holder.add(name)
+
+    def _unpatch_send_entry(self, adapter, name: str) -> None:
+        holder = self.profiles.get("__send_entry__")
+        if not holder or name not in holder:
+            return
+        for method_name in ("send_group_message", "send_direct_message"):
+            current = getattr(adapter, method_name, None)
+            if getattr(current, "_kira_bridge_entry", False):
+                try:
+                    delattr(adapter, method_name)
+                except Exception:
+                    pass
+        holder.discard(name)
+
+    # ------------------------------------------------------------------ #
+    # intent 扩展（成员事件 / 互动回调位）—— 走 botpy.Client.start 包一层
+    # ------------------------------------------------------------------ #
+    def _apply_extra_intents(self, adapter, name: str, client) -> None:
+        """给 botpy 客户端多订阅两个 intent 位。
+
+        **为什么不在巡检里改**：`client.start()` 内部先 `_bot_login()`（建 session，把
+        `self.intents` 写进 `session["intent"]`）再建连接。巡检晚于 start，只能改
+        "下一次重连"用的值 —— 首连注定还是旧 intent。
+
+        所以这里包的是 **`botpy.Client.start`（类级）**：进来时 `self.intents` 已赋值、
+        session 还没建，改它是零竞态，而且**两版通用**（2.x/3.0 的 `start` 都是先
+        `intents` 后 `_bot_login`）。
+        """
+        if not self.extra_intents:
+            return
+        flag = self.profiles.setdefault("__intents__", {})
+        if flag.get("done"):
+            return
+        try:
+            import botpy
+
+            original_start = getattr(botpy.Client, "start", None)
+            if not callable(original_start) or getattr(original_start, "_kira_bridge_intents", False):
+                flag["done"] = True
+                return
+            plugin = self
+
+            async def patched_start(self, appid, secret, ret_coro=False, _orig=original_start):
+                try:
+                    target = getattr(self, "adapter", None)
+                    if target is not None and plugin._is_qq_official(target):
+                        self.intents |= (1 << 24) | (1 << 26)
+                        conn = getattr(self, "_connection", None)
+                        for session in getattr(conn, "_session_list", []) or []:
+                            if isinstance(session, dict):
+                                session["intent"] = self.intents
+                except Exception as exc:
+                    logger.debug("[QQBOT-BRIDGE] 注入 intent 失败: %s", exc)
+                return await _orig(self, appid, secret, ret_coro)
+
+            setattr(patched_start, "_kira_bridge_intents", True)
+            botpy.Client.start = patched_start
+            flag["done"] = True
+            self._intents_patched_at = time.time()
+            logger.info(
+                "[QQBOT-BRIDGE] 已请求额外订阅位（1<<24 成员事件 / 1<<26 互动回调）—— "
+                "**需重启 KiraAI 后首次连接才生效**；若平台拒绝该订阅，连接会反复失败，"
+                "请把 extra_intents 关掉（插件会尝试自动回退）"
+            )
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 安装 intent 补丁失败: %s", exc)
+
+    def _revert_extra_intents(self) -> None:
+        flag = self.profiles.get("__intents__")
+        if not flag or not flag.get("done"):
+            return
+        try:
+            import botpy
+
+            current = getattr(botpy.Client, "start", None)
+            if getattr(current, "_kira_bridge_intents", False):
+                delattr(botpy.Client, "start")
+        except Exception:
+            pass
+        flag["done"] = False
+        logger.warning("[QQBOT-BRIDGE] 已回退额外订阅位（成员事件 / 互动回调将不再收到）")
+
+    # ------------------------------------------------------------------ #
+    # 群名（2.x：构建事件时填；3.0：publish 包装，见 v3_support）
+    # ------------------------------------------------------------------ #
+    def _group_name_for(self, adapter_name: str, adapter, group_id: str, client) -> str:
+        """取群名；没有就顺手丢一个后台任务去拉，并保持 openid（不阻塞）。"""
+        if not self.group_name_enabled or not group_id:
+            return str(group_id)
+        cached = self.group_names.lookup(adapter_name, str(group_id))
+        if cached:
+            return cached
+        try:
+            self.group_names.schedule_fetch(adapter, adapter_name, str(group_id), client, logger)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 排队群名拉取失败: %s", exc)
+        return str(group_id)
+
+    # ------------------------------------------------------------------ #
+    # 成员事件（1<<24）：成员进出 / 加群申请
+    # ------------------------------------------------------------------ #
+    def _make_member_handler(self, adapter, name: str, event_name: str):
+        async def _handler(payload):
+            try:
+                await self._on_member_event(adapter, name, payload, event_name)
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 处理成员事件失败（%s）: %s: %s",
+                             event_name, type(exc).__name__, exc)
+
+        return _handler
+
+    async def _on_member_event(self, adapter, name: str, payload, event_name: str) -> None:
+        if not self.enabled or not self.member_notice_enabled:
+            return
+        body = normalize_body(payload) or {}
+        text = describe_member_event(event_name, body, self.group_names, name)
+        if not text:
+            return
+        group_id = str(body.get("group_openid") or "")
+        member_id = str(body.get("member_openid") or body.get("op_member_openid") or "")
+        self._member_events += 1
+        if self._member_events <= 3:
+            logger.info("[QQBOT-BRIDGE] 成员事件 #%d：%s", self._member_events, text)
+        self.publish_synthetic_event(
+            target_id=group_id or name,
+            sender_id=member_id or "system",
+            is_group=bool(group_id),
+            text=text,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 2.x：构建事件时把群名填进去
+    # ------------------------------------------------------------------ #
+    def _fill_group_name_v2(self, adapter, name: str, body: dict) -> str:
+        group_id = str(body.get("group_openid") or "")
+        try:
+            client = adapter.get_client()
+        except Exception:
+            client = None
+        return self._group_name_for(name, adapter, group_id, client)
+
     def _patch_send_path(self, adapter, name: str, client) -> None:
         if name in self._patched_sends:
             return
@@ -749,11 +1404,11 @@ class QQOfficialGroupBridge(BasePlugin):
         async def _send_message(target_id, send_message_obj, is_group):
             ref = self._quote_ref_for(adapter, target_id, send_message_obj, is_group) \
                 if self.quote_reply else None
-            token = _QUOTE_REF.set(ref)
+            token = QUOTE_REF.set(ref)
             try:
                 result = await original(target_id, send_message_obj, is_group)
             finally:
-                _QUOTE_REF.reset(token)
+                QUOTE_REF.reset(token)
             if result is not None and bool(getattr(result, "ok", True)):
                 return result
             err = str(getattr(result, "err", "") or "")
@@ -778,9 +1433,6 @@ class QQOfficialGroupBridge(BasePlugin):
         self._patched_sends[name] = original
         if self.send_at_mention:
             self._patch_text_content(adapter)
-        if self.quote_reply or (self.send_at_mention and self.at_markdown):
-            # 关掉「引用回复」也要装：@ 的 markdown 转换同样在这一层
-            self._patch_api_quote(adapter, name, client)
 
     @staticmethod
     def _purge_dead_reply_id(adapter, target_id: str, is_group: bool) -> None:
@@ -891,7 +1543,7 @@ class QQOfficialGroupBridge(BasePlugin):
             store = {}
 
             async def _patched(*args, _orig=orig, _is_group=is_group, _store=store, **kwargs):
-                ref = _QUOTE_REF.get()
+                ref = QUOTE_REF.get()
                 if ref and not kwargs.get("message_reference"):
                     kwargs["message_reference"] = {"message_id": ref}
 
@@ -1032,3 +1684,67 @@ class QQOfficialGroupBridge(BasePlugin):
         message_id = result_id(result) if callable(result_id) else None
         logger.info("[QQBOT-BRIDGE] 主动消息已发送（今日第 %d 条）", self._proactive_count)
         return KiraIMSentResult(message_id=message_id)
+
+# --------------------------------------------------------------------------- #
+# 标签：<markdown> / <keyboard>
+#
+# 靠核心的 TagSet 机制进提示词（两版一致）：
+#   message_manager 在 ON_LLM_REQUEST 阶段 new TagSet() → 逐个 handler 传下去 →
+#   tag_set.to_prompt() 拼进 format 提示词的 message_types 段。
+# 标签的父级都是 "msg"（与 <text> 同级），所以模型写
+#   <msg><markdown>## 标题</markdown><keyboard>{...}</keyboard></msg>
+# 即可。真正的渲染由 api 层补丁（api_send）按 msg_type=2 + keyboard 发送。
+# --------------------------------------------------------------------------- #
+class _BridgeTag(BaseTag):
+    """描述文案由插件按配置动态给的标签基类。"""
+
+    def __init__(self, ctx=None, description: str = ""):
+        super().__init__(ctx=ctx)
+        if description:
+            self.description = description
+
+    def _make(self, element):
+        return element
+
+
+class MarkdownTag(_BridgeTag):
+    name = "markdown"
+    description = MARKDOWN_TAG_DESCRIPTION
+
+    async def handle(self, value: str, **kwargs):
+        text = (value or "").strip()
+        if not text:
+            return []
+        return [MarkdownText(text)]
+
+
+class KeyboardTag(_BridgeTag):
+    name = "keyboard"
+    description = KEYBOARD_TAG_DESCRIPTION
+
+    async def handle(self, value: str, **kwargs):
+        try:
+            payload = validate_keyboard(value or "")
+        except Exception as exc:
+            logger.warning("[QQBOT-BRIDGE] <keyboard> 内容不合法，已丢弃：%s", exc)
+            return []
+        return [KeyboardMarker(payload)]
+
+
+# --------------------------------------------------------------------------- #
+# 插件钩子注册
+#
+# ⚠ `on.llm_request` 装饰器用的是「声明所在模块 ⇒ 插件 id」的静态映射，
+#   在**类体内**使用会把 id 认成框架模块，所以这里改成"先用 __module__ 指向本文件的
+#   普通函数"注册，再绑回类 —— 这样 get_obj_plugin_id 能正确定位到本插件。
+# --------------------------------------------------------------------------- #
+async def _hook_llm_request(self, event, request, tag_set, *_, **__):
+    """ON_LLM_REQUEST：注入 L1 工具 + markdown/keyboard 标签 + 3.0 增量。"""
+    try:
+        self.inject_tools_and_tags(event, request, tag_set)
+    except Exception as exc:
+        logger.debug("[QQBOT-BRIDGE] 注入失败（忽略）: %s: %s", type(exc).__name__, exc)
+
+
+on.llm_request(priority=Priority.MEDIUM)(_hook_llm_request)
+QQOfficialGroupBridge.on_llm_request = _hook_llm_request

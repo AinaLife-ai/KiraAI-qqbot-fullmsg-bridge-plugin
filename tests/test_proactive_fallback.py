@@ -46,6 +46,26 @@ class BasePlugin:
 core_plugin.BasePlugin = BasePlugin
 core_plugin.logger = logging.getLogger("test")
 
+# 插件会用到钩子装饰器；最小桩里补上（与真核心同形）
+class _Priority:
+    LOW = -50
+    MEDIUM = 0
+    HIGH = 50
+    SYS_HIGH = 100
+
+
+class _On:
+    @staticmethod
+    def llm_request(*a, **kw):
+        def _deco(func):
+            return func
+        if a and callable(a[0]):
+            return a[0]
+        return _deco
+
+core_plugin.Priority = _Priority
+core_plugin.on = _On()
+
 
 class Text:
     def __init__(self, text=""):

@@ -45,6 +45,16 @@ EVENT_GROUP_MESSAGE = "group_message_create"
 EVENT_GROUP_AT_MESSAGE = "group_at_message_create"
 EVENT_C2C_MESSAGE = "c2c_message_create"
 
+#: 成员事件（官方 intent 1<<24 GROUP_MEMBER_EVENT）。botpy 至今**没有**这几个解析器，
+#: 且官方事件名与 botpy 的 `parse_<name>` 命名规则一致 ⇒ 补上即可。
+EVENT_GROUP_MEMBER_ADD = "group_member_add"
+EVENT_GROUP_MEMBER_REMOVE = "group_member_remove"
+EVENT_GROUP_JOIN_REQUEST = "group_join_request"
+
+#: 需要补解析器的全部事件（2.x 用）
+MEMBER_EVENTS = (EVENT_GROUP_MEMBER_ADD, EVENT_GROUP_MEMBER_REMOVE,
+                 EVENT_GROUP_JOIN_REQUEST)
+
 #: dedup "kind" per event -- AT is the authoritative copy of an @-message.
 KIND_FULL = "fm"
 KIND_AT = "at"
@@ -891,6 +901,7 @@ def build_event(
     notes: Optional[list] = None,
     At: Any = None,
     Text: Any = None,
+    group_name: Optional[str] = None,
     now: Optional[float] = None,
 ) -> tuple:
     """Turn one raw QQ payload into a KiraAI event.
@@ -1001,7 +1012,8 @@ def build_event(
         message_types=adapter.message_types,
         message=KiraIMMessage(
             timestamp=ts,
-            group=Group(group_id=target_id, group_name=target_id) if is_group else None,
+            group=Group(group_id=target_id,
+                        group_name=(group_name or target_id)) if is_group else None,
             sender=User(user_id=uid, nickname=nickname),
             is_mentioned=is_mentioned,
             message_id=display_id or message_id,
@@ -1011,6 +1023,118 @@ def build_event(
         timestamp=ts,
     )
     return event, source
+
+
+# --------------------------------------------------------------------------- #
+# 成员事件（1<<24）：成员加入 / 退出 / 加群申请
+#
+# botpy 的 `ConnectionState.parsers` 是由 `parse_*` 方法**自动收集**的
+# （`for attr, func in inspect.getmembers(self) if attr.startswith("parse_")`），
+# 而官方这三个事件恰恰**没有**对应方法 ⇒ 事件到了会在最外层报
+# `_parser unknown event group_member_add` 然后丢掉。补法与 group_message_create 同款。
+# --------------------------------------------------------------------------- #
+def describe_member_event(event_name: str, body: dict, group_names=None,
+                          adapter_name: str = "") -> str:
+    """把成员事件渲染成一行可读文本（作为 notice 消息正文）。"""
+    if not isinstance(body, dict):
+        return ""
+    gid = str(body.get("group_openid") or "")
+    group_label = gid
+    if group_names is not None and gid:
+        try:
+            group_label = group_names.lookup(adapter_name, gid) or gid
+        except Exception:
+            group_label = gid
+
+    if event_name == EVENT_GROUP_MEMBER_ADD:
+        who = str(body.get("member_openid") or "")
+        return f"[System 新成员 {who} 加入了群聊 {group_label}]"
+    if event_name == EVENT_GROUP_MEMBER_REMOVE:
+        who = str(body.get("member_openid") or "")
+        return f"[System 成员 {who} 退出了群聊 {group_label}]"
+    if event_name == EVENT_GROUP_JOIN_REQUEST:
+        who = str(body.get("member_openid") or "")
+        name = str(body.get("username") or "")
+        source = str(body.get("apply_source") or "")
+        source_text = {"self_apply": "主动申请", "invited": "被邀请"}.get(source, source)
+        return (
+            f"[System 用户 {name or who} 申请加入群聊 {group_label}"
+            + (f"（{source_text}）" if source_text else "")
+            + "]"
+        )
+    return ""
+
+
+def install_member_parser(state: Any, event_name: str) -> bool:
+    """给运行中的 `ConnectionState.parsers` 补一个成员事件解析器。
+
+    与 :func:`inject_live_parser` 同款，但**不做强覆盖**：
+    已经有了就返回 False（让位）。
+    """
+    parsers = getattr(state, "parsers", None)
+    dispatch = getattr(state, "_dispatch", None)
+    if not isinstance(parsers, dict) or dispatch is None:
+        return False
+    if event_name in parsers:
+        return False
+
+    def parser(payload, _dispatch=dispatch, _name=event_name):
+        body = payload.get("d") if isinstance(payload, dict) else None
+        _dispatch(_name, body if isinstance(body, dict) else payload)
+
+    setattr(parser, _MARK, True)
+    parsers[event_name] = parser
+    return True
+
+
+def build_member_event(*, adapter, body: dict, event_name: str, Group, User,
+                       Text, KiraIMMessage, KiraMessageEvent, KiraIMSentResult=None):
+    """把成员事件构造成一条 notice 事件（独立构造器，**不复用 build_event**）。
+
+    为什么不复用 `build_event`：成员事件 payload 里**没有 `author` / `id`**，
+    直接走 build_event 会因 `missing-ids` 被丢掉。
+    """
+    if not isinstance(body, dict):
+        return None
+    group_id = str(body.get("group_openid") or "")
+    member_id = str(body.get("member_openid") or body.get("op_member_openid") or "")
+    if not group_id:
+        return None
+    text = describe_member_event(event_name, body)
+    if not text:
+        return None
+    ts = int(body.get("timestamp") or time.time())
+    try:
+        event = KiraMessageEvent(
+            adapter=adapter.info,
+            message_types=list(getattr(adapter, "message_types", []) or ["text"]),
+            message=KiraIMMessage(
+                timestamp=ts,
+                group=Group(group_id=group_id, group_name=group_id),
+                sender=User(user_id=member_id or "system", nickname=None),
+                is_mentioned=True,
+                is_notice=True,
+                message_id="",
+                self_id=getattr(adapter, "app_id", None),
+                chain=_make_chain(Text, text),
+            ),
+            timestamp=ts,
+        )
+    except Exception:
+        return None
+    return event
+
+
+def _make_chain(Text, text: str):
+    try:
+        from core.chat import MessageChain as _MC
+
+        return _MC([Text(text)])
+    except Exception:
+        try:
+            return [Text(text)]
+        except Exception:
+            return []
 
 
 def collect_self_ids(client: Any) -> list:

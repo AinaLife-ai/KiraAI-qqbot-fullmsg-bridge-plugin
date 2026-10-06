@@ -79,6 +79,22 @@ def c2c(msg_id="MSG3", content="在吗", uid="UOPENID9", username="小红"):
     }}
 
 
+def make_adapter(info, queue):
+    """兼容两版适配器构造签名。
+
+    * KiraAI 2.x：``QQOfficialAdapter(info, event_queue)``
+    * KiraAI 3.0：``QQOfficialAdapter(AdapterContext(info=..., event_queue=...))``
+    """
+    from core.adapter.src.qq_official.qq_official import QQOfficialAdapter
+
+    try:
+        return QQOfficialAdapter(info, queue)
+    except TypeError:
+        from core.adapter.context import AdapterContext
+
+        return QQOfficialAdapter(AdapterContext(info=info, event_queue=queue))
+
+
 async def main():
     print("=" * 72)
     try:
@@ -104,6 +120,10 @@ async def main():
     spec = importlib.util.spec_from_file_location(
         "qqbot_bridge_plugin_main", os.path.join(PLUGIN_DIR, "main.py")
     )
+    if PLUGIN_DIR not in sys.path:
+        sys.path.insert(0, PLUGIN_DIR)
+    import importlib
+    api_send = importlib.import_module("api_send")
     plugin_main = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = plugin_main
     spec.loader.exec_module(plugin_main)
@@ -113,7 +133,7 @@ async def main():
         config={"app_id": "102000001", "app_secret": "secret", "permission_mode": "deny_list"},
     )
     bus = asyncio.Queue()
-    adapter = QQOfficialAdapter(info, bus)
+    adapter = make_adapter(info, bus)
     adapter.app_id = "102000001"
 
     from core.adapter.src.qq_official.qq_official import _QQOfficialClient
@@ -153,14 +173,33 @@ async def main():
     await plugin.initialize()
     await asyncio.sleep(0.05)
 
-    check("运行中连接已补上 group_message_create 解析器", "group_message_create" in parsers)
-    check("@ 事件解析器已被接管（发原始 payload）",
-          getattr(parsers.get("group_at_message_create"), "_kira_qqbot_fullmsg_bridge", False))
-    check("单聊解析器已被接管",
-          getattr(parsers.get("c2c_message_create"), "_kira_qqbot_fullmsg_bridge", False))
-    check("客户端已挂载全部处理器",
-          all(callable(getattr(client, a, None)) for a in
-              ("on_group_message_create", "on_group_at_message_create", "on_c2c_message_create")))
+    _profile = plugin.profiles.get("qqo")
+    _gen = getattr(_profile, "generation", "?")
+    print(f"  info 检测到核心世代: {_gen}")
+    if _gen == "v3":
+        # KiraAI 3.0：核心已自带全量群消息 + 真昵称 + @ 解析 + 引用 + 去重
+        # ⇒ 桥接**必须让位**：不补解析器、不接管事件（否则会用 2.x 字段名造事件，
+        #   导致所有 @ 消息静默丢失 —— 这正是 Phase 0 要修的雷）
+        check("3.0 下不补 botpy 解析器（核心已自带）",
+              "group_message_create" not in parsers)
+        check("3.0 下不顶掉核心原生处理器",
+              not getattr(getattr(client, "on_group_at_message_create", None),
+                          "_kira_bridge_owner", None))
+    else:
+        # KiraAI 2.x：核心缺全量群消息 + 昵称写成 OpenID ⇒ 桥接必须接管
+        check("运行中连接已补上 group_message_create 解析器", "group_message_create" in parsers)
+        check("@ 事件解析器已被接管（发原始 payload）",
+              getattr(parsers.get("group_at_message_create"), "_kira_qqbot_fullmsg_bridge", False))
+        check("单聊解析器已被接管",
+              getattr(parsers.get("c2c_message_create"), "_kira_qqbot_fullmsg_bridge", False))
+        check("客户端已挂载全部处理器",
+              all(callable(getattr(client, a, None)) for a in
+                  ("on_group_message_create", "on_group_at_message_create", "on_c2c_message_create")))
+
+    if _gen != "v2":
+        # 3.0 的路由由核心自己完成，桥接不参与 → 本套 2.x 专属断言整体跳过
+        print("  skip  后续 2.x 专属的事件语义断言（当前核心由核心自身处理）")
+        return 0
 
     async def drain(timeout=0.3):
         await asyncio.sleep(timeout)
@@ -520,21 +559,21 @@ async def main():
 
     # ② api 层注入：设置 contextvar 后调用，应带上 message_reference
     sent_calls.clear()
-    token = plugin_main._QUOTE_REF.set("REFIDX_quoted==")
+    token = api_send.QUOTE_REF.set("REFIDX_quoted==")
     try:
         await client.api.post_group_message(group_openid="GRP_OPENID_1", msg_type=0, content="hi")
     finally:
-        plugin_main._QUOTE_REF.reset(token)
+        api_send.QUOTE_REF.reset(token)
     check("★ 带上 message_reference（官方要求的 REFIDX）",
           sent_calls and sent_calls[0].get("message_reference") == {"message_id": "REFIDX_quoted=="},
           str(sent_calls[:1]))
 
     sent_calls.clear()
-    token = plugin_main._QUOTE_REF.set("REFIDX_sent==")
+    token = api_send.QUOTE_REF.set("REFIDX_sent==")
     try:
         await client.api.post_group_message(group_openid="GRP_OPENID_1", msg_type=0, content="hi2")
     finally:
-        plugin_main._QUOTE_REF.reset(token)
+        api_send.QUOTE_REF.reset(token)
     check("机器人自己发的消息也记下了 ref_idx（以后能引用自己发过的消息）",
           any(k[0].endswith("GRP_OPENID_1") and k[1].startswith("qqo-")
               for k in plugin_main.ref_store_for(adapter)),
@@ -696,7 +735,9 @@ async def main():
     fake_api = _FakeApi()
     plugin_md = plugin_main.QQOfficialGroupBridge(FakeCtx(), cfg0)
     adapter.client = types.SimpleNamespace(api=fake_api)
-    plugin_md._patch_send_path(adapter, "QQ Official", adapter.client)
+    # api 层发送增强现在由 _install_api_send 统一安装（3.0 上 _send_message 不存在，
+    # 所以不能再依赖 _patch_send_path —— 这正是本次改造要修的问题）
+    plugin_md._install_api_send(adapter, "QQ Official", adapter.client)
     _at_id = "9CD54739CC9BAA46B93243088802DC72"
     import asyncio as _aio
 

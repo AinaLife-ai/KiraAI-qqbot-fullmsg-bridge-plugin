@@ -26,7 +26,7 @@ def check(name, ok, detail=""):
 version = json.loads((PLUGIN / "manifest.json").read_text(encoding="utf-8"))["version"]
 readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
 
-title = re.search(r"补丁 v(\d+\.\d+\.\d+)", readme)
+title = re.search(r"(?:补丁|增强)\s*v(\d+\.\d+\.\d+)", readme)
 check("manifest.version 是 x.y.z", bool(re.fullmatch(r"\d+\.\d+\.\d+", version)), version)
 check("README 标题版本 == manifest.version",
       bool(title) and title.group(1) == version,
