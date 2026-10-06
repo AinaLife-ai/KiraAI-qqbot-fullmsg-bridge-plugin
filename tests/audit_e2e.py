@@ -169,7 +169,7 @@ async def main():
     tools = {t.name: t(ctx=p4.ctx) for t in build_tools({
         "recall_enabled": True, "group_info_enabled": True,
         "member_query_enabled": True, "receive_files": True,
-        "send_file_enabled": True, "bot_state_enabled": True,
+        "bot_state_enabled": True,
         "admin_tools_enabled": True, "mute_enabled": True,
         "mute_state_enabled": True, "join_approval_enabled": True,
         "kick_enabled": True, "roster_enabled": True, "blacklist_enabled": True,

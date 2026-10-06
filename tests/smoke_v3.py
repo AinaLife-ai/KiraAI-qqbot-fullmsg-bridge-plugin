@@ -341,7 +341,7 @@ async def main():
     names = sorted(t.name for t in req.tool_set.tools)
     check("无需权限的工具已注入（默认配置）",
           {"recall_qq_msg", "get_qq_group_info", "find_qq_group_member",
-           "read_qq_attached_file", "send_qq_file", "get_qq_bot_state"} <= set(names),
+           "read_qq_attached_file", "get_qq_bot_state"} <= set(names),
           str(names))
     check("★ 需管理员权限的工具默认不注入",
           not ({"set_qq_group_ban", "get_group_mute_state",

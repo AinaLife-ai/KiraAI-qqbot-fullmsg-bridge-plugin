@@ -281,7 +281,6 @@ class QQOfficialGroupBridge(BasePlugin):
         self.admin_mute_state = bool(admin.get("admin_mute_state", False))
         self.admin_join_approval = bool(admin.get("admin_join_approval", False))
         self.admin_recall_others = bool(admin.get("admin_recall_others", False))
-        self.admin_send_file = bool(admin.get("admin_send_file", True))
         self.admin_member_roster = bool(admin.get("admin_member_roster", False))
         self.admin_kick = bool(admin.get("admin_kick", False))
         self.admin_blacklist = bool(admin.get("admin_blacklist", False))
@@ -394,12 +393,11 @@ class QQOfficialGroupBridge(BasePlugin):
                 "开" if self.proactive_enabled else "关",
             )
             logger.info(
-                "[QQBOT-BRIDGE] 无需权限的能力：群信息=%s；按名字找人=%s；读文件=%s；发文件=%s；"
+                "[QQBOT-BRIDGE] 无需权限的能力：群信息=%s；按名字找人=%s；读文件=%s；"
                 "成员事件=%s；加群申请提醒=%s；额外订阅位=%s",
                 "开" if self.group_info_enabled else "关",
                 "开" if self.member_query_enabled else "关",
                 "开" if self.receive_files else "关",
-                "开" if self.admin_send_file else "关",
                 "开" if self.member_notice_enabled else "关",
                 "开" if self.join_request_notice_enabled else "关",
                 "开" if self.extra_intents else "关",
@@ -666,7 +664,6 @@ class QQOfficialGroupBridge(BasePlugin):
                     "group_info_enabled": self.group_info_enabled,
                     "member_query_enabled": self.member_query_enabled,
                     "receive_files": self.receive_files,
-                    "send_file_enabled": self.admin_send_file,
                     "bot_state_enabled": True,
                     # 需要管理员（再受总闸约束）
                     "admin_tools_enabled": self.admin_tools_enabled,

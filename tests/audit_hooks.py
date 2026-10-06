@@ -149,7 +149,7 @@ def main():
     check("★ 标签真的进了 TagSet", {"markdown", "keyboard"} <= set(tag_names), str(tag_names))
     check("★ 无需权限的工具真的进了 ToolSet（默认配置）",
           {"recall_qq_msg", "get_qq_group_info", "find_qq_group_member",
-           "read_qq_attached_file", "send_qq_file",
+           "read_qq_attached_file",
            "get_qq_bot_state"} <= set(tool_names), str(tool_names))
     check("★ 默认配置下管理工具**不该**出现（需权限的默认关）",
           not ({"set_qq_group_ban", "get_group_mute_state",

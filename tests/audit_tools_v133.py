@@ -52,7 +52,8 @@ def main():
 
     # ---------------- 1. 用户点名的默认值 ----------------
     print("\n[1] 默认值（用户点名的四条）")
-    check("★ 发文件默认开（用户点名）", dflt("section_admin", "admin_send_file") is True)
+    check("★ 发文件：不重复实现（框架原生已支持，见 audit_core_files.py）",
+          "admin_send_file" not in schema["section_admin"]["fields"])
     check("★ 撤回默认开（自己消息，平台自动判权限）",
           dflt("section_basic", "recall_enabled") is True
           if "recall_enabled" in schema["section_basic"]["fields"] else True)
@@ -85,20 +86,21 @@ def main():
     check("默认含群信息", "get_qq_group_info" in names)
     check("默认含找人", "find_qq_group_member" in names)
     check("默认含读文件", "read_qq_attached_file" in names)
-    check("默认含发文件", "send_qq_file" in names)
+    check("★ 默认不含发文件工具（避免与框架原生重复）",
+          "send_qq_file" not in names)
 
     # ---------------- 4. 全开时应全部就位 ----------------
     print("\n[4] 全开时工具全就位（功能全在）")
     allcfg = {
         "recall_enabled": True, "group_info_enabled": True,
         "member_query_enabled": True, "receive_files": True,
-        "send_file_enabled": True, "bot_state_enabled": True,
+        "bot_state_enabled": True,
         "admin_tools_enabled": True, "mute_enabled": True,
         "mute_state_enabled": True, "join_approval_enabled": True,
         "kick_enabled": True, "roster_enabled": True, "blacklist_enabled": True,
     }
     allnames = [t.name for t in A.build_tools(allcfg)]
-    check("★ 全开时所有 12 个工具都注册", len(allnames) == 12, str(allnames))
+    check("★ 全开时所有 11 个工具都注册", len(allnames) == 11, str(allnames))
     check("★ 管理工具全部就位", ADMIN_TOOLS <= set(allnames), str(ADMIN_TOOLS - set(allnames)))
 
     # ---------------- 5. 总闸语义：单开细项但总闸关 => 不注册 ----------------
@@ -165,6 +167,20 @@ def main():
     st.save()
     st2 = IdentityStore(path=st.path)
     check("★ 角色落盘后可回读", st2.role_of("qq", "B2") == "群主", st2.role_of("qq", "B2"))
+
+    # ★★ 防回归：机器人自己**会出现在 mentions 里**（用户日志实证），
+    #    文档写"不含@机器人自身"与实测不符。若不跳过 is_you，
+    #    机器人自己会被写进通讯录、被 find_qq_group_member 搜出来。
+    st3 = IdentityStore(path=os.path.join(tempfile.mkdtemp(), "i3.json"))
+    st3.remember_from_mentions("qq", [
+        {"id": "ROBOTSELF", "is_you": True, "bot": True, "username": "香里"},
+        {"member_openid": "U1", "username": "真人", "member_role": "member"},
+    ])
+    selfs = [m for m in st3.all_members("qq") if m["uid"] == "ROBOTSELF"]
+    check("★★ 机器人自己（is_you）不被记进通讯录", not selfs, str(st3.all_members("qq")))
+    check("★ 真人仍正常记入", bool(st3.search("qq", "真人")))
+    st3.remember_from_mentions("qq", [{"member_openid": "PLACE", "username": "PLACE"}])
+    check("★ 名字=自己 openid 的占位不记", not st3.lookup("qq", "PLACE"))
 
     # ---------------- 9. 存量用户升级无感（核心的补默认值语义） ----------------
     print("\n[9] 存量用户升级无感")

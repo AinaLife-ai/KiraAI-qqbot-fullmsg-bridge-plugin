@@ -919,64 +919,6 @@ class JoinRequestTool(_AdminTool):
         return "已拒绝该加群申请" + ("，并加入黑名单" if also_blacklist else "")
 
 
-# --------------------------------------------------------------------------- #
-# 11. 发送文件（无需权限，默认开）
-# --------------------------------------------------------------------------- #
-class SendGroupFileTool(_ApiTool):
-    name = "send_qq_file"
-    description = (
-        "把文件发送到当前群或私聊。不需要管理员权限。支持图片(png/jpg)、视频(mp4)、"
-        "语音(silk)和普通文件；普通文件上限 200MB。"
-        "传一个公网可访问的 URL 即可，平台会自己下载转存。"
-        "注意：官方机器人只能“发”文件，不能浏览群文件库、下载或删除群文件。"
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string",
-                "description": "文件的公网下载地址，必须是 http/https 开头",
-            },
-            "file_type": {
-                "type": "integer",
-                "description": "媒体类型：1=图片 2=视频 3=语音 4=普通文件（默认 4）",
-                "default": 4,
-            },
-            "file_name": {
-                "type": "string",
-                "description": "可选。显示的文件名",
-            },
-        },
-        "required": ["url"],
-    }
-
-    async def execute(self, event, *args, url: str = "", file_type: int = 4,
-                      file_name: str = "", **kwargs) -> str:
-        target = self._target_id(event)
-        if not target or not url:
-            return "发送失败：缺少会话或文件地址"
-        if not str(url).lower().startswith(("http://", "https://")):
-            return "发送失败：文件地址必须是 http/https 开头"
-        try:
-            ftype = int(file_type)
-        except (TypeError, ValueError):
-            ftype = 4
-        if ftype not in (1, 2, 3, 4):
-            ftype = 4
-        is_group = self._is_group(event)
-        path = ("/v2/groups/{group_openid}/files" if is_group
-                else "/v2/users/{user_openid}/files")
-        key = {"group_openid": target} if is_group else {"user_openid": target}
-        body = {"file_type": ftype, "url": str(url), "srv_send_msg": True}
-        if file_name:
-            body["file_name"] = str(file_name)
-        try:
-            await self._request(event, "POST", path, _json=body, **key)
-        except Exception as exc:
-            return f"发送失败：{humanize_error(exc)}"
-        return "文件已发送"
-
-
 #: 按配置开关挑选要注册的工具（v1.3.3：分组、细粒度）
 def build_tools(cfg: dict) -> list:
     tools = []
@@ -994,8 +936,6 @@ def build_tools(cfg: dict) -> list:
             tools.append(ReadAttachedFileTool)
         except Exception:
             pass
-    if cfg.get("send_file_enabled", True):
-        tools.append(SendGroupFileTool)
     if cfg.get("bot_state_enabled", True):
         tools.append(GetQQBotStateTool)
 

@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.3
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -127,6 +127,17 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
 | `extra_intents` | **开** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；插件会在连接时自动补上订阅位并请一次重连，**需重启 KiraAI** 生效。个别环境被平台拒绝订阅时会自动回退 |
 
+### 关于「发文件」——本插件**不做**（框架原生已支持）
+
+KiraAI 框架内置的 `kira-ai` 插件**默认注册 `<file>` 标签**，模型写
+`<file>https://…</file>`（或 `data/files/` 下的本地路径）即可发文件；
+QQ 官方适配器**两版都原生实现上传**（2.x `qq_official.py:_upload_file`、
+3.0 `im.py:_upload_file`，都走 `POST /v2/groups|users/{id}/files`）。
+所以本插件**不重复实现**发文件，避免与框架抢同一件事。
+（依据与验证见 `tests/audit_core_files.py`，2.x / 3.0 双核心报文级确认。）
+
+> 注意：官方机器人**只能发**文件，不能浏览群文件库、下载或删除群文件——这是平台限制。
+
 ### 成员与信息（都不需要权限，默认全开）
 
 | 配置项 | 默认 | 说明 |
@@ -149,7 +160,6 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `admin_mute_state` | 关 | `get_group_mute_state`：查全员禁言模式与禁言中成员（**只能查不能改** —— 官方 POST 只支持成员级） |
 | `admin_join_approval` | 关 | `manage_qq_group_join_request`：查 / 批准 / 拒绝加群申请（**仅需管理员，不属内邀**） |
 | `admin_recall_others` | 关 | 撤回**他人**消息（官方限 2 分钟内） |
-| `admin_send_file` | **开** | `send_qq_file`：发文件到群 / 私聊。**不需要管理员权限**，故默认开、不受总闸影响。只能发，不能浏览群文件库 / 下载 / 删除 |
 | `admin_member_roster` | 关 | `get_qq_group_member_roster`：全群名册 / 成员详情。官方标注**内邀接入中**，不可用时自动记住并不再重试 |
 | `admin_kick` | 关 | `kick_qq_group_member`：移出群成员（同样属内邀，自动降级） |
 | `admin_blacklist` | 关 | `manage_qq_group_blacklist`：群黑名单查 / 增 / 删（同样属内邀，自动降级） |
@@ -437,6 +447,60 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.3.4</b> — ★ 与框架 / S 版 / Z 版对照后的两处修正（昵称防污染 + 去掉重复的发文件）</summary>
+
+### 修正一：机器人自己会被写进昵称通讯录（真 bug）
+
+官方 `GROUP_AT_MESSAGE_CREATE` 文档写 `mentions`「**不含 @ 机器人自身**」，
+但**实测会带**（用户日志实证）：
+
+```json
+"mentions": [{"id": "0A0B9F32…", "is_you": true, "bot": true, "username": "香里"}]
+```
+
+我最初按文档实现 ⇒ **机器人自己会被当成群成员写进通讯录**，
+`find_qq_group_member` 就会把机器人自己搜出来。
+
+**修正**：跳过 `is_you=True`（平台明确的标记），并顺带跳过「名字恰好等于自己编号」的占位。
+机器人自己的名字另有专门用途（`learn_self_from_mentions` 认自己），不受影响。
+
+> 同时核对了三个昵称来源的**共存性**：它们写的是**同一个 key**（`adapter|uid`），
+> 不会分裂成三份；`remember_from_mentions` 全程 `try` 包裹，异常不炸主流程；
+> 与 S 版 / Z 版**完全无关**（它们不做昵称通讯录）。
+
+### 修正二：`send_qq_file` 是**重复实现**，已移除
+
+对照框架与两版核心源码后发现，**发文件本来就能用**：
+
+| 环节 | 已有实现 |
+|---|---|
+| 模型表达 | 框架内置 `kira-ai` 插件**默认注册 `<file>` 标签**（支持公网 URL 与本地路径） |
+| 元素 | `File` 元素（`core/chat/message_elements.py`） |
+| 上传 | **2.x** `qq_official.py:_upload_file` ／ **3.0** `im.py:_upload_file`，都走 `POST /v2/groups|users/{id}/files` |
+
+我们再加一个工具只是把同一件事做两遍。已删除，并新增
+`tests/audit_core_files.py` 做**报文级验证**（chain 里放 `File` 元素 ⇒ 真的调到核心的上传入口），
+2.x / 3.0 双核心都确认。
+
+### 核对结论：我们只补**没人做**的那一块
+
+| 方向 | 谁在做 | 我们的动作 |
+|---|---|---|
+| **发**文件 | 框架 `<file>` 标签 + 核心适配器 | **不做**（已移除） |
+| 收 **图片 / 语音 / 视频** | 核心转元素；S 版 / Z 版做 **VLM 描述**（`desc_img`） | **不碰** |
+| 收 **普通文件**（txt/md/json/csv/代码…） | ★ **谁都没做** —— 核心的 `File` 元素 `repr` 只有 `[File 名字]`；S/Z 的 `media_recognize.py` 里 `File` 出现 **0 次** | ✅ **我们补这个缺口**（`read_qq_attached_file`） |
+
+### 与框架 / S / Z 的零冲突证据（`tests/audit_framework_peers.py`）
+
+* 框架 `agent` 插件的工具（`read_file`/`write_file`/`exec`…）是**本地文件与命令**类，
+  与我们的 QQ 群工具**无一重名**；
+* 框架内置插件**没有**任何 QQ 群成员/群信息类工具 ⇒ 不抢它的活；
+* S / Z 版接管的是框架 `desc_img`（VLM 识图），**我们完全不 patch `desc_img`**；
+* S / Z 的工具只有 `manage_ignore`，与我们的**无一重名**。
+
+</details>
+
+<details>
 <summary><b>v1.3.3</b> — ★ 成员与信息 / 群管理分组：不需要权限的默认开，需要权限的默认关</summary>
 
 ### 按「是否需要群管理权限」重新分组

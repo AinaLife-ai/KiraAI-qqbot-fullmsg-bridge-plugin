@@ -131,6 +131,13 @@ class IdentityStore:
 
         零额外请求：`mentions` 本来就在事件里，我们只是**以前没拿它学昵称**。
 
+        ⚠ **实测与文档不符的一点**（用户日志实证）：
+        文档写"不含 @ 机器人自身"，但**实际会带**，形如
+        ``{"id": "…", "is_you": true, "bot": true, "username": "香里"}``。
+        所以这里**必须跳过 `is_you=True`** —— 否则机器人自己会被当成群成员
+        写进通讯录，`find_qq_group_member` 就会把机器人自己搜出来。
+        （机器人自己的名字另有专门用途：`learn_self_from_mentions` 认自己。）
+
         :returns: 新学到/更新了几条。
         """
         if not isinstance(mentions, list):
@@ -139,11 +146,17 @@ class IdentityStore:
         for item in mentions:
             if not isinstance(item, dict):
                 continue
+            # ★ 跳过机器人自己（is_you 是平台明确的标记；bot 兜底再判一次）
+            if item.get("is_you") is True:
+                continue
             name = item.get("username")
             uid = (item.get("member_openid") or item.get("user_openid")
                    or item.get("id"))
             if not uid:
                 continue
+            # 别把"名字恰好等于自己 openid"这类占位也记进去
+            if isinstance(name, str) and name.strip() and name.strip() == str(uid):
+                name = None
             if isinstance(name, str) and name.strip():
                 if self.remember(adapter, "any", str(uid), name.strip()):
                     learned += 1

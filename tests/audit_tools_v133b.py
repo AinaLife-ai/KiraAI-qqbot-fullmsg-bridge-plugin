@@ -204,28 +204,14 @@ def main():
           "小王" in r and "主动申请" in r and "我是老同学" in r, r)
     check("列表给出审批所需的 member_id", "member_id=W1" in r, r)
 
-    # --- 发文件（默认开，无需权限） ---
-    calls.clear()
-    adapter6 = make_adapter(calls)
-    tool = [c for c in build_tools({"send_file_enabled": True})
-            if c.name == "send_qq_file"][0](ctx=FakeCtx(adapter6))
-    r = loop.run_until_complete(tool.execute(
-        make_event(adapter6), url="https://x.com/a.txt", file_type=4, file_name="a.txt"))
-    sent = calls[-1]["json"]
-    check("★ 发文件：走 POST /files 且带 url/file_type",
-          "/v2/groups/G1/files" in calls[-1]["url"] and sent.get("url") == "https://x.com/a.txt",
-          json.dumps(calls[-1], ensure_ascii=False)[:160])
-    r = loop.run_until_complete(tool.execute(make_event(adapter6), url="ftp://x/a"))
-    check("非法协议被拦（不编造请求）", "http" in r, r)
-
-    # --- 私聊发文件走 users 路径 ---
-    calls.clear()
-    r = loop.run_until_complete(tool.execute(
-        make_event(adapter6, is_group=False, sid="U1"), url="https://x.com/a.txt"))
-    check("私聊发文件走 /v2/users/{uid}/files",
-          "/v2/users/U1/files" in calls[-1]["url"], calls[-1]["url"])
+    # --- 发文件：**我们不再实现**（框架原生已支持，见 audit_core_files.py） ---
+    fn = [t for t in build_tools({"admin_tools_enabled": True})
+          if t.name == "send_qq_file"]
+    check("★ 不再注册 send_qq_file（避免与框架原生发文件重复）", not fn, str(fn))
 
     # --- 读文件工具：没有附件时如实说明 ---
+    calls.clear()
+    adapter6 = make_adapter(calls)
     tool = [c for c in build_tools({"receive_files": True})
             if c.name == "read_qq_attached_file"][0](ctx=FakeCtx(adapter6))
     r = loop.run_until_complete(tool.execute(make_event(adapter6)))
