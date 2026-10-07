@@ -28,6 +28,10 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_all_on.py        ★ 「全开」配置实测：3.0 上 2.x 专属项**无操作但无害**
+                       （不报错），全部配置项都能读到。
+  audit_hot_install_live.py ★ 热装实测：适配器**先连**→此刻才装插件，逐项验证
+                       「第一轮巡检（≤15s）当场就位」，不需要重启。
   audit_hot_install.py    ★ 三项修复：① 实例已在运行时装插件不用重启（15s 巡检自动
                        补挂 + 新增群名补拉）② 撤回失败提示压到 2 句 ③ 合成事件
                        空 message_id 教坏模型（`<msg message_id="">`）的根因。
@@ -76,7 +80,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py", "audit_recall_alias.py", "audit_hot_install.py"]
+          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py", "audit_recall_alias.py", "audit_hot_install.py", "audit_all_on.py", "audit_hot_install_live.py"]
 
 rc = 0
 for suite in SUITES:
