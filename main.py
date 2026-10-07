@@ -2251,10 +2251,36 @@ class QQOfficialGroupBridge(BasePlugin):
         #   ⇒ 只查 adapter 的话，3.0 上会取不到 ⇒ content 为空 ⇒
         #     被误判成"消息形状不支持" ⇒ **主动兜底在 3.0 上整个失效**。
         #     （实测：返回 err='qqbot bridge cannot send this message shape'）
+        #
+        # ★★★ 但**不能直接把原链丢给 `_text_content`**（v1.4.5 修的真回归）：
+        #   它**不认识我们的自定义元素**（`MarkdownText` / `KeyboardMarker`），
+        #   遇到不认识的就填 `"[Unsupported message element]"` —— 那句占位文本
+        #   会被当成正文**真的发到群里**（用户实测：md 全没了，只剩这一句）。
+        #   ⇒ 必须先提取 markdown / keyboard，与其它发送路径（2.x `_patch_send_path`、
+        #     3.0 `_patch_send_entry`、api 层）**完全一致**。
         text_content = self._adapter_attr(adapter, "_text_content")
-        content = text_content(send_message_obj) if callable(text_content) else ""
-        media_elements = [e for e in send_message_obj if isinstance(e, (File, Image))]
-        if len(media_elements) > 1 or (not content and not media_elements):
+        md_text = kb = None
+        if self.markdown_enabled or self.keyboard_enabled:
+            try:
+                found_md, found_kb, changed = split_markdown_and_keyboard(send_message_obj)
+                if changed:
+                    if self.markdown_enabled:
+                        md_text = found_md
+                    if self.keyboard_enabled:
+                        kb = found_kb
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 主动兜底：提取 markdown/keyboard 失败: %s", exc)
+
+        if md_text is not None:
+            # 有 markdown ⇒ 正文走 markdown，纯文本部分留空（与 api 层同语义）
+            content = ""
+        else:
+            content = text_content(send_message_obj) if callable(text_content) else ""
+        media_elements = []
+        if not md_text:
+            media_elements = [e for e in send_message_obj
+                              if isinstance(e, (File, Image))]
+        if len(media_elements) > 1 or (not content and not md_text and not media_elements):
             return KiraIMSentResult(ok=False, err="qqbot bridge cannot send this message shape")
 
         media = None
@@ -2276,8 +2302,16 @@ class QQOfficialGroupBridge(BasePlugin):
             payload["media"] = media
         # 主动通道同样遵守「纯文本没有 @ 能力」：正文带 @ 标记时改按 markdown 发，
         # 失败（无原生 MD 权限）退回剥掉标记的纯文本 —— 与被动路径（v1.1.9）同一语义
-        md_text = None
-        if not media and self.at_markdown and isinstance(content, str) and (
+        #
+        # ★ md_text 优先于"正文里含 @"的判断：前者是模型显式写了 `<markdown>`，
+        #   后者只是正文里恰好有 @ 标记。两者都走 markdown，但显式优先级更高。
+        if not media and md_text is not None:
+            payload["msg_type"] = 2
+            payload["markdown"] = {"content": md_text}
+            payload["content"] = None
+            if kb:
+                payload["keyboard"] = kb
+        elif not media and self.at_markdown and isinstance(content, str) and (
             "<@" in content or "qqbot-at-user" in content
         ):
             md_text = content

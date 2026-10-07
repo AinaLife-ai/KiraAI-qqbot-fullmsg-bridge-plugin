@@ -1,34 +1,35 @@
-"""v1.4.5：回归 —— 「`<reply>` + `<markdown>` 同一条消息」会发出 `[Unsupported message element]`。
+"""md 回归：`[Unsupported message element]` 的两条成因（都修了）。
 
-用户报：原本 md 发得好好的，更新后变成这样（群里只显示 `[Unsupported message element]`）。
+用户报：原本 md 发得好好的，更新后群里只剩 `[Unsupported message element]`。
+用户还提醒：截图里**有明显没带 reply 的 md** 也坏了 —— 促使我找到真凶。
 
-## 根因（已复现）
+## ★ 真凶（v1.4.6 修）：**主动兜底** `_proactive_send`
 
-2.x 的发送补丁 `_patch_send_path` 里，`_send_message` 包装**只设了 `QUOTE_REF`**，
-**漏了 `PENDING_MD` / `PENDING_KB`**（3.0 那条路径 `_patch_send_entry` 是有的）。
+它直接把**原链**丢给 `adapter._text_content()`：
 
-⇒ `api_send._send` 读不到 `PENDING_MD`
-⇒ 不会走 `msg_type=2 + markdown.content`
-⇒ 把**原链**交给适配器
-⇒ 适配器 `_text_content()` **不认识我们的自定义元素**（`MarkdownText`）
-⇒ 拼出 `"[Unsupported message element]"` 当正文发出去（用户看到的就是这句）。
+    content = text_content(send_message_obj)
 
-## 为什么"偶尔全坏"
+而 `_text_content()` **不认识我们的自定义元素**（`MarkdownText` / `KeyboardMarker`），
+遇到不认识的就填 `"[Unsupported message element]"` —— 这句被当成正文**真发到群里**。
 
-触发条件是**同一条消息里既有 `<reply>` 又有 `<markdown>`**（模型常这么写）。
-单独发 md 时…… 其实也会坏；但用户之前主要发"纯 md"，
-而且这条路径只在**显式引用**时才走 `_quote_ref_for` 那段 ——
-无论哪种，**只要 markdown 提取没传到 api 层就坏**。
-
-## 实测前后对比
+**触发路径**：模型发 md → 被动回复失败（`msg_id` 过期等）
+→ 走主动兜底 → 就坏了。实测复现：
 
     修复前：msg_type=0  content='[Unsupported message element]'
-    修复后：msg_type=2  content=None  markdown={'content': '## 标题\\n正文'}
+    修复后：msg_type=2  content=None  markdown={'content': '…'}
 
-## 修法
+## 另一条（v1.4.5 修的，属**冗余防御**）
 
-在 `_patch_send_path` 的 `_send_message` 里补齐 `PENDING_MD` / `PENDING_KB`
-的设置与 reset，**与 3.0 路径完全一致**。
+2.x 的 `_patch_send_path` 里 `_send_message` 包装只设 `QUOTE_REF`、漏了
+`PENDING_MD` / `PENDING_KB`。实测**有 `_patch_send_entry` 兜着时不会坏**
+（它在外层已经提取并设好），但补上更稳、也更一致。
+
+## 共同教训
+
+**适配器/核心遇到不认识的自定义元素 → 填 `[Unsupported message element]`。**
+⇒ **每一条发送路径都必须先提取自定义元素**，不能把原链丢给适配器。
+现有四条：2.x `_patch_send_path` / 3.0 `_patch_send_entry` /
+**主动兜底 `_proactive_send`** / api 层。加自定义元素时要逐一检查。
 """
 import asyncio
 import os
@@ -143,6 +144,24 @@ def main():
           and "标题" in str(got["markdown"].get("content")), str(got.get("markdown")))
     check("★ 引用用的是真实 msg_id（不是展示态）",
           got.get("msg_id") != mid1, f"{got.get('msg_id')!r} vs {mid1!r}")
+
+    # ---------------- 2b. ★ 主动兜底：这才是线上那条的真凶 ----------------
+    print("\n[2b] ★ 主动兜底路径（被动 id 过期后走这里）—— 必须也不出占位文本")
+    sent.clear()
+    chain2 = MessageChain([Reply("qqo-whatever"),
+                           MarkdownText("## 香香给哥的 Markdown 大展览 w\n\n**哥最大**")])
+    r2 = loop.run_until_complete(p._proactive_send(ad, "G1", chain2, True))
+    g2 = sent[-1] if sent else {}
+    print(f"      实际报文：msg_type={g2.get('msg_type')} "
+          f"content={str(g2.get('content'))[:34]!r} markdown={str(g2.get('markdown'))[:40]!r}")
+    check("★★ 主动兜底：走 markdown 分支（msg_type=2）",
+          g2.get("msg_type") == 2, str(g2)[:200])
+    check("★★ 主动兜底：content 不是 [Unsupported message element]",
+          "[Unsupported message element]" not in str(g2.get("content") or ""),
+          str(g2.get("content")))
+    check("★★ 主动兜底：markdown 正文被正确带上",
+          isinstance(g2.get("markdown"), dict)
+          and "展览" in str(g2["markdown"].get("content")), str(g2.get("markdown")))
 
     # ---------------- 3. 单发 md（无 reply）也要正常 ----------------
     print("\n[3] 对照：单独发 markdown（无 reply）")
