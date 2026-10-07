@@ -334,6 +334,8 @@ class QQOfficialGroupBridge(BasePlugin):
 
         #: 能力对象缓存（见 _capability_of / _resolve_im_capability）
         self._capability_cache: dict = {}
+        #: 装过媒体类型修正的宿主对象（还原时要用）
+        self._media_types_holders: dict = {}
         #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
         self._group_prefetch_task = None
         #: ★ 本实例发起的「请重连」任务 —— terminate 时必须全部取消，
@@ -658,6 +660,15 @@ class QQOfficialGroupBridge(BasePlugin):
                 changed.append(f"{name}.api_send")
             # 发送入口包装
             self._unpatch_send_entry(adapter, name)
+            # 媒体类型修正
+            _mh = self._media_types_holders.pop(name, None)
+            if _mh is not None:
+                try:
+                    from media_types import restore as _restore_mt
+                    if _restore_mt(_mh):
+                        changed.append(f"{name}.media_types")
+                except Exception:
+                    pass
             # 互动回调（标记与 qqbot_bridge.attach_client_handler 统一，便于还原）
             current = getattr(client, "on_interaction_create", None)
             if callable(current) and detach_client_handler(client, "on_interaction_create"):
@@ -962,6 +973,22 @@ class QQOfficialGroupBridge(BasePlugin):
         #   它现在是「世代无关」的：内部自己选落点（3.0 能力对象 / 2.x 适配器实例）。
         if self.proactive_enabled or self.quote_reply or self.send_at_mention:
             self._patch_send_path(adapter, name, client)
+
+        # ---- L3-B：媒体类型修正（视频→2 / 语音→3）—— 同样世代无关 ----
+        #
+        #   官方 file_type：1=图片 2=视频 3=语音 4=文件；框架写死「非图即 4」
+        #   ⇒ 视频/语音会以**文件卡片**发出（要点开下载），不能内嵌播放。
+        #   纯插件侧修正（包 `_upload_file`），不动核心。
+        try:
+            from media_types import install as _install_media_types
+            holder = self._capability_of(adapter)
+            if not hasattr(holder, "_upload_file"):
+                holder = adapter            # 2.x：在适配器实例上
+            if _install_media_types(holder, client, logger):
+                self._media_types_holders[name] = holder
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 安装媒体类型修正失败（不影响其它功能）: %s", exc)
+
         if profile.generation == GEN_UNKNOWN:
             if name not in self._broken_adapters:
                 self._broken_adapters.add(name)
@@ -1285,11 +1312,41 @@ class QQOfficialGroupBridge(BasePlugin):
 
         只认显式引用：否则 KiraAI 会把"最后收到的消息"当作回复目标，
         我们若跟着发 message_reference，机器人每条消息都会变成引用上一条 —— 那是刷屏。
+
+        ## ★★★ 3.0 上这里**不负责发送**，只是补位（2026-10-07 修误报）
+
+        实测（`repro_ref_warning.py`）：3.0 的**核心自己**已经有一套引用索引
+
+            im._message_references[(is_group, target_id, raw_id)] = ref_idx
+            im._resolve_reference(...)   # 发送时自己填 message_reference
+
+        而桥接在 3.0 上**刻意不接管事件**（核心已自带全量群消息），
+        所以**我们这份 store 在 3.0 上必然是空的** —— 这不是故障。
+
+        于是原来的实现会：拿空 store 找不到 ⇒ **误报 WARNING**
+        「机器人想引用 xxx 但没找到 REFIDX …… 本条按普通回复发出」，
+        可实际上核心那边引用**完全正常**（用户截图里 reply 是成功的）。
+
+        ⇒ 先问核心要（`_resolve_reference`），拿不到再回退到我们这份 store；
+        两边都没有，才认为真的找不到（此时日志会指出"核心也没有"）。
         """
         try:
             sid = f"{adapter.info.name}:{'gm' if is_group else 'dm'}:{target_id}"
         except Exception:
             return None
+
+        # ---- ① 先问核心（3.0 自带；2.x 上这个方法不存在，会安静跳过）----
+        try:
+            cap = self._capability_of(adapter)
+            resolver = getattr(cap, "_resolve_reference", None) if cap is not None else None
+            if callable(resolver):
+                core_ref = resolver(is_group, str(target_id), chain)
+                if core_ref:
+                    return core_ref
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 问核心要 REFIDX 失败: %s", exc)
+
+        # ---- ② 回退到我们自己的 store（2.x 主力；3.0 上通常为空）----
         store = ref_store_for(adapter)
         for ele in chain:
             if not isinstance(ele, Reply):
@@ -1305,9 +1362,13 @@ class QQOfficialGroupBridge(BasePlugin):
             if not self._quote_miss_logged:
                 self._quote_miss_logged = True
                 known = ", ".join(sorted({str(k[1]) for k in store})[:6])
+                # ★ 措辞区分：3.0 上我们这份 store 本来就该是空的，
+                #   说"没找到"会让用户以为坏了（实测误报过一次）。
                 logger.warning(
-                    "[QQBOT-BRIDGE] 机器人想引用 %s，但没找到对应的 REFIDX（已知 %d 条：%s）——"
-                    "本条按普通回复发出；如持续如此请把本条连同启动日志一起反馈",
+                    "[QQBOT-BRIDGE] 机器人想引用 %s，但**核心与桥接都没有它的 REFIDX**"
+                    "（桥接已知 %d 条：%s）—— 本条按普通回复发出。"
+                    "若核心是 3.0，通常说明这条消息不是经核心收到的（或索引尚未建立）；"
+                    "如持续如此请把本条连同启动日志一起反馈",
                     display_id, len(store), known or "无",
                 )
         return None
@@ -2378,6 +2439,14 @@ class QQOfficialGroupBridge(BasePlugin):
         # ★ md_text 优先于"正文里含 @"的判断：前者是模型显式写了 `<markdown>`，
         #   后者只是正文里恰好有 @ 标记。两者都走 markdown，但显式优先级更高。
         if not media and md_text is not None:
+            # ★ 与 api 层补丁同源：md 里的本地图片换成公网地址（结构不动）
+            try:
+                from md_media import fix_markdown_images
+                md_text = await fix_markdown_images(
+                    md_text, client=client, target_id=str(target_id),
+                    is_group=is_group, logger=logger)
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 主动兜底 md 图片处理失败（原样发送）: %s", exc)
             payload["msg_type"] = 2
             payload["markdown"] = {"content": md_text}
             payload["content"] = None

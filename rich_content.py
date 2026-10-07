@@ -18,6 +18,7 @@ KiraAI 2.x 与 3.0 的 `ElementType` 里**都没有** markdown / keyboard。
 """
 
 from __future__ import annotations
+import re
 
 import json
 from typing import Optional
@@ -146,6 +147,59 @@ def validate_keyboard(raw: str) -> dict:
 # --------------------------------------------------------------------------- #
 # 从消息链里提取 markdown / keyboard
 # --------------------------------------------------------------------------- #
+#: 模型有时会把标签转义着写进正文（`&lt;markdown&gt;…&lt;/markdown&gt;`），
+#: 于是整条被当纯文本发出去（用户实测：`#` 和链接全都没渲染）。
+_ESCAPED_MD_OPEN = re.compile(r"&lt;\s*markdown\s*&gt;", re.I)
+_ESCAPED_MD_CLOSE = re.compile(r"&lt;\s*/\s*markdown\s*&gt;", re.I)
+#: 也认没转义的裸标签（模型偶尔会这么写）
+_RAW_MD_OPEN = re.compile(r"<\s*markdown\s*>", re.I)
+_RAW_MD_CLOSE = re.compile(r"<\s*/\s*markdown\s*>", re.I)
+
+
+def unwrap_markdown_tags(text: str) -> str:
+    """把正文里**被转义或裸写**的 `<markdown>` 标签剥掉。
+
+    模型经常这样输出（线上实测）：
+
+        <text>&lt;markdown&gt;
+        # 标题
+        ![图](url)
+        &lt;/markdown&gt;</text>
+
+    标签里的尖括号被转义成 `&lt;`，解析器就只当它是普通文字 ⇒
+    **整条消息的 markdown 全不渲染**（标题、链接都变成原文）。
+    这里把外层这层壳剥掉，正文照常按 markdown 发。
+    """
+    if not text:
+        return text
+    out = _ESCAPED_MD_OPEN.sub("", text)
+    out = _ESCAPED_MD_CLOSE.sub("", out)
+    out = _RAW_MD_OPEN.sub("", out)
+    out = _RAW_MD_CLOSE.sub("", out)
+    return out
+
+
+def looks_like_markdown(text: str) -> bool:
+    """粗判这段正文是不是 markdown（用于「标签被转义」时的兜底识别）。
+
+    只认**明确的** markdown 特征，避免把普通聊天文本误判成 markdown
+    （误判会让本该纯文本的消息变成 md，影响 @ 解析等）。
+    """
+    if not text:
+        return False
+    if re.search(r"^#{1,6}\s+\S", text, re.M):
+        return True
+    if re.search(r"^\s*[-*+]\s+\S", text, re.M) or re.search(r"^\s*\d+\.\s+\S", text, re.M):
+        return True
+    if re.search(r"!\[[^\]]*\]\([^)]+\)", text):
+        return True
+    if re.search(r"^\s*>\s+\S", text, re.M):
+        return True
+    if re.search(r"\*\*[^*\n]+\*\*|~~[^~\n]+~~", text):
+        return True
+    return False
+
+
 def split_markdown_and_keyboard(chain) -> tuple[Optional[str], Optional[dict], bool]:
     """扫描一条消息链，取出 markdown 正文与键盘载荷。
 
@@ -155,22 +209,43 @@ def split_markdown_and_keyboard(chain) -> tuple[Optional[str], Optional[dict], b
       （这样"<text>前面</text><markdown>## 标题</markdown>"也成立）；
     * `keyboard`：取第一个 `KeyboardMarker`（一条消息只支持一个键盘）；
     * `changed`：是否真的提取到了东西 —— 只有 True 时才需要走 markdown 分支。
+
+    ★ 两个「容错补救」（2026-10-07 用户实测踩到）：
+
+    1. **标签被转义**：正文写着 `&lt;markdown&gt;…&lt;/markdown&gt;`
+       ⇒ 剥掉这层壳（`unwrap_markdown_tags`），否则整条 md 不渲染；
+    2. **该走 md 却写在 text 里**：剥掉壳之后，如果这段正文明显是 markdown
+       （标题/列表/图片/引用/加粗）而模型只用了 `<text>` 标签，
+       **就按 markdown 发** —— 否则用户看到的是满屏 `#` 和 `-`。
+       （判据卡得比较紧，只认明确特征，避免误伤普通聊天。）
     """
     md_parts: list = []
     keyboard = None
     has_md = False
+    text_pool: list = []
     for ele in chain or []:
         if isinstance(ele, MarkdownText):
             has_md = True
-            md_parts.append(ele.text)
+            md_parts.append(unwrap_markdown_tags(ele.text))
         elif isinstance(ele, KeyboardMarker):
             if keyboard is None:
                 keyboard = ele.keyboard
         else:
             text = getattr(ele, "text", None)
             if isinstance(text, str) and text:
-                md_parts.append(text)
+                cleaned = unwrap_markdown_tags(text)
+                md_parts.append(cleaned)
+                text_pool.append(cleaned)
+
     md_text = "".join(md_parts).strip() if has_md else None
+
+    # ★ 补救 2：模型只用了 <text>，但内容明显是 markdown ⇒ 也按 md 发
+    if md_text is None and text_pool:
+        joined = "".join(text_pool).strip()
+        if looks_like_markdown(joined):
+            md_text = joined
+            has_md = True
+
     if md_text and len(md_text) > MAX_MARKDOWN_CHARS:
         md_text = md_text[:MAX_MARKDOWN_CHARS]
     return md_text, keyboard, bool(has_md or keyboard)
@@ -183,6 +258,12 @@ MARKDOWN_TAG_DESCRIPTION = (
     "<markdown>markdown 正文</markdown> "
     "# 用 markdown 富文本发送本条消息（支持标题/加粗/斜体/删除线/链接/图片/有序无序列表/块引用/分割线）。"
     "适合需要排版的长内容（列表、步骤、代码块、对比）。"
+    "★ 必须用 <markdown> 标签包裹正文，不要写在 <text> 里，也不要转义成 &lt;markdown&gt; —— "
+    "否则整条消息不会按富文本渲染。"
+    "★ 平台**不支持任何 HTML 标签**（<audio> <video> <img> <div> 等一律无效，会显示成文字）；"
+    "需要放音频/视频请在 markdown 里给出**可点击的直链**，例如 `[▶ 点这里播放](https://…/a.mp3)`，"
+    "或用 <audio> 这类标签包裹音频链接 —— 都不会出声，直链才是唯一可行做法。"
+    "★ 图片必须写在 markdown 里 `![描述](图片地址)`，系统会自动把它转成公网地址。"
     "不要在正文里手写 <qqbot-at-user> 之类的平台标记，系统会自动处理 @。"
 )
 
