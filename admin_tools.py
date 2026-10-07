@@ -33,6 +33,12 @@ except Exception:  # pragma: no cover
         def __init__(self, *a, **kw):
             pass
 
+try:
+    from core.plugin import logger  # noqa: F401  （核心的插件日志器）
+except Exception:  # pragma: no cover
+    import logging as _logging
+    logger = _logging.getLogger("qqbot_bridge")   # type: ignore
+
 
 #: 官方错误码 → 人话（给模型看，避免它反复重试同一个注定失败的调用）
 ERROR_HINTS = {
@@ -157,31 +163,55 @@ class RecallQQMsgTool(_ApiTool):
         #   不是官方要求的那种长 id。直接拿它去请求会得到
         #   `40061001 请求参数无效`（实测）。官方适配器内部维护着一张
         #   「展示态 id → 真实 id」的表（`_reply_id_aliases`），必须反查一次。
-        raw_id = self._to_raw_message_id(event, target, message_id, is_group)
+        resolved, found = self._to_raw_message_id(event, target, message_id, is_group)
 
         path = ("/v2/groups/{group_openid}/messages/{message_id}" if is_group
                 else "/v2/users/{user_openid}/messages/{message_id}")
         # 路径参数名两版官方文档不一致（群用 group_openid，单聊用 user_openid）
         key = {"group_openid": target} if is_group else {"user_openid": target}
-        key["message_id"] = raw_id
+        key["message_id"] = resolved
         try:
             await self._request(event, "DELETE", path, **key)
         except Exception as exc:
+            # ⚠ 这里**只返回官方原始报错**，不做任何"我的推断"式解释 ——
+            #   用户提醒得对：40061001 可能有多种原因，把我猜的
+            #   （"记录被清掉"）当成事实告诉模型，反而会误导。
+            #   `found` 只用来**打日志**（便于真出问题时排查），不进给模型的话。
+            if not found:
+                logger.debug(
+                    "[QQBOT-BRIDGE] 撤回失败：展示态 id %s 未反查到真实 id（%s）",
+                    message_id, humanize_error(exc),
+                )
             return f"撤回失败：{humanize_error(exc)}"
         return "撤回成功"
 
-    def _to_raw_message_id(self, event, target: str, message_id: str, is_group: bool) -> str:
-        """把展示态 id 反查成官方要求的真实 id；查不到就原样返回（让官方报错）。
+    def _alias_table_stats(self, adapter) -> str:
+        """诊断用：把别名表的规模读出来（只用于日志/排查，不影响行为）。"""
+        try:
+            aliases = getattr(adapter, "_reply_id_aliases", None)
+            lrus = getattr(adapter, "_reply_alias_lrus", None)
+            n = len(aliases) if isinstance(aliases, dict) else -1
+            m = len(lrus) if isinstance(lrus, dict) else -1
+            return f"别名表 {n} 条 / 会话 {m} 个"
+        except Exception:
+            return "别名表不可读"
+
+    def _to_raw_message_id(self, event, target: str, message_id: str,
+                           is_group: bool) -> tuple:
+        """把展示态 id 反查成官方要求的真实 id。
+
+        :returns: ``(raw_id, found)`` —— **found=False 表示没查到**，
+            调用方据此给出可操作的提示（而不是干巴巴的报错）。
 
         两版核心的表都在适配器上：
           * 2.x：`adapter._reply_id_aliases[(is_group, target, display_id)] -> raw_id`
           * 3.0：同一张表搬到了 `adapter.get_capability(IMCapability)` 上
-        所以这里两处都找一遍（用 getattr 防御，拿不到就返回原值）。
+        所以这里两处都找一遍（用 getattr 防御）。
         """
         mid = str(message_id or "")
         # 只有形如 qqo-xxxx 的才需要反查（真实 id 长得完全不一样）
         if not mid.startswith("qqo-"):
-            return mid
+            return mid, True        # 本来就是真实 id，照用
         holders = []
         adapter = self._adapter(event)
         if adapter is not None:
@@ -198,8 +228,17 @@ class RecallQQMsgTool(_ApiTool):
                 continue
             raw = aliases.get((is_group, str(target), mid))
             if raw:
-                return str(raw)
-        return mid
+                return str(raw), True
+            # ★ 兜底：主表被 LRU 淘汰时，会话级 LRU 里可能还有
+            #   （`_reply_alias_lrus[(is_group,target)] = OrderedDict(display->raw)`）
+            lrus = getattr(holder, "_reply_alias_lrus", None)
+            if isinstance(lrus, dict):
+                conv = lrus.get((is_group, str(target)))
+                if isinstance(conv, dict):
+                    raw2 = conv.get(mid)
+                    if raw2:
+                        return str(raw2), True
+        return mid, False
 
 
 # --------------------------------------------------------------------------- #

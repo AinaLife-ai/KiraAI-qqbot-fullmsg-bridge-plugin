@@ -199,6 +199,27 @@ def _plugin_version() -> str:
 #: 每次巡检只是幂等的 dict/getattr 操作，成本可忽略。
 _WATCH_INTERVAL = 15.0
 
+#: 能力对象解析结果缓存：`id(adapter) -> 能力对象 | _MISS`
+#: （能力对象在适配器生命周期内不变；`id()` 作键足够，适配器对象不会中途回收）
+_capability_cache: dict = {}
+_MISS = object()
+
+
+def _resolve_im_capability(adapter):
+    """解析 3.0 的 IM 能力对象（**模块级 import，只做一次**）。
+
+    放在模块级是为了避免在热路径（每 15s 巡检）里反复执行 import 语句 ——
+    虽然 `sys.modules` 有缓存，但每次仍要付出查表开销，没必要。
+    """
+    try:
+        from core.adapter.capabilities import IMCapability
+    except Exception:
+        return None
+    try:
+        return adapter.get_capability(IMCapability)
+    except Exception:
+        return None
+
 _ALL_EVENTS = (EVENT_GROUP_MESSAGE, EVENT_GROUP_AT_MESSAGE, EVENT_C2C_MESSAGE)
 _HANDLERS = ("on_group_message_create", "on_group_at_message_create", "on_c2c_message_create")
 
@@ -309,6 +330,10 @@ class QQOfficialGroupBridge(BasePlugin):
         except Exception:
             pass
 
+        #: 能力对象缓存（见 _capability_of / _resolve_im_capability）
+        self._capability_cache: dict = {}
+        #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
+        self._group_prefetch_task = None
         self._task = None
         self._stop = asyncio.Event()
         self._patch_state = {}
@@ -748,6 +773,18 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     # 合成事件（互动回调 / 成员进出）
     # ------------------------------------------------------------------ #
+    #: 合成事件（成员通知 / 主动消息）的 `message_id` 占位。
+    #:
+    #: ⚠ **不能用空串**（真实踩过的坑）：核心 `kira-ai` 插件把每条进来的消息
+    #: 渲染进提示词时是**无条件**带 `message_id` 的：
+    #:     f"[{date}] [message_id: {msg.message_id}] [...] | {msg.message_str}"
+    #: 空串会渲染成 `[message_id: ]`；模型随后写 `<msg message_id="">` 照抄它，
+    #: 这个空属性还会**留在历史里**被反复模仿 —— 表现就是"偶尔消息发不出去"。
+    #:
+    #: 核心自己早就避开了这点：`plugin_context` 用 `"system_message"`、
+    #: OneBot 适配器用 `"None"`。我们跟它们一致，用非空占位即可。
+    SYNTHETIC_MESSAGE_ID = "system"
+
     def publish_synthetic_event(self, *, target_id: str, sender_id: str, is_group: bool,
                                 text: str, is_notice: bool = True,
                                 target_holder: dict = None) -> bool:
@@ -786,7 +823,9 @@ class QQOfficialGroupBridge(BasePlugin):
                         sender=User(user_id=str(sender_id), nickname=None),
                         is_mentioned=True,
                         is_notice=is_notice,
-                        message_id="",
+                        # ★ 非空占位：空串会被渲染成 `[message_id: ]`，
+                        #   模型照抄成 `<msg message_id="">` 并带进历史。
+                        message_id=self.SYNTHETIC_MESSAGE_ID,
                         self_id=getattr(adapter, "app_id", None),
                         chain=MessageChain([Text(text)]),
                     ),
@@ -863,6 +902,15 @@ class QQOfficialGroupBridge(BasePlugin):
 
         # ---- intent 扩展（成员事件 / 互动回调位）----
         self._apply_extra_intents(adapter, name, client)
+
+        # ---- 群名补拉（★ 解决「适配器已连接时才装插件」的体验问题）----
+        #   群名只在**收到该群消息**时才会被拉取，所以刚装插件时：
+        #   会话列表里所有群都还是那串 openid，要等到群里有人说话才逐个变中文。
+        #   这里在挂载时把**已知会话**的群名补拉一遍。
+        #   ⚠ 官方**没有「列出机器人所在的群」的接口**，所以只能从
+        #   `_group_reply_ids`（我们见过的群）反推 —— 没来消息的群确实没法补，
+        #   这是平台限制，不是我们偷懒。
+        self._prefetch_group_names(adapter, name, client)
 
         # ---- 成员事件解析器（需要 intent 1<<24；缺解析器时补上）----
         if self.extra_intents and self.member_notice_enabled and state is not None:
@@ -1606,6 +1654,83 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     # 群名（2.x：构建事件时填；3.0：publish 包装，见 v3_support）
     # ------------------------------------------------------------------ #
+    def _prefetch_group_names(self, adapter, name: str, client) -> None:
+        """挂载时把**已知会话**的群名补拉一遍（后台，不阻塞）。
+
+        为什么需要：群名原本只在「收到该群消息」时才拉 ⇒ 刚装插件（或刚重启）
+        时，会话列表里所有群都还是那串 openid，要等群里有人说话才逐个变中文。
+        用户在「实例已在运行」时装插件是**最常见**的场景，那时体验尤其差。
+
+        能拿到哪些群：官方**没有**「列出机器人所在的群」的接口，
+        所以只能从我们见过的会话反推：
+          * `adapter._group_reply_ids`（收到过消息的群）；
+          * 3.0 上同一信息在能力对象上，一并取。
+        没来过消息的群确实补不了 —— 这是平台限制，只提示一次、不反复重试。
+        """
+        if not self.group_name_enabled:
+            return
+        candidates = set()
+        for holder in (adapter, self._capability_of(adapter)):
+            if holder is None:
+                continue
+            ids = getattr(holder, "_group_reply_ids", None)
+            if isinstance(ids, dict):
+                candidates.update(str(k) for k in ids.keys() if k)
+        if not candidates:
+            return
+        # ★ 节流（官方群名接口限 30 QPM）：
+        #   ① 单轮只排队 `_PREFETCH_BATCH` 个（其余交给后续巡检，15s 一轮）；
+        #   ② 用一个**跨调用共享的**信号量把实际请求串起来 + 每个之间留间隔，
+        #      避免「刚装插件时一次把几十个群全打出去」撞限流。
+        todo = [g for g in sorted(candidates)
+                if not (self.group_names.lookup(name, g) or self.group_names.has_failed(name, g))]
+        if not todo:
+            return
+        batch = todo[: self._PREFETCH_BATCH]
+        if self._group_prefetch_task is not None and not self._group_prefetch_task.done():
+            # 上一批还没跑完：本轮先不排队，交给下一轮（15s 后）
+            return
+        pulled = 0
+        for gid in batch:
+            try:
+                if self.group_names.schedule_fetch(adapter, name, gid, client, logger):
+                    pulled += 1
+            except Exception:
+                pass
+        if pulled:
+            logger.info(
+                "[QQBOT-BRIDGE] %s: 已为 %d 个已知群排队补拉群名（分批进行，"
+                "避免撞接口限流；这样刚装插件/刚重启也能看到中文群名）",
+                name, pulled,
+            )
+
+    #: 群名接口官方限 **30 QPM** ⇒ 本地再保守一点，串行 + 间隔，
+    #: 避免"刚装插件时一次把几十个群全打出去"撞限流（那会被平台拒一整分钟）。
+    _PREFETCH_GAP = 0.4           # 每个群之间的最小间隔（秒）≈ 150 QPM 上限内
+    _PREFETCH_BATCH = 20          # 单轮最多排队多少个（其余留给后续巡检）
+
+    def _capability_of(self, adapter):
+        """3.0 的会话级数据（如 `_group_reply_ids`）搬到了能力对象上。
+
+        ⚠ 性能注意：**2.x 根本没有能力对象**，`adapter.get_capability` 不存在 ——
+        如果每次都去 import + 调它，就会每轮抛一次 ImportError/AttributeError，
+        实测单次约 **176 µs**（异常很贵），而 `_prefetch_group_names` 是
+        **每 15 秒巡检都要跑**的 ⇒ 纯属白烧。
+
+        所以这里做两件事：
+          ① **先廉价探测**：适配器上没有 `get_capability` 就直接返回 None（2.x）；
+          ② **模块级 import + 结果缓存**：能力对象在适配器生命周期内不变，
+             同一个适配器只解析一次。
+        """
+        cached = self._capability_cache.get(id(adapter))
+        if cached is not None:
+            return cached if cached is not _MISS else None
+        cap = None
+        if hasattr(adapter, "get_capability"):
+            cap = _resolve_im_capability(adapter)
+        self._capability_cache[id(adapter)] = cap if cap is not None else _MISS
+        return cap
+
     def _group_name_for(self, adapter_name: str, adapter, group_id: str, client) -> str:
         """取群名；没有就顺手丢一个后台任务去拉，并保持 openid（不阻塞）。"""
         if not self.group_name_enabled or not group_id:
@@ -1971,6 +2096,18 @@ class QQOfficialGroupBridge(BasePlugin):
         self._proactive_count += 1
         result_id = getattr(adapter, "_result_message_id", None)
         message_id = result_id(result) if callable(result_id) else None
+        # ★ 登记这条消息的 id → 展示态 id 映射，否则模型以后【撤回自己刚发的】
+        #   会反查不到（官方只推「新消息」事件，历史 id 我们见不到）。
+        #   核心在「适配器自己发送」的路径里会登记（`_send_message` 里调
+        #   `_remember_reply_id`），但**这里的主动通道绕过了适配器**，
+        #   直接打 `client.api`，所以必须我们自己补上。
+        remember = getattr(adapter, "_remember_reply_id", None)
+        if message_id and callable(remember):
+            try:
+                # 两版签名一致：_remember_reply_id(is_group, target_id, message_id)
+                remember(bool(is_group), str(target_id), message_id)
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 登记主动消息 id 失败（忽略）: %s", exc)
         logger.info("[QQBOT-BRIDGE] 主动消息已发送（今日第 %d 条）", self._proactive_count)
         return KiraIMSentResult(message_id=message_id)
 
