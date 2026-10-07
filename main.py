@@ -951,6 +951,17 @@ class QQOfficialGroupBridge(BasePlugin):
                     allow_shadow=False, owner=self,
                 )
 
+        # ---- L3-A（发送增强）：两代都要装，且必须在世代分支**之前** ----
+        #
+        # ★★★ 为什么挪到这里（2026-10-07 运行时审查抓到的真遗漏）：
+        #   `_patch_send_path` 原来放在**2.x 段**（`is_v3` 分支之后），
+        #   而 3.0 在 `profile.is_v3` 处**提前 return** ⇒ 3.0 上它**从未被调用**。
+        #   当时我是"手动调一次"去验证的，所以看着是绿的 —— 实际挂载流程里没跑。
+        #   教训：**补丁类改动必须在真实挂载流程里验证**，不能手工调函数自证。
+        #
+        #   它现在是「世代无关」的：内部自己选落点（3.0 能力对象 / 2.x 适配器实例）。
+        if self.proactive_enabled or self.quote_reply or self.send_at_mention:
+            self._patch_send_path(adapter, name, client)
         if profile.generation == GEN_UNKNOWN:
             if name not in self._broken_adapters:
                 self._broken_adapters.add(name)
@@ -1052,9 +1063,9 @@ class QQOfficialGroupBridge(BasePlugin):
                 " + @消息" if self.unify_at else "",
                 " + 单聊" if self.unify_dm else "",
             )
-        # 2.x：发送链补丁挂在 adapter._send_message 上（3.0 没有这个方法）
-        if self.proactive_enabled or self.quote_reply or self.send_at_mention:
-            self._patch_send_path(adapter, name, client)
+        # 2.x：发送链补丁已经在上面「L3-A」段统一装过了（世代无关）。
+        #   ⚠ 不要再在这里装一次 —— `_patch_send_path` 内部虽有幂等，
+        #     但重复调用没有意义，更重要的是会掩盖"3.0 是否真的装上"这件事。
 
     # ------------------------------------------------------------------ #
     # 事件 -> KiraAI
@@ -1990,10 +2001,62 @@ class QQOfficialGroupBridge(BasePlugin):
         return self._group_name_for(name, adapter, group_id, client)
 
     def _patch_send_path(self, adapter, name: str, client) -> None:
+        """把「发送增强」挂到**框架真正走的那个发送入口**上。
+
+        ★★★ 为什么必须区分世代（2026-10-07 线上回归的根因）：
+
+        | 世代 | 框架发送入口 |
+        |------|--------------|
+        | 2.x  | `adapter._send_message()` —— 在**适配器实例**上 |
+        | 3.0  | `capability._send_message()` —— 搬到了**能力对象**上<br>（`QQOfficialIMCapability`，im.py:356），适配器实例上**没有** |
+
+        而 3.0 的 `message_manager.send_message_chain()` 走的是：
+
+            target = adapter.get_capability(IMCapability)
+            result = await target.send_group_message(pid, chain)
+
+        ⇒ 只挂 `adapter._send_message` 的话，**3.0 上这个补丁是一个空操作**：
+        没人设 `PENDING_MD` ⇒ `api_send._send` 读不到 markdown
+        ⇒ 3.0 的能力对象直接 `_text_content(chain)` ⇒ 不认识我们的
+        `MarkdownText` ⇒ 拼出 `[Unsupported message element]` **发到群里**。
+
+        实测（`repro_v3_md.py`，模拟框架真实路径）：
+
+            3.0 修复前：msg_type=0  content='[Unsupported message element]'
+            3.0 修复后：msg_type=2  content=None  markdown={'content': '…'}
+
+        这与 v1.4.5/1.4.6 修的两条（2.x 路径漏设 contextvar、主动兜底漏提取）
+        **是同一个病根的第三个面**：每一处发送入口都要自己提取自定义元素。
+        """
         if name in self._patched_sends:
             return
-        original = getattr(adapter, "_send_message", None)
+        # ★ 先试 3.0 的能力对象（**同一个补丁函数，两代通用**）：
+        #   3.0 上适配器实例没有 `_send_message`，`getattr` 会直接跳过 ——
+        #   所以必须显式找能力对象，否则 3.0 永远挂不上（这正是本次的 bug）。
+        holders = []
+        cap = None
+        try:
+            cap = self._capability_of(adapter)
+        except Exception:
+            cap = None
+        if cap is not None and getattr(cap, "_send_message", None) is not None:
+            holders.append(cap)
+        holders.append(adapter)
+
+        original = None
+        holder = None
+        for h in holders:
+            cand = getattr(h, "_send_message", None)
+            if callable(cand):
+                holder, original = h, cand
+                break
         if not callable(original):
+            # 两代都没有这个落点：不静默吞掉 —— api 层补丁仍会生效（两版结构一致），
+            # 但 markdown 提取会缺一环，所以要留痕，便于以后核心再搬家时定位。
+            logger.debug(
+                "[QQBOT-BRIDGE] %s: 未找到 _send_message 落点（3.0 应在能力对象上），"
+                "markdown 提取交由其它入口处理", name,
+            )
             return
 
         async def _send_message(target_id, send_message_obj, is_group):
@@ -2051,9 +2114,18 @@ class QQOfficialGroupBridge(BasePlugin):
                 return await self._proactive_send(adapter, str(target_id), send_message_obj, is_group)
             return result
 
-        adapter._send_message = _send_message
+        # ★ 挂到**框架真正走的那个对象**上（3.0 = 能力对象，2.x = 适配器实例）——
+        #   挂错对象的后果见本函数 docstring：3.0 上会变成一个静默的空操作。
+        try:
+            holder._send_message = _send_message
+        except Exception as exc:  # 能力对象可能用 __slots__，兜一下但要让问题可见
+            logger.warning("[QQBOT-BRIDGE] %s: 挂载 _send_message 补丁失败: %s", name, exc)
+            return
         self._patched_sends[name] = original
         if self.send_at_mention:
+            # @ 渲染补丁同样两代落点不同（2.x 在实例、3.0 在能力对象）——
+            # 由 `_patch_text_content` 自己两处都找（它还要用 adapter.info 上报名字，
+            # 所以这里仍传 adapter，不传 capability）。
             self._patch_text_content(adapter)
 
     @staticmethod

@@ -25,6 +25,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pathlib
@@ -146,7 +147,6 @@ def main():
         from core.chat.message_elements import Text
         from core.chat.message_utils import KiraIMMessage, KiraMessageEvent
         import asyncio
-
         info = AdapterInfo(adapter_id="t", enabled=True, name="qqo",
                            platform="QQ Official Bot",
                            config={"app_id": "a", "app_secret": "b",
@@ -165,7 +165,8 @@ def main():
 
         dm = {"id": "M1", "author": {"id": "SAMEID", "user_openid": "SAMEID",
                                      "username": "", "bot": False},
-              "content": "在吗", "message_type": 0, "timestamp": "2026-10-07T12:00:00+08:00"}
+              "content": "在吗", "message_type": 0,
+              "timestamp": datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat()}
         ev, _reason = B.build_event(
             adapter, dm, Group=Group, User=User, KiraIMMessage=KiraIMMessage,
             KiraMessageEvent=KiraMessageEvent, kind=B.KIND_DM, is_group=False,

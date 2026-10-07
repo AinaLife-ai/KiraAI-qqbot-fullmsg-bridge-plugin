@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.6
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.7
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,70 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.7</b> — ★ 3.0 上 md 发不出的真因：补丁挂错了对象</summary>
+
+用户在 KiraAI **3.0** 上又看到 `[Unsupported message element]`。
+**这是同一个病根的第三个面** —— 前两次修的是另外两条路径。
+
+### 根因：3.0 的框架不走 `adapter.send_group_message`
+
+| 世代 | 框架发送入口 |
+|------|--------------|
+| 2.x  | `adapter._send_message()` —— 在**适配器实例**上 |
+| **3.0** | `capability._send_message()` —— 搬到了**能力对象**上<br>（`QQOfficialIMCapability`，`im.py:356`），适配器实例上**没有** |
+
+3.0 的 `message_manager.send_message_chain()` 走的是：
+
+```python
+target = adapter.get_capability(IMCapability)
+result = await target.send_group_message(pid, chain)
+```
+
+而我们的 `_patch_send_path` 只挂 `adapter._send_message` ⇒
+在 3.0 上**是一个静默的空操作**：没人设 `PENDING_MD`
+⇒ `api_send._send` 读不到 markdown ⇒ 3.0 的能力对象直接
+`_text_content(chain)` ⇒ 不认识 `MarkdownText`
+⇒ 拼出 `[Unsupported message element]` **发到群里**。
+
+### 实测（模拟框架真实路径）
+
+```
+3.0 修复前：msg_type=0  content='[Unsupported message element]'
+3.0 修复后：msg_type=2  content=None  markdown={'content': '## 标题\n**粗体**'}
+```
+
+### 修法（不动核心、纯优化）
+
+`_patch_send_path` 泛化成**「两代落点自动选择」**：先找能力对象的
+`_send_message`（3.0），再退回适配器实例（2.x），最后挂到**框架真正走的那个对象**上。
+同一个补丁函数，两代通用。
+
+### 同一个病根的三个面（重要）
+
+适配器/核心遇到**不认识的自定义元素** ⇒ 填 `[Unsupported message element]`。
+所以**每一条发送入口都必须自己提取自定义元素**。目前四条，全部对齐：
+
+| 路径 | 修于 |
+|------|------|
+2.x `_patch_send_path` | v1.4.5 |
+3.0 `_patch_send_entry` | 本来就有 |
+主动兜底 `_proactive_send` | v1.4.6 |
+**3.0 capability `_send_message`** | **v1.4.7（本次）** |
+
+以后再加自定义元素，**逐条检查这四处**。
+
+### 测试
+
+`tests/audit_md_regression.py` 扩到 **16 项**：3.0 **不再跳过实测**，
+改走框架真实入口 `get_capability(IMCapability).send_group_message` 断言报文。
+另加两条静态断言防回归（必须找能力对象、必须挂到 holder）。
+
+**反向验证**：旧代码在 3.0 上 6 项全红（含 3.0 落点两条）。
+**双世代全量通过。**
+
+</details>
+
+<details>
 <summary><b>v1.4.6</b> — ★ 找到真凶：**主动兜底**把 `[Unsupported message element]` 发了出去</summary>
 
 你提醒的「截图里**有明显没带 reply 的 md 也坏了**」——正是这句让我找到了真凶。
