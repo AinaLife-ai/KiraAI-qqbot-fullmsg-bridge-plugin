@@ -182,7 +182,7 @@ async def _route_request(api: Any, route: Any, **kwargs: Any) -> Any:
 
 async def _upload_bytes_to_qq(
     client: Any, target_id: str, is_group: bool, data: bytes, name: str,
-    logger: Any = None,
+    logger: Any = None, file_type: int = 1,
 ) -> Optional[str]:
     """把**字节内容**上传到 QQ，返回公网可访问的 COS URL（`raw_url`）。
 
@@ -231,7 +231,7 @@ async def _upload_bytes_to_qq(
             files_route = Route("POST", "/v2/users/{openid}/files", openid=target_id)
 
         prep = await _route_request(api, prep_route, json={
-            "file_type": 1,               # 1 = 图片
+            "file_type": int(file_type),   # 1=图片 2=视频 3=语音 4=文件
             "file_size": str(size),
             "file_name": name,
             "md5": md5,
@@ -246,33 +246,54 @@ async def _upload_bytes_to_qq(
             return None
 
         import aiohttp
-        async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60)) as sess:
-            for part in parts:
-                idx = _get(part, "index")
-                purl = _get(part, "presigned_url")
-                bsize = int(_get(part, "block_size") or 0)
-                if idx is None or not purl:
-                    continue
-                if bsize <= 0:
-                    bsize = max(1, size // max(1, len(parts)))
-                chunk = data[idx * bsize:(idx + 1) * bsize]
-                async with sess.put(purl, data=chunk) as r:
-                    if r.status >= 300:
-                        if logger is not None:
-                            logger.debug("[QQBOT-BRIDGE] 分片 %s PUT 失败: %s", idx, r.status)
-                        return None
-                await _route_request(api, finish_route, json={
-                    "upload_id": upload_id,
-                    "part_index": idx,
-                    "block_size": str(len(chunk)),
-                    "md5": hashlib.md5(chunk).hexdigest(),
-                })
+        # ★★★ 分片必须**按 index 排序、用各自 block_size 累加偏移**。
+        #
+        #   踩过的坑（2026-10-07 线上 850019「富媒体文件格式不支持」）：
+        #   原来写成 `chunk = data[idx * bsize:(idx+1)*bsize]`，而**最后一片的
+        #   block_size 比前面小**（例：12 MB 文件按 5 MB 分片 ⇒ [5MB, 5MB, 2MB]），
+        #   第 2 片就会算成 `data[4MB:6MB]`（应该是 10MB 起）⇒ 拼出来的文件是坏的
+        #   ⇒ 平台合并后校验格式失败，回 400 / 850019，图还是显示不出来。
+        ordered = [p for p in parts if _get(p, "index") is not None]
+        ordered.sort(key=lambda p: int(_get(p, "index")))
+        offset = 0
+        for part in ordered:
+            idx = int(_get(part, "index"))
+            purl = _get(part, "presigned_url")
+            bsize = int(_get(part, "block_size") or 0)
+            if not purl:
+                continue
+            # bsize<=0 时按「剩下的全部」兜底（不该发生，但不至于拼错）
+            chunk = data[offset:offset + bsize] if bsize > 0 else data[offset:]
+            if not chunk:
+                break
+            offset += len(chunk)
+            async with sess.put(purl, data=chunk) as r:
+                if r.status >= 300:
+                    if logger is not None:
+                        logger.debug("[QQBOT-BRIDGE] 分片 %s PUT 失败: %s", idx, r.status)
+                    return None
+            await _route_request(api, finish_route, json={
+                "upload_id": upload_id,
+                "part_index": idx,
+                "block_size": str(len(chunk)),
+                "md5": hashlib.md5(chunk).hexdigest(),
+            })
+
+        # ★ 完整性自检：拼出来的必须和原文件一字不差，否则**宁可不传**
+        #   （传个坏文件上去只会换来一个看不懂的平台错误）。
+        if offset != len(data):
+            if logger is not None:
+                logger.warning(
+                    "[QQBOT-BRIDGE] 分片拼装不完整（%s/%s 字节），已放弃转存，按原样发送",
+                    offset, len(data),
+                )
+            return None
 
         merged = await _route_request(api, files_route, json={
-            "file_type": 1,
+            "file_type": int(file_type),
             "srv_send_msg": False,
             "file_name": name,
+            "url": "",              # 分片合并路径可留空，但字段要带上
             "upload_id": upload_id,
         })
         raw = _get(merged, "raw_url")
@@ -284,8 +305,16 @@ async def _upload_bytes_to_qq(
             logger.debug("[QQBOT-BRIDGE] 合并响应没有 raw_url: %s", merged)
         return None
     except Exception as exc:
+        # ★ 这条**必须可见**（原来是 debug）：
+        #   转存失败 ⇒ 图还是 alt 文字。若不提示，用户只会看到"图片又不显示"，
+        #   然后来问"为什么"——而日志里什么都没有。线上就被这个坑过一次
+        #   （`400 / 850019 富媒体文件格式不支持`，因为分片拼装错了）。
         if logger is not None:
-            logger.debug("[QQBOT-BRIDGE] 分片上传失败: %s: %s", type(exc).__name__, exc)
+            logger.warning(
+                "[QQBOT-BRIDGE] 图片转存到 QQ 失败（%s: %s）—— 本条图片按原地址发送，"
+                "QQ 可能仍显示成 alt 文字；若持续如此请把本条连同日志反馈",
+                type(exc).__name__, str(exc)[:160],
+            )
         return None
 
 
@@ -341,21 +370,43 @@ async def upload_remote_to_public_url(
 
 async def _fetch_bytes(url: str, logger: Any = None,
                        timeout: float = 30.0) -> Optional[bytes]:
-    """下载远程图片字节。失败返回 None（调用方原样发送）。"""
+    """下载远程图片字节。失败返回 None（调用方原样发送）。
+
+    ★ 失败一定**打 WARNING 并带上原因**（2026-10-07 教训）：
+      线上出过「维基共享的图明明 200，日志却只说 `Content-Type=None/None`」——
+      因为 `Content-Type` 只是**拿到响应之后**才有；连不上时它是 None，
+      日志里却看不出到底是**超时**、**403** 还是**被墙**，用户没法排查。
+
+      现在把「HTTP 状态码 / Content-Type / 异常类型 / 是否超时」都写清楚，
+      用户把日志发来就能一眼定位。
+    """
+    if not url:
+        return None
     try:
         import aiohttp
     except Exception:
         return None
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; qqbot-bridge/1.0)"}
+
+    # ★ 带浏览器 UA：不少图床 / CDN（Wikimedia 就是）对陌生 UA 直接 403，
+    #   而 403 的响应体是 text/html，会被误判成"这不是图片"。
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36"),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
     try:
         async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=timeout)) as s:
             async with s.get(url, headers=headers, allow_redirects=True) as r:
+                ctype = (r.headers.get("Content-Type") or "").lower()
                 if r.status != 200:
                     if logger is not None:
-                        logger.debug("[QQBOT-BRIDGE] 下载图片失败 HTTP %s: %s", r.status, url)
+                        logger.warning(
+                            "[QQBOT-BRIDGE] 下载图片失败：HTTP %s（Content-Type=%s）—— %s",
+                            r.status, ctype or "无", url,
+                        )
                     return None
-                ctype = (r.headers.get("Content-Type") or "").lower()
                 data = await r.content.read()
                 head = data[:16]
                 is_img = ctype.startswith("image/") or head[:8] == b"\x89PNG\r\n\x1a\n" \
@@ -363,13 +414,23 @@ async def _fetch_bytes(url: str, logger: Any = None,
                     or (head[:4] == b"RIFF" and data[8:12] == b"WEBP")
                 if not is_img:
                     if logger is not None:
-                        logger.debug("[QQBOT-BRIDGE] 该地址不是图片（Content-Type=%s）: %s",
-                                     ctype, url)
+                        logger.warning(
+                            "[QQBOT-BRIDGE] 该地址返回的不是图片（HTTP 200，"
+                            "Content-Type=%s，前面字节=%s）—— %s；"
+                            "可能它其实是网页/跳转页，请换成图片直链",
+                            ctype or "无", head[:4].hex() or "空", url,
+                        )
                     return None
                 return data
     except Exception as exc:
         if logger is not None:
-            logger.debug("[QQBOT-BRIDGE] 下载图片异常: %s: %s", type(exc).__name__, exc)
+            _timeout = "timeout" in type(exc).__name__.lower() or "Timeout" in str(exc)
+            logger.warning(
+                "[QQBOT-BRIDGE] 下载图片异常%s：%s: %s —— %s（若你的网络访问不了该站，"
+                "QQ 平台多半也访问不了，建议换成国内可直连的图床）",
+                "（超时）" if _timeout else "",
+                type(exc).__name__, str(exc)[:120], url,
+            )
         return None
 
 
