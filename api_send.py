@@ -102,13 +102,14 @@ class ApiSendPatcher:
             bridge = self
 
             async def _patched(*args, _orig=orig, _is_group=is_group, _flags=flags,
-                               _api=api, **kwargs):
+                               _api=api, _cli=client, **kwargs):
                 # 作用域保护：只对我们**当前登记**的 api 生效。
                 # 还原（restore）会把 id 从白名单摘掉 —— 之后即使函数引用还残留在
                 # 某个对象上（热重载/多实例），也只会原样透传，绝不误伤别的 botpy 客户端。
                 if not bridge.owns(_api):
                     return await _orig(*args, **kwargs)
-                return await bridge._send(adapter, _orig, _is_group, _flags, *args, **kwargs)
+                return await bridge._send(adapter, _orig, _is_group, _flags,
+                                          *args, _client=_cli, **kwargs)
 
             setattr(_patched, "_kira_bridge_send", True)
             setattr(_patched, "_kira_bridge_orig", orig)
@@ -145,8 +146,54 @@ class ApiSendPatcher:
         return id(api) in self._OWNED
 
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    async def _fix_md_images(self, md_text: str, flags: dict, client: Any,
+                             target_id: str, is_group: bool) -> str:
+        """把 md 里的图片地址换成 QQ 能真正下载到的公网地址（**不改 md 结构**）。
+
+        * 本地路径 → 走官方「分片上传」拿 `raw_url`（COS 预签名 GET URL）；
+        * 公网 URL → 验真（跟随跳转 / 查 Content-Type），
+          不是可下载的图片就**原样保留**并告警（不静默改动用户内容）。
+
+        任何失败都**原样返回**，绝不因为图片转存失败而丢掉整条消息。
+        """
+        if not md_text or "![" not in md_text:
+            return md_text
+        try:
+            from md_media import fix_markdown_images
+            out = await fix_markdown_images(
+                md_text,
+                client=client,
+                target_id=str(target_id),
+                is_group=is_group,
+                logger=self.logger,
+            )
+            if out != md_text and not flags.get("md_img_logged"):
+                flags["md_img_logged"] = True
+                self.logger.info(
+                    "[QQBOT-BRIDGE] markdown 内图片已换成公网可访问地址"
+                    "（QQ 只认公网 URL，本地路径会退化成 alt 文字）"
+                )
+            return out
+        except Exception as exc:
+            self.logger.debug("[QQBOT-BRIDGE] markdown 图片处理失败（原样发送）: %s", exc)
+            return md_text
+
+    @staticmethod
+    def _target_of(args: tuple, kwargs: dict, is_group: bool) -> str:
+        """从 botpy 的调用参数里取出目标 id。
+
+        `post_group_message(group_openid=..., ...)` / `post_c2c_message(openid=..., ...)`，
+        也可能按位置传。取不到就返回空串（图片转存会跳过，不影响发送）。
+        """
+        key = "group_openid" if is_group else "openid"
+        v = kwargs.get(key)
+        if not v and args:
+            v = args[0]
+        return str(v or "")
+
     async def _send(self, adapter: Any, orig: Any, is_group: bool, flags: dict,
-                    *args, **kwargs):
+                    *args, _client: Any = None, **kwargs):
         # 作用域由 install 时的白名单（id(api)）保证 —— 补丁只挂在登记过的 api 上。
         # ① 引用（只在有明确引用意图时注入）
         ref = QUOTE_REF.get()
@@ -167,6 +214,15 @@ class ApiSendPatcher:
 
         target_md = md_text or auto_md
         if target_md:
+            # ★★★ 图片修复：markdown 里的图片必须是**公网可访问的地址**，
+            #   本地路径（data/temp/x.jpg）QQ 根本下不到 ⇒ 会渲染成 alt 文字
+            #   （用户实测：`![香香](data/temp/...)` 显示成「[香香]」）。
+            #   这里只替换 `(...)` 里的 URL，**md 结构一字不动**
+            #   （标题/列表/引用/链接/代码块全部保留，行数也不变）。
+            target_md = await self._fix_md_images(
+                target_md, flags, _client, self._target_of(args, kwargs, is_group),
+                is_group)
+
             kwargs = dict(kwargs)
             kwargs["msg_type"] = 2
             kwargs["markdown"] = {"content": target_md}

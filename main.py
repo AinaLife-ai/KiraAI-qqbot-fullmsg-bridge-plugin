@@ -2412,6 +2412,14 @@ class QQOfficialGroupBridge(BasePlugin):
         # ★ md_text 优先于"正文里含 @"的判断：前者是模型显式写了 `<markdown>`，
         #   后者只是正文里恰好有 @ 标记。两者都走 markdown，但显式优先级更高。
         if not media and md_text is not None:
+            # ★ 与 api 层补丁同源：md 里的本地图片换成公网地址（结构不动）
+            try:
+                from md_media import fix_markdown_images
+                md_text = await fix_markdown_images(
+                    md_text, client=client, target_id=str(target_id),
+                    is_group=is_group, logger=logger)
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 主动兜底 md 图片处理失败（原样发送）: %s", exc)
             payload["msg_type"] = 2
             payload["markdown"] = {"content": md_text}
             payload["content"] = None

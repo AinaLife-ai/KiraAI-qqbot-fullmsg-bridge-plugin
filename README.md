@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.8
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.9
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,87 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.9</b> — ★ markdown 里的图片终于能真的显示出来（且**md 格式零改动**）</summary>
+
+### 现象
+
+让 bot 用 markdown 发图，群里只显示 `[香香]`（alt 文字），图没出来。
+
+### 根因：官方三条硬约束叠加
+
+| 约束 | 官方原文 |
+|------|----------|
+| **md 内图片只吃公网 URL** | 「请使用**可在公网访问的资源 url**，开放平台会下载转存该资源」 |
+| **`msg_type` 互斥** | `0=纯文本 / 2=Markdown / 7=富媒体`；「传了 markdown 后 content 必须为空」 |
+| **普通上传只返回 `file_info`** | 一串不透明二进制，**拿不到可引用的 URL** |
+
+⇒ 本地图片（`data/temp/x.jpg`，QQ 根本下不到）在 md 里**只能退化成 alt 文字**；
+而 `msg_type=2` 和 `7` 互斥，**图文没法塞进同一条消息**。
+
+### 但官方留了一个口子（本次的关键）
+
+上传接口响应字段里有：
+
+```
+raw_url  string  文件下载链接（COS 预签名 GET URL），有效期与 ttl 一致
+         ★ 仅分片上传合并（upload_id 路径）且 file_type 为图片/视频/语音时返回
+```
+
+⇒ **走「分片上传」路线能拿到公网 COS URL**，于是：
+
+```
+![香香](data/temp/compressed_xxx.jpg)   →   ![香香](https://cos.xxx/xxx?sign=...)
+```
+
+**md 结构一字不动** —— 标题 / 列表 / 引用 / 链接 / 代码块 / 表格全部保留，行数不变。
+
+### 关于「会不会破坏 md 格式」
+
+**不会**。做法是**只替换 `(...)` 里的 URL**，不拆消息、不改结构。
+测试里做了**逐字比对**：除图片 URL 外，输出与输入必须完全相同。
+
+### 顺带修掉：URL 图要先「验真」
+
+用户给过一个维基地址 `.../Special:FilePath/Luka_Megurine.png`，实测：
+
+```
+HTTP 302   content-type: text/html   content-length: 0   ← 下载到 0 字节
+```
+
+**那不是图片地址，是跳转地址**。QQ 下载器拿到空 HTML 就判定失败
+（官方错误码 `850026 下载原始文件失败——请检查 URL 是否可访问`），
+于是渲染成 alt 文字。
+
+现在会**先探一下**（跟随跳转 / 看 Content-Type / 查图片魔数）：
+能解析到真图就换过去；确实不是图片就**原样保留**并告警 —— 不静默改动内容。
+
+### 缓存
+
+* 公网 URL 验真结果缓存 **10 分钟**；
+* 本地图转存结果按 `(路径, 大小, mtime)` 缓存 **4 分钟** ——
+  同一条 md 里重复的图、连续多轮发同一张图，**都不会重复上传**。
+
+### 失败一定不丢消息
+
+任何环节出错（读文件失败 / 预上传失败 / 分片失败 / 没有 `raw_url`）
+⇒ **原样返回**，按原来的方式发送，绝不会因为图片转存失败而丢掉整条消息。
+
+### 测试
+
+`tests/audit_md_img_publish.py`（**22 断言**）：
+
+* 本地图 → 公网地址，且**除 URL 外逐字相同 + 行数不变**；
+* 12 项格式保留（标题/加粗/斜体/删除线/引用/无序/嵌套/有序/链接/代码块/表格/alt）；
+* 缓存生效（第二次不重复上传）；
+* URL 验真：验不出 ⇒ 原样保留；能跳转 ⇒ 换真地址；
+* 无图片的 md **一个字都不动**；
+* 上传失败 ⇒ 原样返回（不抛异常、不删内容）。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.4.8</b> — 引用**误报**修复：核心已有 REFIDX 时不该报警</summary>
 
 ### 现象
