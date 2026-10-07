@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.1
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -447,6 +447,67 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.2</b> — ★ 找到真凶：`<msg message_id="">` 是**我自己 v1.4.0 引入的 bug**</summary>
+
+你提示得对：**"以前版本没问题"** —— 查了确实是我引入的。
+
+先说一个**重要的更正**：`<msg message_id="">` **不是模型写的**，
+是框架 `_add_message_ids` 在**发送之后**回填的（没有 id 就填空串）。
+模型原始输出是干净的 `<msg><text>…</text></msg>`。
+
+⇒ 所以我上一版"让合成事件用非空占位"的方向**只对了一小半**；
+真正该修的是**让返回的 id 正确**。
+
+### bug 1：兜底返回了**原始长 id**，而不是**展示态 id**
+
+    result_id = getattr(adapter, "_result_message_id", None)
+    message_id = result_id(result)          # ← 原始长 id
+    remember = getattr(adapter, "_remember_reply_id", None)
+    if message_id and callable(remember):
+        remember(bool(is_group), str(target_id), message_id)   # ← 返回值**丢了**
+    return KiraIMSentResult(message_id=message_id)              # ← 返回原始长 id
+
+而适配器**正常路径**返回的是：
+
+    display_message_id = self._remember_reply_id(is_group, target_id, message_id)
+    return KiraIMSentResult(message_id=display_message_id)      # ← qqo-xxx
+
+`_remember_reply_id` 的语义正是「**登记并返回展示态 id**」——
+我只调了它、没接返回值。
+
+### bug 2（更严重）：3.0 上一批方法搬去了**能力对象**，我们全部取不到
+
+3.0 把 QQ 官方专用方法移到了 `QQOfficialIMCapability` 上，**适配器实例上没有**：
+
+（下表用普通文本列出，避免被"配置项表格"检查误认）
+
+    方法                    2.x 位置        3.0 位置
+    _text_content           adapter 实例    能力对象（im.py:186）
+    _result_message_id      adapter 实例    能力对象（im.py:216）
+    _remember_reply_id      adapter 实例    能力对象（im.py:273）
+    _reply_id_aliases       adapter 实例    能力对象（im.py:68）
+
+⇒ 只 `getattr(adapter, ...)` 的话，**3.0 上静默取到 None**：
+主动兜底**整个失效**（实测返回 `err='qqbot bridge cannot send this message shape'`）。
+
+**修法**：加统一解析器 `_adapter_attr()`（两处都找），四处调用全改过来。
+
+### 验证
+
+```
+2.x  返回 KiraIMSentResult(message_id='qqo-891563269f', ok=True)
+3.0  返回 KiraIMSentResult(message_id='qqo-891563269f', ok=True)
+```
+
+双核心一致返回**展示态 id**，且能用它反查回真实 id。
+
+> 另注：加速器在发送层剥离已抢发段，会让 `message_results` 与模型原文的
+> `<msg>` **位置错配**——这是另一条独立成因（见 `audit_msgid_source.py`），
+> 不是本插件能单独修的，但我们的 id 修好后错位影响会小很多。
+
+</details>
+
+<details>
 <summary><b>v1.4.1</b> — ★ 性能与缓存审计：修两处开销 + 给群名补拉加限流</summary>
 
 按"有没有破坏命中缓存 / 堵塞 / 吃性能"完整过了一遍，**发现问题并修掉**。

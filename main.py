@@ -1731,6 +1731,37 @@ class QQOfficialGroupBridge(BasePlugin):
         self._capability_cache[id(adapter)] = cap if cap is not None else _MISS
         return cap
 
+    def _adapter_attr(self, adapter, attr: str, default=None):
+        """取适配器上的方法/属性 —— **两处都找**（2.x 在实例上，3.0 在能力对象上）。
+
+        ★ 为什么要专门做这个（实测踩过一串）：
+        3.0 把一批 QQ 官方专用方法搬到了**能力对象**
+        （`QQOfficialIMCapability`）上，适配器实例上**没有**：
+
+            `_text_content`（im.py:186）
+            `_result_message_id`（im.py:216）
+            `_remember_reply_id`（im.py:273）
+            `_reply_id_aliases`（im.py:68）
+
+        ⇒ 只 `getattr(adapter, ...)` 的话，**3.0 上会静默取到 None**，
+        表现为「主动兜底整个失效」「返回 id 丢失」这类难查的问题。
+
+        本方法统一两处都找；找不到返回 `default`。
+        """
+        val = getattr(adapter, attr, None)
+        if val is not None:
+            return val
+        cap = None
+        try:
+            cap = self._capability_of(adapter)
+        except Exception:
+            cap = None
+        if cap is not None:
+            val = getattr(cap, attr, None)
+            if val is not None:
+                return val
+        return default
+
     def _group_name_for(self, adapter_name: str, adapter, group_id: str, client) -> str:
         """取群名；没有就顺手丢一个后台任务去拉，并保持 openid（不阻塞）。"""
         if not self.group_name_enabled or not group_id:
@@ -2036,7 +2067,14 @@ class QQOfficialGroupBridge(BasePlugin):
                 now - self._last_proactive.get(target_id, 0.0) < self.proactive_min_interval:
             return KiraIMSentResult(ok=False, err="proactive throttled by qqbot bridge")
 
-        text_content = getattr(adapter, "_text_content", None)
+        # ★ 把消息链转成文本的方法，**两版位置不同**：
+        #   * 2.x：在**适配器实例**上（`adapter._text_content`）；
+        #   * 3.0：搬到了**能力对象**上（`QQOfficialIMCapability._text_content`，
+        #          见 im.py:186），适配器实例上**没有**这个方法。
+        #   ⇒ 只查 adapter 的话，3.0 上会取不到 ⇒ content 为空 ⇒
+        #     被误判成"消息形状不支持" ⇒ **主动兜底在 3.0 上整个失效**。
+        #     （实测：返回 err='qqbot bridge cannot send this message shape'）
+        text_content = self._adapter_attr(adapter, "_text_content")
         content = text_content(send_message_obj) if callable(text_content) else ""
         media_elements = [e for e in send_message_obj if isinstance(e, (File, Image))]
         if len(media_elements) > 1 or (not content and not media_elements):
@@ -2044,8 +2082,8 @@ class QQOfficialGroupBridge(BasePlugin):
 
         media = None
         if media_elements:
-            upload_file = getattr(adapter, "_upload_file", None)
-            media_payload = getattr(adapter, "_media_payload", None)
+            upload_file = self._adapter_attr(adapter, "_upload_file")
+            media_payload = self._adapter_attr(adapter, "_media_payload")
             if not callable(upload_file) or not callable(media_payload):
                 return KiraIMSentResult(ok=False, err="qqbot bridge cannot upload media on this core version")
             try:
@@ -2094,22 +2132,28 @@ class QQOfficialGroupBridge(BasePlugin):
 
         self._last_proactive[target_id] = now
         self._proactive_count += 1
-        result_id = getattr(adapter, "_result_message_id", None)
+        # ★ `_result_message_id` 在 3.0 上也在能力对象上 ⇒ 用统一解析器
+        result_id = self._adapter_attr(adapter, "_result_message_id")
         message_id = result_id(result) if callable(result_id) else None
-        # ★ 登记这条消息的 id → 展示态 id 映射，否则模型以后【撤回自己刚发的】
-        #   会反查不到（官方只推「新消息」事件，历史 id 我们见不到）。
-        #   核心在「适配器自己发送」的路径里会登记（`_send_message` 里调
-        #   `_remember_reply_id`），但**这里的主动通道绕过了适配器**，
-        #   直接打 `client.api`，所以必须我们自己补上。
-        remember = getattr(adapter, "_remember_reply_id", None)
+        # ★★★ 关键：返回值必须是**展示态 id**，与适配器正常路径保持一致。
+        #
+        #   框架 `_add_message_ids` 把这里的 `message_id` **原样贴到 `<msg>` 上**
+        #   给模型看；适配器正常路径返回的是 `display_message_id`（`qqo-xxxx`），
+        #   而 `result["id"]` 是**原始长 id** —— 两者混用会让模型上下文里的
+        #   id 形态前后不一（模型照着历史引用时就会对不上）。
+        #
+        #   `_remember_reply_id(真实id)` 的语义正是「登记并**返回展示态 id**」
+        #   ⇒ 必须用它的**返回值**，不能只调不管（这是 v1.4.0 我引入的 bug：
+        #     只调了没接返回值 ⇒ 返回了原始长 id 甚至丢失 id）。
+        remember = self._adapter_attr(adapter, "_remember_reply_id")
+        display_id = None
         if message_id and callable(remember):
             try:
-                # 两版签名一致：_remember_reply_id(is_group, target_id, message_id)
-                remember(bool(is_group), str(target_id), message_id)
+                display_id = remember(bool(is_group), str(target_id), message_id)
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 登记主动消息 id 失败（忽略）: %s", exc)
         logger.info("[QQBOT-BRIDGE] 主动消息已发送（今日第 %d 条）", self._proactive_count)
-        return KiraIMSentResult(message_id=message_id)
+        return KiraIMSentResult(message_id=display_id or message_id)
 
 # --------------------------------------------------------------------------- #
 # 标签：<markdown> / <keyboard>
