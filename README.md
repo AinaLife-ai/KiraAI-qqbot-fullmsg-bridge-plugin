@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.4
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,105 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.6</b> — ★ 找到真凶：**主动兜底**把 `[Unsupported message element]` 发了出去</summary>
+
+你提醒的「截图里**有明显没带 reply 的 md 也坏了**」——正是这句让我找到了真凶。
+**我上一版的诊断不完整**，这里更正。
+
+### 真凶：主动兜底 `_proactive_send`
+
+它直接把**原链**丢给 `adapter._text_content()`：
+
+```python
+content = text_content(send_message_obj)
+```
+
+而 `_text_content()` **不认识我们的自定义元素**（`MarkdownText` / `KeyboardMarker`）——
+遇到不认识的就填 `"[Unsupported message element]"`，**这句被当成正文真的发到群里**。
+
+**触发路径**：模型发 md → 被动回复失败（`msg_id` 过期等）
+→ 走**主动兜底** → 就只剩那一句占位文本了。
+（这也解释了为什么"没带 reply 的 md"也坏。）
+
+**实测**：
+
+```
+修复前：msg_type=0  content='[Unsupported message element]'
+修复后：msg_type=2  content=None  markdown={'content': '…'}
+```
+
+### 上一版（v1.4.5）修的那条：属**冗余防御**
+
+2.x 的 `_patch_send_path` 里 `_send_message` 包装漏设 `PENDING_MD` / `PENDING_KB`。
+**实测有 `_patch_send_entry` 兜着时不会坏**（它在外层已经提取好了），
+但补上更稳、与其它路径也更一致 —— 保留。
+
+### 共同教训
+
+适配器遇到**不认识的自定义元素** → 填 `[Unsupported message element]`。
+⇒ **每一条发送路径都必须先提取自定义元素**，不能把原链丢给适配器。
+现有四条：2.x `_patch_send_path` / 3.0 `_patch_send_entry` /
+**主动兜底 `_proactive_send`** / api 层 —— 这次全部对齐了。
+
+### 测试
+
+`tests/audit_md_regression.py` 扩到 **14 项**，新增**主动兜底**的报文级断言
+（必须 `msg_type=2`、不含占位文本）。
+
+</details>
+
+<details>
+<summary><b>v1.4.5</b> — ★ 修回归：`<reply>` + `<markdown>` 同条消息会发出 `[Unsupported message element]`</summary>
+
+你报的："原本她 md 发的好好的，结果现在这样了" —— 确实是我引入的回归。
+
+### 现象
+
+群里只显示一句：
+
+```
+[Unsupported message element]
+```
+
+### 根因（已复现）
+
+2.x 的发送补丁 `_patch_send_path` 里，`_send_message` 包装**只设了 `QUOTE_REF`**，
+**漏了 `PENDING_MD` / `PENDING_KB`**（3.0 那条路径是有的）。
+
+后果链：
+
+1. `api_send._send` 读不到 `PENDING_MD`；
+2. ⇒ 不走 `msg_type=2 + markdown.content`；
+3. ⇒ 把**原链**交给适配器；
+4. ⇒ 适配器 `_text_content()` **不认识我们的自定义元素**（`MarkdownText`）；
+5. ⇒ 拼出 `"[Unsupported message element]"` 当正文发出去。
+
+### 触发条件
+
+**同一条消息里既有 `<reply>` 又有 `<markdown>`**（模型很喜欢这么写）。
+单独发 md 也会受影响 —— 只要 markdown 提取没传到 api 层就坏。
+
+### 实测前后
+
+```
+修复前：msg_type=0   content='[Unsupported message element]'
+修复后：msg_type=2   content=None   markdown={'content': '## 标题\n正文'}
+```
+
+### 修法
+
+在 `_send_message` 包装里补齐 `PENDING_MD` / `PENDING_KB` 的设置与 reset，
+**与 3.0 路径完全一致**。
+
+### 测试
+
+新增 `tests/audit_md_regression.py`（11 项）：静态检查两条路径都提取 markdown
++ **决定性实测**（`<reply>`+`<markdown>` 的报文必须是 `msg_type=2` 且不含占位文本）
++ 单发 md 对照。
+
+</details>
+
+<details>
 <summary><b>v1.4.4</b> — ★ 已有会话的名字也能补成中文（含私聊昵称）</summary>
 
 会话名在**建立那一刻**就定死了 —— 以前装插件时群名还拉不到，
