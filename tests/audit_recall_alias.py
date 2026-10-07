@@ -186,17 +186,11 @@ def main():
     # ---------------- 6. 我们的缺口：主动通道补登记 ----------------
     print("\n[6] 我们自己的缺口：主动消息发送后要补登记")
     our = (ROOT / "main.py").read_text(encoding="utf-8")
-    lines = our.splitlines()
-    # 找**紧跟着** return KiraIMSentResult(message_id=message_id) 的那一处
-    # （主动通道的收尾），确认它前面有登记调用
-    hit = False
-    for i, ln in enumerate(lines):
-        if "主动消息已发送" in ln and "return KiraIMSentResult(message_id=message_id)" in \
-                "\n".join(lines[i:i + 3]):
-            back = "\n".join(lines[max(0, i - 12):i])
-            hit = "_remember_reply_id" in back
-            break
-    check("★ 主动通道里补了 _remember_reply_id 登记", hit, "未在主动通道收尾处找到")
+    ai = our.find("主动消息已发送")
+    back = our[max(0, ai - 2200):ai] if ai > 0 else ""
+    check("★ 主动通道里做了 _remember_reply_id 登记（并用其返回值）",
+          "_remember_reply_id" in back and "display_id = remember(" in back,
+          "未在主动通道收尾处找到")
     check("★ 官方撤回本来就有 2 分钟时限（所以不必落盘持久化）",
           "2 分钟" in (ROOT / "admin_tools.py").read_text(encoding="utf-8"))
 
