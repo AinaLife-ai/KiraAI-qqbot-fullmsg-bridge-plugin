@@ -86,7 +86,31 @@ def main():
     check("★ 群名补拉是后台的（不阻塞挂载）",
           "schedule_fetch" in main_src and "def _prefetch_group_names" in main_src)
     check("★ 群名补拉不会重复（lookup/has_failed 挡）",
-          "self.group_names.lookup(name, gid) or self.group_names.has_failed" in main_src)
+          "self.group_names.lookup(name, g)" in main_src
+          and "self.group_names.has_failed(name, g)" in main_src)
+    # ★ 性能审计（用户要求）：不能撞接口限流
+    gn_src = (ROOT / "group_names.py").read_text(encoding="utf-8")
+    check("★ 群名拉取有速率控制（官方限 30 QPM）",
+          "Semaphore(1)" in gn_src and "_MIN_GAP" in gn_src)
+    check("★ 间隔在**锁内**（放锁外会并行睡完再抢锁 ⇒ 等于没限速）",
+          "async with _sem:" in gn_src
+          and gn_src.index("async with _sem:") < gn_src.index("await asyncio.sleep(_MIN_GAP)"))
+    check("★ 单发路径零延迟（只有真的还有排队时才等）",
+          "len(self._pending) - 1 > 0" in gn_src)
+    check("★ 补拉分批（单轮最多 20 个，其余留给下一轮）",
+          "_PREFETCH_BATCH" in main_src)
+    check("★ 上一批没跑完时本轮不排队（避免堆积）",
+          "_group_prefetch_task" in main_src)
+
+    # ---------------- 性能：热路径代价 ----------------
+    print("\n[1b] 热路径性能（新增代码不能吃 CPU）")
+    check("★ 能力对象解析有缓存（2.x 上避免每轮走异常，实测 176µs → 0）",
+          "_capability_cache" in main_src and "_resolve_im_capability" in main_src)
+    check("★ 能力对象解析先做廉价探测（无 get_capability 直接跳过）",
+          'hasattr(adapter, "get_capability")' in main_src)
+    check("★ import 提到模块级（不在热路径里执行 import 语句）",
+          "def _resolve_im_capability" in main_src
+          and "from core.adapter.capabilities import IMCapability" in main_src.split("def _resolve_im_capability")[1][:400])
     check("说明：官方没有「列出机器人所在的群」接口 ⇒ 只能补已知会话",
           "_group_reply_ids" in main_src)
 

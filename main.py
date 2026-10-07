@@ -199,6 +199,27 @@ def _plugin_version() -> str:
 #: 每次巡检只是幂等的 dict/getattr 操作，成本可忽略。
 _WATCH_INTERVAL = 15.0
 
+#: 能力对象解析结果缓存：`id(adapter) -> 能力对象 | _MISS`
+#: （能力对象在适配器生命周期内不变；`id()` 作键足够，适配器对象不会中途回收）
+_capability_cache: dict = {}
+_MISS = object()
+
+
+def _resolve_im_capability(adapter):
+    """解析 3.0 的 IM 能力对象（**模块级 import，只做一次**）。
+
+    放在模块级是为了避免在热路径（每 15s 巡检）里反复执行 import 语句 ——
+    虽然 `sys.modules` 有缓存，但每次仍要付出查表开销，没必要。
+    """
+    try:
+        from core.adapter.capabilities import IMCapability
+    except Exception:
+        return None
+    try:
+        return adapter.get_capability(IMCapability)
+    except Exception:
+        return None
+
 _ALL_EVENTS = (EVENT_GROUP_MESSAGE, EVENT_GROUP_AT_MESSAGE, EVENT_C2C_MESSAGE)
 _HANDLERS = ("on_group_message_create", "on_group_at_message_create", "on_c2c_message_create")
 
@@ -309,6 +330,10 @@ class QQOfficialGroupBridge(BasePlugin):
         except Exception:
             pass
 
+        #: 能力对象缓存（见 _capability_of / _resolve_im_capability）
+        self._capability_cache: dict = {}
+        #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
+        self._group_prefetch_task = None
         self._task = None
         self._stop = asyncio.Event()
         self._patch_state = {}
@@ -1653,10 +1678,20 @@ class QQOfficialGroupBridge(BasePlugin):
                 candidates.update(str(k) for k in ids.keys() if k)
         if not candidates:
             return
+        # ★ 节流（官方群名接口限 30 QPM）：
+        #   ① 单轮只排队 `_PREFETCH_BATCH` 个（其余交给后续巡检，15s 一轮）；
+        #   ② 用一个**跨调用共享的**信号量把实际请求串起来 + 每个之间留间隔，
+        #      避免「刚装插件时一次把几十个群全打出去」撞限流。
+        todo = [g for g in sorted(candidates)
+                if not (self.group_names.lookup(name, g) or self.group_names.has_failed(name, g))]
+        if not todo:
+            return
+        batch = todo[: self._PREFETCH_BATCH]
+        if self._group_prefetch_task is not None and not self._group_prefetch_task.done():
+            # 上一批还没跑完：本轮先不排队，交给下一轮（15s 后）
+            return
         pulled = 0
-        for gid in candidates:
-            if self.group_names.lookup(name, gid) or self.group_names.has_failed(name, gid):
-                continue
+        for gid in batch:
             try:
                 if self.group_names.schedule_fetch(adapter, name, gid, client, logger):
                     pulled += 1
@@ -1664,18 +1699,37 @@ class QQOfficialGroupBridge(BasePlugin):
                 pass
         if pulled:
             logger.info(
-                "[QQBOT-BRIDGE] %s: 已为 %d 个已知群补拉群名（后台进行，"
-                "这样刚装插件/刚重启也能看到中文群名）", name, pulled,
+                "[QQBOT-BRIDGE] %s: 已为 %d 个已知群排队补拉群名（分批进行，"
+                "避免撞接口限流；这样刚装插件/刚重启也能看到中文群名）",
+                name, pulled,
             )
 
-    @staticmethod
-    def _capability_of(adapter):
-        """3.0 的会话级数据（如 `_group_reply_ids`）搬到了能力对象上。"""
-        try:
-            from core.adapter.capabilities import IMCapability
-            return adapter.get_capability(IMCapability)
-        except Exception:
-            return None
+    #: 群名接口官方限 **30 QPM** ⇒ 本地再保守一点，串行 + 间隔，
+    #: 避免"刚装插件时一次把几十个群全打出去"撞限流（那会被平台拒一整分钟）。
+    _PREFETCH_GAP = 0.4           # 每个群之间的最小间隔（秒）≈ 150 QPM 上限内
+    _PREFETCH_BATCH = 20          # 单轮最多排队多少个（其余留给后续巡检）
+
+    def _capability_of(self, adapter):
+        """3.0 的会话级数据（如 `_group_reply_ids`）搬到了能力对象上。
+
+        ⚠ 性能注意：**2.x 根本没有能力对象**，`adapter.get_capability` 不存在 ——
+        如果每次都去 import + 调它，就会每轮抛一次 ImportError/AttributeError，
+        实测单次约 **176 µs**（异常很贵），而 `_prefetch_group_names` 是
+        **每 15 秒巡检都要跑**的 ⇒ 纯属白烧。
+
+        所以这里做两件事：
+          ① **先廉价探测**：适配器上没有 `get_capability` 就直接返回 None（2.x）；
+          ② **模块级 import + 结果缓存**：能力对象在适配器生命周期内不变，
+             同一个适配器只解析一次。
+        """
+        cached = self._capability_cache.get(id(adapter))
+        if cached is not None:
+            return cached if cached is not _MISS else None
+        cap = None
+        if hasattr(adapter, "get_capability"):
+            cap = _resolve_im_capability(adapter)
+        self._capability_cache[id(adapter)] = cap if cap is not None else _MISS
+        return cap
 
     def _group_name_for(self, adapter_name: str, adapter, group_id: str, client) -> str:
         """取群名；没有就顺手丢一个后台任务去拉，并保持 openid（不阻塞）。"""

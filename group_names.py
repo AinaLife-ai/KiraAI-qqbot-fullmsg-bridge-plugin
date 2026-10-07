@@ -30,7 +30,23 @@ from typing import Any, Optional
 
 #: 接口频率限制 30 QPM —— 本地再宽一点，避免并发拉同一个群
 _FETCH_TIMEOUT = 8.0
+
+#: 官方群名接口限 **30 QPM**。这里做**本地串行 + 间隔**：
+#: 同一时间只允许 1 个请求在飞，且每个之间至少间隔 `_MIN_GAP` 秒（≈ 100 QPM 上限内）。
+#: 目的：即使上层一次排队几十个群（如刚装插件时补拉），也只是"慢慢拉完"，
+#: 绝不会撞平台限流被整分钟拒绝。
+_MIN_GAP = 0.6
 _DEFAULT_MAX = 2000
+
+
+class _NullSem:
+    """信号量兜底：拿不到 asyncio.Semaphore 时不加锁（退化为原行为）。"""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
 
 
 class GroupInfoCache:
@@ -44,6 +60,8 @@ class GroupInfoCache:
         self.ttl = float(ttl)
         self._names: "OrderedDict[str, tuple]" = OrderedDict()   # key -> (name, ts)
         self._pending: set = set()
+        #: 串行门闸（惰性创建：构造时可能还没事件循环）
+        self._fetch_sem = None
         self._failed: set = set()
         self._dirty = False
         self._notified = False
@@ -107,23 +125,46 @@ class GroupInfoCache:
         if key in self._pending:
             return False
         self._pending.add(key)
+        # 惰性建信号量（首次真正排队时才有事件循环）
+        if self._fetch_sem is None:
+            try:
+                self._fetch_sem = asyncio.Semaphore(1)
+            except Exception:
+                self._fetch_sem = None
 
         async def _worker():
-            try:
-                info = await asyncio.wait_for(
-                    self._fetch(client, group_id), timeout=_FETCH_TIMEOUT
-                )
-            except Exception as exc:
-                info = None
-                reason = f"{type(exc).__name__}"
-                detail = str(exc)[:120]
-                if "11253" not in detail:
-                    logger.debug("[QQBOT-BRIDGE] 群名拉取异常（%s %s）: %s",
-                                 adapter_name, group_id, detail)
-                else:
-                    reason = "11253"
-            finally:
-                self._pending.discard(key)
+            # ★ 速率控制（官方群名接口限 **30 QPM**）：
+            #   同一时间只允许 1 个在飞；**且只有"确实还有别的在排队"时才留间隔**
+            #   （说明这是批量补拉场景）。正常路径（收到一条消息、拉一个群名）
+            #   前面没人排队 ⇒ 零延迟，不拖慢任何东西。
+            _sem = self._fetch_sem or _NullSem()
+            async with _sem:
+                # ★ 间隔必须放在**锁内**：放锁外的话，N 个任务会**并行**睡完
+                #   再一起抢锁，间隔等于没生效（实测踩过：间隔仍是 0.02s）。
+                #   锁内间隔 ⇒ 天然串行排队。
+                #   只在"除了我还有别人在排"时才等 —— 单发路径（收到一条消息、
+                #   拉一个群名）零延迟，不拖慢任何东西。
+                if len(self._pending) - 1 > 0:
+                    try:
+                        await asyncio.sleep(_MIN_GAP)
+                    except Exception:
+                        pass
+                try:
+                    info = await asyncio.wait_for(
+                        self._fetch(client, group_id), timeout=_FETCH_TIMEOUT
+                    )
+                except Exception as exc:
+                    info = None
+                    reason = f"{type(exc).__name__}"
+                    detail = str(exc)[:120]
+                    if "11253" not in detail:
+                        logger.debug("[QQBOT-BRIDGE] 群名拉取异常（%s %s）: %s",
+                                     adapter_name, group_id, detail)
+                    else:
+                        reason = "11253"
+                finally:
+                    self._pending.discard(key)
+
 
             if isinstance(info, dict):
                 name = info.get("group_name")
