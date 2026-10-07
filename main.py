@@ -1285,11 +1285,41 @@ class QQOfficialGroupBridge(BasePlugin):
 
         只认显式引用：否则 KiraAI 会把"最后收到的消息"当作回复目标，
         我们若跟着发 message_reference，机器人每条消息都会变成引用上一条 —— 那是刷屏。
+
+        ## ★★★ 3.0 上这里**不负责发送**，只是补位（2026-10-07 修误报）
+
+        实测（`repro_ref_warning.py`）：3.0 的**核心自己**已经有一套引用索引
+
+            im._message_references[(is_group, target_id, raw_id)] = ref_idx
+            im._resolve_reference(...)   # 发送时自己填 message_reference
+
+        而桥接在 3.0 上**刻意不接管事件**（核心已自带全量群消息），
+        所以**我们这份 store 在 3.0 上必然是空的** —— 这不是故障。
+
+        于是原来的实现会：拿空 store 找不到 ⇒ **误报 WARNING**
+        「机器人想引用 xxx 但没找到 REFIDX …… 本条按普通回复发出」，
+        可实际上核心那边引用**完全正常**（用户截图里 reply 是成功的）。
+
+        ⇒ 先问核心要（`_resolve_reference`），拿不到再回退到我们这份 store；
+        两边都没有，才认为真的找不到（此时日志会指出"核心也没有"）。
         """
         try:
             sid = f"{adapter.info.name}:{'gm' if is_group else 'dm'}:{target_id}"
         except Exception:
             return None
+
+        # ---- ① 先问核心（3.0 自带；2.x 上这个方法不存在，会安静跳过）----
+        try:
+            cap = self._capability_of(adapter)
+            resolver = getattr(cap, "_resolve_reference", None) if cap is not None else None
+            if callable(resolver):
+                core_ref = resolver(is_group, str(target_id), chain)
+                if core_ref:
+                    return core_ref
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 问核心要 REFIDX 失败: %s", exc)
+
+        # ---- ② 回退到我们自己的 store（2.x 主力；3.0 上通常为空）----
         store = ref_store_for(adapter)
         for ele in chain:
             if not isinstance(ele, Reply):
@@ -1305,9 +1335,13 @@ class QQOfficialGroupBridge(BasePlugin):
             if not self._quote_miss_logged:
                 self._quote_miss_logged = True
                 known = ", ".join(sorted({str(k[1]) for k in store})[:6])
+                # ★ 措辞区分：3.0 上我们这份 store 本来就该是空的，
+                #   说"没找到"会让用户以为坏了（实测误报过一次）。
                 logger.warning(
-                    "[QQBOT-BRIDGE] 机器人想引用 %s，但没找到对应的 REFIDX（已知 %d 条：%s）——"
-                    "本条按普通回复发出；如持续如此请把本条连同启动日志一起反馈",
+                    "[QQBOT-BRIDGE] 机器人想引用 %s，但**核心与桥接都没有它的 REFIDX**"
+                    "（桥接已知 %d 条：%s）—— 本条按普通回复发出。"
+                    "若核心是 3.0，通常说明这条消息不是经核心收到的（或索引尚未建立）；"
+                    "如持续如此请把本条连同启动日志一起反馈",
                     display_id, len(store), known or "无",
                 )
         return None

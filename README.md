@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.7
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,62 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.8</b> — 引用**误报**修复：核心已有 REFIDX 时不该报警</summary>
+
+### 现象
+
+你日志里的那条：
+
+```
+WARNING [QQBOT-BRIDGE] 机器人想引用 qqo-fe30659912，但没找到对应的 REFIDX
+（已知 0 条：无）—— 本条按普通回复发出
+```
+
+但截图里 **reply 明显是成功的** —— 两件事同时成立，说明这里报错了。
+
+### 根因
+
+**3.0 的核心自带引用索引**：
+
+```python
+im._message_references[(is_group, target_id, raw_id)] = ref_idx
+im._resolve_reference(...)   # 发送时自己填 message_reference
+```
+
+而桥接在 3.0 上**刻意不接管事件**（核心已自带全量群消息）
+⇒ **我们那份 `ref_store` 在 3.0 上必然是空的** —— 这不是故障。
+
+原实现拿这个空 store 找不到就报警 ⇒ **误报**。
+
+### 修法
+
+`_quote_ref_for` **先问核心**（`_resolve_reference`），拿不到再回退到我们自己的 store；
+**两边都没有**才报警 —— 此时措辞也改成「核心与桥接都没有」，
+不会再把「我们没索引」说成「引用失败」。
+
+### 实测
+
+```
+② core._message_references = {(True,'G1','ROBOT1.0_in'): 'REFIDX_user=='}   ← 核心已索引
+③ bridge.ref_store        = {}                                            ← 插件这份是空的（正常）
+③ 修复前：打 WARNING「没找到 REFIDX」，但……
+④ 报文 message_reference  = {'message_id': 'REFIDX_user=='}               ← 引用其实成功
+
+修复后：无 WARNING，引用照常成功。
+```
+
+### 测试
+
+新增 `tests/audit_ref_no_false_alarm.py`(4)：
+
+* 核心已索引 ⇒ 返回核心的 REFIDX，且**不得**打「没找到」的 WARNING；
+* 两边都没有 ⇒ 才返回 None **并给出可见 WARNING**（真问题时不能静默）。
+
+**反向验证**：还原旧实现 ⇒ 3 项红（误报复现）。
+
+</details>
+
+<details>
 <summary><b>v1.4.7</b> — ★ 3.0 上 md 发不出的真因：补丁挂错了对象</summary>
 
 用户在 KiraAI **3.0** 上又看到 `[Unsupported message element]`。
