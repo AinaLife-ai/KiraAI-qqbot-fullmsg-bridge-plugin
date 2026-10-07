@@ -334,6 +334,8 @@ class QQOfficialGroupBridge(BasePlugin):
 
         #: 能力对象缓存（见 _capability_of / _resolve_im_capability）
         self._capability_cache: dict = {}
+        #: 装过媒体类型修正的宿主对象（还原时要用）
+        self._media_types_holders: dict = {}
         #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
         self._group_prefetch_task = None
         #: ★ 本实例发起的「请重连」任务 —— terminate 时必须全部取消，
@@ -658,6 +660,15 @@ class QQOfficialGroupBridge(BasePlugin):
                 changed.append(f"{name}.api_send")
             # 发送入口包装
             self._unpatch_send_entry(adapter, name)
+            # 媒体类型修正
+            _mh = self._media_types_holders.pop(name, None)
+            if _mh is not None:
+                try:
+                    from media_types import restore as _restore_mt
+                    if _restore_mt(_mh):
+                        changed.append(f"{name}.media_types")
+                except Exception:
+                    pass
             # 互动回调（标记与 qqbot_bridge.attach_client_handler 统一，便于还原）
             current = getattr(client, "on_interaction_create", None)
             if callable(current) and detach_client_handler(client, "on_interaction_create"):
@@ -962,6 +973,22 @@ class QQOfficialGroupBridge(BasePlugin):
         #   它现在是「世代无关」的：内部自己选落点（3.0 能力对象 / 2.x 适配器实例）。
         if self.proactive_enabled or self.quote_reply or self.send_at_mention:
             self._patch_send_path(adapter, name, client)
+
+        # ---- L3-B：媒体类型修正（视频→2 / 语音→3）—— 同样世代无关 ----
+        #
+        #   官方 file_type：1=图片 2=视频 3=语音 4=文件；框架写死「非图即 4」
+        #   ⇒ 视频/语音会以**文件卡片**发出（要点开下载），不能内嵌播放。
+        #   纯插件侧修正（包 `_upload_file`），不动核心。
+        try:
+            from media_types import install as _install_media_types
+            holder = self._capability_of(adapter)
+            if not hasattr(holder, "_upload_file"):
+                holder = adapter            # 2.x：在适配器实例上
+            if _install_media_types(holder, client, logger):
+                self._media_types_holders[name] = holder
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 安装媒体类型修正失败（不影响其它功能）: %s", exc)
+
         if profile.generation == GEN_UNKNOWN:
             if name not in self._broken_adapters:
                 self._broken_adapters.add(name)

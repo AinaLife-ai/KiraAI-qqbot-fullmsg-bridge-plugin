@@ -180,39 +180,37 @@ async def _route_request(api: Any, route: Any, **kwargs: Any) -> Any:
     return await api._http.request(route, **kwargs)
 
 
-async def upload_local_to_public_url(
-    client: Any, target_id: str, is_group: bool, file_path: str,
+async def _upload_bytes_to_qq(
+    client: Any, target_id: str, is_group: bool, data: bytes, name: str,
     logger: Any = None,
 ) -> Optional[str]:
-    """把**本地图片**上传到 QQ，返回一个**公网可访问的 COS URL**（`raw_url`）。
+    """把**字节内容**上传到 QQ，返回公网可访问的 COS URL（`raw_url`）。
 
-    走的是官方「分片上传」路线 —— 只有这条路才会返回 `raw_url`：
+    走官方「分片上传」路线 —— **只有这条路**才会返回 `raw_url`：
 
         upload_prepare  →  upload_id / block_size / parts[].presigned_url
         分片 PUT 到 presigned_url
         upload_part_finish（逐片确认）
-        上传接口（带 upload_id）合并  →  → file_info **+ raw_url**
+        上传接口（带 upload_id）合并  →  file_info **+ raw_url**
 
-    失败时返回 None（调用方按原样发送，绝不会因此丢掉整条消息）。
+    官方原文：
+
+        raw_url  string  文件下载链接（COS 预签名 GET URL），有效期与 ttl 一致
+                 ★ 仅分片上传合并（upload_id 路径）且 file_type 为图片/视频/语音时返回；
+                   URL 直传和文件类型(file_type=4) 不返回此字段
+
+    失败返回 None（调用方按原样发送，绝不会因此丢掉整条消息）。
     """
     try:
         from botpy.http import Route
     except Exception:
         return None
     api = getattr(client, "api", None)
-    if api is None:
-        return None
-
-    try:
-        with open(file_path, "rb") as f:
-            data = f.read()
-    except Exception as exc:
-        if logger is not None:
-            logger.debug("[QQBOT-BRIDGE] 读本地图片失败: %s", exc)
+    if api is None or not data:
         return None
 
     size = len(data)
-    name = os.path.basename(file_path)
+    name = name or "image.png"
     md5 = hashlib.md5(data).hexdigest()
     sha1 = hashlib.sha1(data).hexdigest()
     md5_10m = hashlib.md5(data[:10002432]).hexdigest()
@@ -280,7 +278,7 @@ async def upload_local_to_public_url(
         raw = _get(merged, "raw_url")
         if raw:
             if logger is not None:
-                logger.info("[QQBOT-BRIDGE] 本地图片已转存为公网地址，markdown 可直接引用")
+                logger.info("[QQBOT-BRIDGE] 图片已转存为公网地址，markdown 可直接引用")
             return str(raw)
         if logger is not None:
             logger.debug("[QQBOT-BRIDGE] 合并响应没有 raw_url: %s", merged)
@@ -289,6 +287,132 @@ async def upload_local_to_public_url(
         if logger is not None:
             logger.debug("[QQBOT-BRIDGE] 分片上传失败: %s: %s", type(exc).__name__, exc)
         return None
+
+
+async def upload_local_to_public_url(
+    client: Any, target_id: str, is_group: bool, file_path: str,
+    logger: Any = None,
+) -> Optional[str]:
+    """本地图片 → 公网 COS URL。读文件后交给 `_upload_bytes_to_qq`。"""
+    try:
+        with open(file_path, "rb") as f:
+            data = f.read()
+    except Exception as exc:
+        if logger is not None:
+            logger.debug("[QQBOT-BRIDGE] 读本地图片失败: %s", exc)
+        return None
+    return await _upload_bytes_to_qq(client, target_id, is_group, data,
+                                     os.path.basename(file_path), logger=logger)
+
+
+async def upload_remote_to_public_url(
+    client: Any, target_id: str, is_group: bool, url: str,
+    logger: Any = None, timeout: float = 30.0,
+) -> Optional[str]:
+    """**远程图片** → 转存到 QQ 自己的 COS，返回公网 URL。
+
+    ## ★★★ 为什么要做这件事（2026-10-07 的教训）
+
+    官方文档说「md 内图片请使用**可在公网访问**的资源 url，开放平台会下载转存」，
+    但实测**公网 + 国内 + 200 + 真图片**照样失败：
+
+        用户日志：萌娘百科国内站直链（HEAD 200、content-type: image/png）
+                 ⇒ 群里依旧只显示 [巡音流歌 V4X]（alt 文字）
+
+    原因是**平台的转存是异步的、失败只回一个错误码给日志**（`304010 CHANGE_IMAGE_URL
+    图片转存错误` / `304021 GET_FILE 下载文件错误` / `304020 FILE_SIZE 文件大小超限`），
+    前端拿不到任何反馈 ⇒ 用户只看到 alt 文字。用户那张 `Luka1.jpg` 有 **13.7 MB**，
+    很可能就是撞了大小限制。
+
+    ⇒ **最可靠的做法：我们自己把图取下来，走 QQ 自己的上传通道转存一次**
+    （`raw_url` 是 QQ 自己的 COS 预签名地址，平台去下载它必然成功），
+    顺便还能把过大的图**压缩**到软限制内。
+    """
+    if not url:
+        return None
+    data = await _fetch_bytes(url, logger=logger, timeout=timeout)
+    if not data:
+        return None
+    # 太大的图先压缩（官方软限制：图片 20 MB，超过会降级成"文件"）
+    data, name = await _shrink_if_needed(data, url, logger=logger)
+    return await _upload_bytes_to_qq(client, target_id, is_group, data, name,
+                                     logger=logger)
+
+
+async def _fetch_bytes(url: str, logger: Any = None,
+                       timeout: float = 30.0) -> Optional[bytes]:
+    """下载远程图片字节。失败返回 None（调用方原样发送）。"""
+    try:
+        import aiohttp
+    except Exception:
+        return None
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; qqbot-bridge/1.0)"}
+    try:
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)) as s:
+            async with s.get(url, headers=headers, allow_redirects=True) as r:
+                if r.status != 200:
+                    if logger is not None:
+                        logger.debug("[QQBOT-BRIDGE] 下载图片失败 HTTP %s: %s", r.status, url)
+                    return None
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                data = await r.content.read()
+                head = data[:16]
+                is_img = ctype.startswith("image/") or head[:8] == b"\x89PNG\r\n\x1a\n" \
+                    or head[:3] == b"\xff\xd8\xff" or head[:6] in (b"GIF87a", b"GIF89a") \
+                    or (head[:4] == b"RIFF" and data[8:12] == b"WEBP")
+                if not is_img:
+                    if logger is not None:
+                        logger.debug("[QQBOT-BRIDGE] 该地址不是图片（Content-Type=%s）: %s",
+                                     ctype, url)
+                    return None
+                return data
+    except Exception as exc:
+        if logger is not None:
+            logger.debug("[QQBOT-BRIDGE] 下载图片异常: %s: %s", type(exc).__name__, exc)
+        return None
+
+
+async def _shrink_if_needed(data: bytes, url: str, logger: Any = None,
+                            soft_limit: int = 20 * 1024 * 1024) -> tuple:
+    """超过官方软限制（图片 20 MB）就压一下 —— 避免被降级成"文件"。"""
+    name = os.path.basename(url.split("?")[0]) or "image.jpg"
+    if len(data) <= soft_limit:
+        return data, name
+    try:
+        import io
+        from PIL import Image as PILImage
+    except Exception:
+        return data, name
+    try:
+        def _do() -> bytes:
+            im = PILImage.open(io.BytesIO(data))
+            if im.mode in ("RGBA", "P", "LA"):
+                im = im.convert("RGB")
+            quality = 85
+            for _ in range(4):
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=quality, optimize=True)
+                out = buf.getvalue()
+                if len(out) <= soft_limit:
+                    return out
+                quality -= 15
+            # 还大就缩尺寸
+            im.thumbnail((1600, 1600))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=80, optimize=True)
+            return buf.getvalue()
+
+        import asyncio
+        out = await asyncio.to_thread(_do)
+        if logger is not None:
+            logger.info("[QQBOT-BRIDGE] 图片过大已压缩：%.1f MB → %.1f MB",
+                        len(data) / 1048576, len(out) / 1048576)
+        return out, os.path.splitext(name)[0] + ".jpg"
+    except Exception as exc:
+        if logger is not None:
+            logger.debug("[QQBOT-BRIDGE] 压缩图片失败（按原图上传）: %s", exc)
+        return data, name
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -324,11 +448,34 @@ async def fix_markdown_images(
         new_url = url
 
         if _is_remote(url):
-            # 公网地址：验真（结果缓存，同一条 md 里重复的图不重复请求）
+            # ★★★ 远程图也**转存到 QQ 自己的 COS**（不再只是"验真"）。
+            #
+            #   为什么（2026-10-07 用户实测）：官方说「用公网 URL，平台会下载转存」，
+            #   但**公网 + 国内 + 200 + 真图片**照样失败 —— 用户给的萌娘百科国内站
+            #   直链（HEAD 200、content-type: image/png）在群里依旧只显示 alt 文字。
+            #   平台转存是**异步**的、失败只回错误码（304010 CHANGE_IMAGE_URL /
+            #   304021 GET_FILE / 304020 FILE_SIZE），前端完全拿不到反馈。
+            #   用户那张 Luka1.jpg 有 13.7 MB，很可能撞了大小限制。
+            #
+            #   ⇒ 我们自己取下来，走 QQ 自己的上传通道转存一次：
+            #     raw_url 是 QQ 自己的 COS 预签名地址，平台去下载它**必然成功**；
+            #     顺便还能把过大的图压到软限制内。
             cached = _cache_get(_URL_CACHE, url)
             if cached is None:
-                real = await resolve_image_url(client, url, logger=logger)
-                cached = real or url          # 验不出来就保留原样
+                pub = None
+                try:
+                    pub = await upload_remote_to_public_url(
+                        client, target_id, is_group, url, logger=logger)
+                except Exception as exc:
+                    if logger is not None:
+                        logger.debug("[QQBOT-BRIDGE] 远程图转存失败: %s", exc)
+                if pub:
+                    cached = pub
+                else:
+                    # 转存不成，退回"验真"：能确认是真图就保留原地址
+                    # （也许平台那边能转成功），确认不是图就也保留并告警。
+                    real = await resolve_image_url(client, url, logger=logger)
+                    cached = real or url
                 _cache_put(_URL_CACHE, url, cached, _URL_TTL)
             new_url = cached
         else:

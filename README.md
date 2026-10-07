@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.9
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,89 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.0</b> — ★ 图片/视频/语音/标签 四件事一起修好（md 格式始终零改动）</summary>
+
+### 1. 图片：**远程图也转存到 QQ 自己的 COS**（不只是"验真"）
+
+v1.4.9 以为「公网 URL 就能渲染」。**实测打脸**：你给的萌娘百科**国内站**直链
+（HEAD 200、`content-type: image/png`、真 PNG）在群里**依旧只显示 alt 文字**。
+
+查证后发现：平台的转存是**异步**的，失败只会回错误码给服务端日志，前端**毫无反馈**：
+
+```
+304010  CHANGE_IMAGE_URL  图片转存错误
+304021  GET_FILE          下载文件错误
+304020  FILE_SIZE         文件大小超限
+```
+
+你那张 `Luka1.jpg` 有 **13.7 MB** —— 很可能就撞了大小限制。
+
+**现在的做法**：不管本地还是远程，**我们自己把图取下来，走 QQ 自己的上传通道转存一次**，
+把 `raw_url`（QQ 自己的 COS 预签名地址）填回 md —— 平台去下载它**必然成功**。
+顺便还会把超过 **20 MB** 的图**自动压缩**（官方图片软限制），避免被降级成"文件"。
+
+### 2. 视频 / 语音：不再退化成「文件卡片」
+
+框架（两代都一样）写死：
+
+```python
+file_type = 1 if isinstance(media_element, Image) else 4
+```
+
+而官方是 `1=图片 2=视频 3=语音 4=文件`。
+⇒ 视频/语音一律按 **4=文件** 发，只能显示成**要点开下载的文件卡片**。
+
+**现在**（纯插件侧包一层 `_upload_file`，不动核心）：`Video→2`、`Record→3`，
+视频有封面可播放、语音是语音条。
+
+### 3. 标签被转义 ⇒ **整条 md 都不渲染**（不只是素材占位）
+
+你日志里模型这么写：
+
+```
+<text>&lt;markdown&gt;
+# 🎧 巡音ルカ · Just Be Friends
+&lt;/markdown&gt;</text>
+```
+
+`<markdown>` 被**转义**了，解析器只当普通文字 ⇒ **整条消息按纯文本发**，
+所以你截图里 `#` 和链接**全都没渲染**（不只是音频没声）。
+
+**现在**：
+* 自动**剥掉这层转义壳**（`&lt;markdown&gt;…&lt;/markdown&gt;` 和裸标签都认）；
+* 剥完若这段正文**明显是 markdown**（标题/列表/图片/引用/加粗）而模型只用了 `<text>`，
+  **就按 markdown 发** —— 判据卡得紧，普通聊天不会被误伤。
+
+### 4. HTML 标签：QQ 的 markdown **根本不支持**
+
+官方「支持格式」清单里只有：标题 / 文字样式 / 链接 / 图片 / 有序无序列表 /
+列表嵌套 / 块引用 / 分割线 / 换行 —— **没有 HTML**。
+
+⇒ `<audio controls src="...">`、`<video>`、`<img>` 一概无效，只会显示成文字。
+
+**音频的可行做法**：markdown 里给**可点击的直链**，例如
+`[▶ 点这里播放](https://…/a.mp3)`（点击后由系统播放器打开）。
+提示词里已经写清楚这一点，引导模型别再写 `<audio>`。
+
+### ★ 关于 md 格式（你反复强调的那点）
+
+**始终零改动**。所有图片处理都只是**替换 `(...)` 里的 URL**，
+不拆消息、不改结构。测试里做了**逐字比对**：除图片 URL 外，输出与输入必须完全相同，
+**行数也不变**。
+
+### 测试（新增 3 个套件）
+
+| 文件 | 断言数 | 覆盖 |
+|------|-------|------|
+`tests/audit_md_img_publish.py` | 26 | 本地/远程转存 + 12 项格式保留 + 逐字比对 + 缓存 + 失败不丢消息 |
+`tests/audit_md_tag_repair.py` | 15 | 转义标签剥壳 + md 识别 + 不误伤普通聊天 |
+`tests/audit_media_types.py` | 8 | Video→2 / Record→3 / 幂等 / 可还原 |
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.4.9</b> — ★ markdown 里的图片终于能真的显示出来（且**md 格式零改动**）</summary>
 
 ### 现象

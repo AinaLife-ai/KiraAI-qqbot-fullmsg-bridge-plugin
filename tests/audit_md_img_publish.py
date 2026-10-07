@@ -154,6 +154,38 @@ async def main():
           out3.replace("https://upload.wikimedia.org/real.png",
                        "https://zh.wikipedia.org/wiki/Special:FilePath/Luka.png") == md_remote)
 
+    print("\n[3b] ★ 远程图也转存到 QQ 的 COS（不再只验真）")
+    M.resolve_image_url = lambda *a, **k: None      # 故意让验真失败
+    M.clear_caches()
+    remote_calls = {"n": 0}
+
+    async def fake_remote_upload(client, tid, isg, url, logger=None, timeout=30.0):
+        remote_calls["n"] += 1
+        return "https://cos.example.com/converted.png?sign=qqq"
+    M.upload_remote_to_public_url = fake_remote_upload
+    md_r = "![香香](https://storage.moegirl.org.cn/moegirl/commons/3/39/Luka_v4x_final.png)\n"
+    out_r = await M.fix_markdown_images(md_r, client=None, target_id="G1", is_group=True)
+    check("★★ 远程图被转存成 QQ 自己的 COS 地址",
+          "https://cos.example.com/converted.png?sign=qqq" in out_r, repr(out_r))
+    check("原站地址已不在 md 里", "moegirl" not in out_r)
+    check("结构仍未被破坏",
+          out_r.replace("https://cos.example.com/converted.png?sign=qqq",
+                        "https://storage.moegirl.org.cn/moegirl/commons/3/39/Luka_v4x_final.png") == md_r)
+
+    print("\n[3c] 转存失败 ⇒ 退回验真，仍然不许丢内容")
+    M.clear_caches()
+
+    async def fail_remote(client, tid, isg, url, logger=None, timeout=30.0):
+        return None
+    M.upload_remote_to_public_url = fail_remote
+
+    async def ok_resolve(client, url, logger=None, timeout=12.0):
+        return url
+    M.resolve_image_url = ok_resolve
+    out_r2 = await M.fix_markdown_images(md_r, client=None, target_id="G1", is_group=True)
+    check("★ 转存失败但地址确是真图 ⇒ 保留原地址（不丢内容）",
+          out_r2 == md_r, repr(out_r2))
+
     print("\n[4] 没有图片的 md：一个字都不许动")
     plain = "# 只有文字\n\n- 列表\n"
     out4 = await M.fix_markdown_images(plain, client=None, target_id="G1", is_group=True)
