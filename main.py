@@ -334,6 +334,9 @@ class QQOfficialGroupBridge(BasePlugin):
         self._capability_cache: dict = {}
         #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
         self._group_prefetch_task = None
+        #: ★ 本实例发起的「请重连」任务 —— terminate 时必须全部取消，
+        #   否则每次重载都漏一个在跑（会让连接反复重连 ⇒ 消息重复）。
+        self._reconnect_tasks: list = []
         self._task = None
         self._stop = asyncio.Event()
         self._patch_state = {}
@@ -469,6 +472,19 @@ class QQOfficialGroupBridge(BasePlugin):
             except asyncio.CancelledError:
                 pass
         self._task = None
+        # ★★★ 把「请重连」的后台任务也**全部取消**。
+        #   不取消的话：每次「卸载 / 重载插件」都漏一个在跑（实测三轮累积 3 个），
+        #   它们会反复去 close 网关 socket ⇒ 连接反复重连、
+        #   可能多条网关连接并存 ⇒ **同一条消息被重复处理多次**。
+        for t in self._reconnect_tasks:
+            if not t.done():
+                t.cancel()
+        for t in self._reconnect_tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reconnect_tasks = []
         await self._flush_identities(force=True)
         await self._flush_group_names(force=True)
         logger.info(
@@ -1572,7 +1588,14 @@ class QQOfficialGroupBridge(BasePlugin):
                 logger.debug("[QQBOT-BRIDGE] 请求重连失败（忽略）: %s", exc)
 
         try:
-            asyncio.get_running_loop().create_task(_worker())
+            # ★★★ v1.4.3 修的真 bug：**必须记住这个 task**。
+            #   原来 `create_task(_worker())` 的返回值没保存 ⇒ `terminate()` 取消不到它
+            #   ⇒ 每次「卸载 / 重载插件」都漏一个在跑。
+            #   实测「装→卸载→装→卸载→装」三轮后**累积 3 个**（与用户报的
+            #   "同一条消息出现 3 条"数字吻合）；每个都会去 close 网关 socket
+            #   ⇒ 反复重连、可能多条网关连接并存 ⇒ 同一条事件被处理多次。
+            self._reconnect_tasks.append(
+                asyncio.get_running_loop().create_task(_worker()))
         except RuntimeError:
             pass
 

@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.2
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -447,6 +447,48 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.3</b> — ★ 修「反复装卸载插件后同一条消息变成 3 条」（后台任务泄漏）</summary>
+
+### 你的猜测是对的
+
+> 有没有可能是我点了插件卸载，重新安装后，又点插件重载，然后就出现这种bug？
+
+**实测复现，数字完全吻合**：
+
+```
+装 → 卸载 → 装 → 卸载 → 装
+第 1 轮后，仍在跑的 reconnect 任务数 = 1
+第 2 轮后，仍在跑的 reconnect 任务数 = 2
+第 3 轮后，仍在跑的 reconnect 任务数 = 3   ← 和"3 条"对上
+```
+
+### 根因
+
+`_request_reconnect` 里：
+
+```python
+asyncio.get_running_loop().create_task(_worker())   # ← 返回值没保存！
+```
+
+而 `terminate()` 只 cancel 巡检任务，**碰不到它** ⇒ **每次卸载/重载都漏一个在跑**。
+
+**后果链**：每个遗留任务都会去 `gw._conn.close()` **关网关 socket**
+⇒ 多个任务轮流关 ⇒ botpy **反复重连** ⇒ 重连期间 / 多连接并存
+⇒ **同一条事件被处理多次**。
+
+这个 bug 是 **v1.3.2** 加 `_request_reconnect`（"让订阅位立刻生效"那次）时引入的。
+之所以到最近才暴露：**平时不会反复装卸载**，只有折腾插件时才攒得起来。
+
+### 修法
+
+* `create_task` 的返回值**存进 `self._reconnect_tasks`**；
+* `terminate()` 里**全部 cancel 并 await**。
+
+**验证**：修完后三轮操作，**残留 = 0**。
+
+</details>
+
+<details>
 <summary><b>v1.4.2</b> — ★ 找到真凶：`<msg message_id="">` 是**我自己 v1.4.0 引入的 bug**</summary>
 
 你提示得对：**"以前版本没问题"** —— 查了确实是我引入的。
