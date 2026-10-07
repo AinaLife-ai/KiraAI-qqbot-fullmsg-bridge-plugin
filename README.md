@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.3.9
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -447,6 +447,61 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.0</b> — ★ 修「消息偶尔发不出去」（空 message_id）+ 已运行时安装即时生效</summary>
+
+### 一、`<msg message_id="">` 导致消息发不出去（真 bug）
+
+日志里的铁证：`[message] LLM -> ...: <msg message_id="">` —— **空属性**。
+
+**完整根因链**（逐段核实）：
+
+1. 我们的**合成事件**（成员通知 / 主动消息）用了 `message_id=""`；
+2. 核心 `kira-ai` 插件把每条进来的消息**无条件**渲染进提示词：
+   `f"[{date}] [message_id: {msg.message_id}] [...] | {msg.message_str}"`
+   ⇒ 空串渲染成 `[message_id: ]`；
+3. 模型写 `<msg message_id="">` —— **照抄**这个空属性；
+4. 这个空属性**留在历史里被反复模仿** ⇒ 所以是"**会出现**"而不是"只在首次"。
+
+**对照证据**：核心自己早就避开了 ——
+`plugin_context` 用 `"system_message"`、OneBot 适配器用 `"None"`。
+**唯独我们用了空串。**
+
+**修法**：合成事件改用非空占位 `"system"`（两处：`main.py` / `qqbot_bridge.py`）。
+
+### 二、实例已在运行时装插件：**大部分不用重启**
+
+先说结论：插件**每 15 秒巡检一次**，会对**已连接的适配器**自动补挂：
+
+* 发送增强 / markdown / 键盘 / 引用；
+* 互动回调；
+* 事件处理器；
+* **运行中解析表**（否则新解析器对已建立的连接不生效）；
+* intent 扩展 —— 并**主动请一次重连**让新订阅位立即生效。
+
+**真正需要补救的缺口只有一个**：**群名**原本只在「收到该群消息」时才拉
+⇒ 刚装插件时会话列表里所有群都还是 openid，要等群里有人说话才逐个变中文。
+（用户在"实例已在运行"时装插件是最常见的场景，那时体验尤其差。）
+
+**修法**：挂载时把**已知会话**的群名**补拉一遍**（后台，不阻塞）。
+> 官方**没有「列出机器人所在的群」的接口**，所以只能从见过的会话反推 ——
+> 没来过消息的群确实补不了，这是平台限制。
+
+### 三、撤回失败的提示：**原样返回官方报错**
+
+上一版我写了段自定义解释（"记录被清掉，别重试"）——**这是错的**：
+40061001 可能有多种原因，把我猜的当成事实告诉模型**反而误导**。
+
+**已回退**为原样返回 `撤回失败：请求参数无效（40061001）`；
+"未反查到 id"这个信息只写**日志**，便于真出问题时排查。
+
+### 测试
+
+新增 `tests/audit_hot_install.py`：三项修复的断言（含"核心确实把 message_id
+无条件渲染进提示词"这条链路证据）。**双核心 2.x / 3.0 均通过。**
+
+</details>
+
+<details>
 <summary><b>v1.3.9</b> — ★ 撤回「图片/表情」仍报 40061001 的根因与修复</summary>
 
 ### 现象

@@ -1151,7 +1151,9 @@ def build_member_event(*, adapter, body: dict, event_name: str, Group, User,
                 sender=User(user_id=member_id or "system", nickname=None),
                 is_mentioned=True,
                 is_notice=True,
-                message_id="",
+                # ★ 非空占位（与 main.SYNTHETIC_MESSAGE_ID 同义）：
+                #   空串会渲染成 `[message_id: ]`，模型照抄进 `<msg message_id="">`。
+                message_id="system",
                 self_id=getattr(adapter, "app_id", None),
                 chain=_make_chain(Text, text),
             ),

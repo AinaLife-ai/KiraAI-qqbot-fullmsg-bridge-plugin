@@ -140,20 +140,19 @@ def main():
     check("★ 用的是**真实 id**（不是 qqo-xxx）", used == RAW, used)
     check("撤回成功", "成功" in r, r)
 
-    # ---------------- 2. 未命中：给可操作提示 ----------------
-    print("\n[2] 表里没有（模拟重启 / 超过 100 条被淘汰）→ 应给可操作提示")
+    # ---------------- 2. 未命中：返回**官方原始报错** ----------------
+    # ★ 用户提醒：不要把「我猜的原因」当成事实告诉模型 ——
+    #   40061001 可能有多种原因，编解释反而误导。所以只回原始报错。
+    print("\n[2] 表里没有（模拟重启 / 超过 100 条被淘汰）→ 返回原始报错")
     HOLDER._reply_id_aliases.clear()
     calls.clear()
     r = loop.run_until_complete(tool.execute(E(), message_id="qqo-ad248e7d21"))
-    for ln in r.splitlines():
-        print("    " + ln)
-    check("★ 说明「原始 ID 已经查不到」（而不是只说'参数无效'）",
-          "查不到" in r, r)
-    check("★ 给出原因（记录有限/重启清空）",
-          "100" in r and "重启" in r, r)
-    check("★ 给出可操作建议（撤不回来/让管理员手动撤）",
-          "撤不回来" in r and "管理员" in r, r)
-    check("★ 明确说「不要反复重试」（省 token）", "不要反复重试" in r, r)
+    print("    " + r)
+    check("★ 返回官方原始报错（含错误码）", "40061001" in r and "请求参数无效" in r, r)
+    check("★ 不编造原因（不出现'记录被清掉'这类推断）",
+          "已经查不到" not in r and "清掉" not in r, r)
+    check("★ 不替模型下结论（不出现'不要重试'这类指令）",
+          "不要重试" not in r, r)
 
     # ---------------- 3. found 标记语义 ----------------
     print("\n[3] _to_raw_message_id 的 found 标记")

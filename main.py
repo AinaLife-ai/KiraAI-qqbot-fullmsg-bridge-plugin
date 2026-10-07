@@ -748,6 +748,18 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     # 合成事件（互动回调 / 成员进出）
     # ------------------------------------------------------------------ #
+    #: 合成事件（成员通知 / 主动消息）的 `message_id` 占位。
+    #:
+    #: ⚠ **不能用空串**（真实踩过的坑）：核心 `kira-ai` 插件把每条进来的消息
+    #: 渲染进提示词时是**无条件**带 `message_id` 的：
+    #:     f"[{date}] [message_id: {msg.message_id}] [...] | {msg.message_str}"
+    #: 空串会渲染成 `[message_id: ]`；模型随后写 `<msg message_id="">` 照抄它，
+    #: 这个空属性还会**留在历史里**被反复模仿 —— 表现就是"偶尔消息发不出去"。
+    #:
+    #: 核心自己早就避开了这点：`plugin_context` 用 `"system_message"`、
+    #: OneBot 适配器用 `"None"`。我们跟它们一致，用非空占位即可。
+    SYNTHETIC_MESSAGE_ID = "system"
+
     def publish_synthetic_event(self, *, target_id: str, sender_id: str, is_group: bool,
                                 text: str, is_notice: bool = True,
                                 target_holder: dict = None) -> bool:
@@ -786,7 +798,9 @@ class QQOfficialGroupBridge(BasePlugin):
                         sender=User(user_id=str(sender_id), nickname=None),
                         is_mentioned=True,
                         is_notice=is_notice,
-                        message_id="",
+                        # ★ 非空占位：空串会被渲染成 `[message_id: ]`，
+                        #   模型照抄成 `<msg message_id="">` 并带进历史。
+                        message_id=self.SYNTHETIC_MESSAGE_ID,
                         self_id=getattr(adapter, "app_id", None),
                         chain=MessageChain([Text(text)]),
                     ),
@@ -863,6 +877,15 @@ class QQOfficialGroupBridge(BasePlugin):
 
         # ---- intent 扩展（成员事件 / 互动回调位）----
         self._apply_extra_intents(adapter, name, client)
+
+        # ---- 群名补拉（★ 解决「适配器已连接时才装插件」的体验问题）----
+        #   群名只在**收到该群消息**时才会被拉取，所以刚装插件时：
+        #   会话列表里所有群都还是那串 openid，要等到群里有人说话才逐个变中文。
+        #   这里在挂载时把**已知会话**的群名补拉一遍。
+        #   ⚠ 官方**没有「列出机器人所在的群」的接口**，所以只能从
+        #   `_group_reply_ids`（我们见过的群）反推 —— 没来消息的群确实没法补，
+        #   这是平台限制，不是我们偷懒。
+        self._prefetch_group_names(adapter, name, client)
 
         # ---- 成员事件解析器（需要 intent 1<<24；缺解析器时补上）----
         if self.extra_intents and self.member_notice_enabled and state is not None:
@@ -1606,6 +1629,54 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     # 群名（2.x：构建事件时填；3.0：publish 包装，见 v3_support）
     # ------------------------------------------------------------------ #
+    def _prefetch_group_names(self, adapter, name: str, client) -> None:
+        """挂载时把**已知会话**的群名补拉一遍（后台，不阻塞）。
+
+        为什么需要：群名原本只在「收到该群消息」时才拉 ⇒ 刚装插件（或刚重启）
+        时，会话列表里所有群都还是那串 openid，要等群里有人说话才逐个变中文。
+        用户在「实例已在运行」时装插件是**最常见**的场景，那时体验尤其差。
+
+        能拿到哪些群：官方**没有**「列出机器人所在的群」的接口，
+        所以只能从我们见过的会话反推：
+          * `adapter._group_reply_ids`（收到过消息的群）；
+          * 3.0 上同一信息在能力对象上，一并取。
+        没来过消息的群确实补不了 —— 这是平台限制，只提示一次、不反复重试。
+        """
+        if not self.group_name_enabled:
+            return
+        candidates = set()
+        for holder in (adapter, self._capability_of(adapter)):
+            if holder is None:
+                continue
+            ids = getattr(holder, "_group_reply_ids", None)
+            if isinstance(ids, dict):
+                candidates.update(str(k) for k in ids.keys() if k)
+        if not candidates:
+            return
+        pulled = 0
+        for gid in candidates:
+            if self.group_names.lookup(name, gid) or self.group_names.has_failed(name, gid):
+                continue
+            try:
+                if self.group_names.schedule_fetch(adapter, name, gid, client, logger):
+                    pulled += 1
+            except Exception:
+                pass
+        if pulled:
+            logger.info(
+                "[QQBOT-BRIDGE] %s: 已为 %d 个已知群补拉群名（后台进行，"
+                "这样刚装插件/刚重启也能看到中文群名）", name, pulled,
+            )
+
+    @staticmethod
+    def _capability_of(adapter):
+        """3.0 的会话级数据（如 `_group_reply_ids`）搬到了能力对象上。"""
+        try:
+            from core.adapter.capabilities import IMCapability
+            return adapter.get_capability(IMCapability)
+        except Exception:
+            return None
+
     def _group_name_for(self, adapter_name: str, adapter, group_id: str, client) -> str:
         """取群名；没有就顺手丢一个后台任务去拉，并保持 openid（不阻塞）。"""
         if not self.group_name_enabled or not group_id:

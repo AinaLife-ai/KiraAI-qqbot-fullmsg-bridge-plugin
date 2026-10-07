@@ -33,6 +33,12 @@ except Exception:  # pragma: no cover
         def __init__(self, *a, **kw):
             pass
 
+try:
+    from core.plugin import logger  # noqa: F401  （核心的插件日志器）
+except Exception:  # pragma: no cover
+    import logging as _logging
+    logger = _logging.getLogger("qqbot_bridge")   # type: ignore
+
 
 #: 官方错误码 → 人话（给模型看，避免它反复重试同一个注定失败的调用）
 ERROR_HINTS = {
@@ -167,21 +173,16 @@ class RecallQQMsgTool(_ApiTool):
         try:
             await self._request(event, "DELETE", path, **key)
         except Exception as exc:
-            hint = humanize_error(exc)
-            # ★ 查不到映射时的**可操作提示**（实测的高频失败原因）：
-            #   官方只推「新消息」事件，历史消息的 id 我们本来见不到；
-            #   别名表是**内存态**（每条会话最多 100 条），所以
-            #   ① 重启过 KiraAI，或 ② 之后又聊了 100 条以上，
-            #   那条 id 就被清掉了 ⇒ 反查不到 ⇒ 只能拿展示态 id 去试 ⇒ 40061001。
-            if (not found) and "40061001" in str(exc):
-                return (
-                    "撤回失败：这条消息的原始 ID 已经查不到了（40061001）。\n"
-                    "原因：机器人在本会话里能记住的「最近消息 ID」是有限的"
-                    "（约 100 条，且重启后会清空）；这条太早，记录已被清掉。\n"
-                    "请告诉用户：这条撤不回来了，需要撤回请尽快说；"
-                    "或者让群管理员手动撤回。**不要反复重试**。"
+            # ⚠ 这里**只返回官方原始报错**，不做任何"我的推断"式解释 ——
+            #   用户提醒得对：40061001 可能有多种原因，把我猜的
+            #   （"记录被清掉"）当成事实告诉模型，反而会误导。
+            #   `found` 只用来**打日志**（便于真出问题时排查），不进给模型的话。
+            if not found:
+                logger.debug(
+                    "[QQBOT-BRIDGE] 撤回失败：展示态 id %s 未反查到真实 id（%s）",
+                    message_id, humanize_error(exc),
                 )
-            return f"撤回失败：{hint}"
+            return f"撤回失败：{humanize_error(exc)}"
         return "撤回成功"
 
     def _alias_table_stats(self, adapter) -> str:
