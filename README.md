@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.0
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -447,6 +447,39 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.1</b> — ★ 性能与缓存审计：修两处开销 + 给群名补拉加限流</summary>
+
+按"有没有破坏命中缓存 / 堵塞 / 吃性能"完整过了一遍，**发现问题并修掉**。
+
+### 修 1：能力对象解析在 2.x 上每轮白烧 176 µs
+
+原来在热路径里 `import` + 调 `get_capability`，而 **2.x 根本没有能力对象**
+⇒ 每次都走异常分支。实测单次 **175.92 µs**，而这段是**每 15 秒巡检都跑**的。
+
+**修法**：import 提到模块级 + **先廉价探测**（无 `get_capability` 直接跳过）
++ **结果缓存**。
+
+### 修 2（更严重）：群名补拉会撞接口限流
+
+官方群名接口限 **30 QPM**，而上一版在挂载时**一次性排队所有已知群**
+⇒ 刚装插件那一刻可能直接打几十个请求，**被平台拒一整分钟**。
+
+**修法**：共享串行门闸 + 间隔；⚠ 间隔必须在**锁内**（放锁外会并行睡完
+再一起抢锁，等于没限速）；且只在「**除我还有人在排**」时才等
+⇒ **单发路径零延迟**。上层再**分批**（单轮 ≤20 个）。
+
+实测：单发无间隔；批量 4 个 ⇒ 间隔 0.62s、并发 1 ⇒ 约 **90 QPM**，限内。
+
+### 确认**没有**被破坏
+
+* 撤回别名表：全程只 `.get()`，**不动 LRU 顺序**；
+* S/Z 识图缓存（`desc_img` / `media_cache`）：**零触碰**；
+* 消息路径新增的 `remember_from_mentions`：**16.3 µs / 10 个 mentions**；
+* 落盘：走线程 + 脏标记，**反复 @ 同一人 50 次不会写盘**。
+
+</details>
+
+<details>
 <summary><b>v1.4.0</b> — ★ 修「消息偶尔发不出去」（空 message_id）+ 已运行时安装即时生效</summary>
 
 ### 一、`<msg message_id="">` 导致消息发不出去（真 bug）
