@@ -73,10 +73,13 @@ def main():
 
     src = (ROOT / "main.py").read_text(encoding="utf-8")
 
-    # ---------------- 1. 静态：2.x 路径也要设 PENDING_MD ----------------
+    # ---------------- 1. 静态：两条发送路径都要提取 PENDING_MD ----------------
     print("\n[1] 静态检查：两条发送路径都要提取 markdown")
     i = src.find("def _patch_send_path")
-    seg = src[i:i + 3000] if i > 0 else ""
+    # ★ 别用固定字数窗口 —— 函数里加了注释/docstring 就会把断言挤出窗外，
+    #   导致"改了注释就红"这种假失败。按**下一个同类缩进的方法**取段才稳。
+    j = src.find("\n    def ", i + 10) if i > 0 else -1
+    seg = src[i:j] if (i > 0 and j > i) else (src[i:i + 8000] if i > 0 else "")
     check("★ 2.x 的 _send_message 包装里设了 PENDING_MD",
           "PENDING_MD.set(" in seg, seg[:300])
     check("★ 也设了 PENDING_KB", "PENDING_KB.set(" in seg)
@@ -84,6 +87,14 @@ def main():
           "PENDING_MD.reset(" in seg and "PENDING_KB.reset(" in seg)
     check("★ 提取用的是 split_markdown_and_keyboard",
           "split_markdown_and_keyboard(send_message_obj)" in seg)
+    # ★★★ 3.0 落点：框架走的是 capability._send_message，不是 adapter._send_message
+    #     （漏了这条 = 3.0 上整个补丁是空操作，用户看到 [Unsupported message element]）
+    check("★★ 补丁会去找能力对象的 _send_message（3.0 落点）",
+          "_capability_of(adapter)" in seg and "cap" in seg,
+          "缺能力对象落点 ⇒ 3.0 上补丁静默失效")
+    check("★★ 最终挂到 holder（框架真正走的对象）",
+          "holder._send_message = _send_message" in seg,
+          "挂错对象 ⇒ 3.0 上白装")
 
     # ---------------- 2. 决定性实测：reply + markdown ----------------
     print("\n[2] 实测：<reply> + <markdown> 同一条消息，实际发出什么")
@@ -92,11 +103,21 @@ def main():
                        config={"app_id": "a", "app_secret": "b",
                                "permission_mode": "deny_list",
                                "group_deny_list": [], "user_deny_list": []})
-    if os.environ.get("KIRA_CORE_GEN") == "3":
-        print("      （3.0 走的是核心自己的发送链，本回归只影响 2.x 的补丁路径）")
-        return 0
+    # ★★★ 3.0 **不是**"走核心自己的发送链就没事"（2026-10-07 实测纠正）：
+    #   3.0 的框架走 `adapter.get_capability(IMCapability).send_group_message()`，
+    #   而补丁原本只挂 `adapter._send_message`（3.0 上不存在）
+    #   ⇒ 3.0 上补丁是**空操作** ⇒ capability 自己 `_text_content` 拼出
+    #   `[Unsupported message element]` 发到群里。所以 3.0 必须一起实测。
+    GEN3 = os.environ.get("KIRA_CORE_GEN") == "3"
 
-    ad = QQOfficialAdapter(info, asyncio.Queue())
+    if GEN3:
+        from core.adapter.context import AdapterContext
+        from core.adapter.capabilities import IMCapability
+        from core.adapter.src.qq_official.qq_official import QQOfficialAdapter as _A
+        ad = _A(AdapterContext(info=info, event_queue=asyncio.Queue()))
+    else:
+        ad = QQOfficialAdapter(info, asyncio.Queue())
+
     sent = []
 
     class API:
@@ -117,18 +138,34 @@ def main():
 
     p = B.QQOfficialGroupBridge(C(), {})
     p._install_api_send(ad, "qqo", ad.client)
+    p._patch_send_entry(ad, "qqo")
     p._patch_send_path(ad, "qqo", ad.client)
     loop = asyncio.new_event_loop()
 
+    # ★ 框架真实发送入口：3.0 走能力对象，2.x 走适配器实例
+    if GEN3:
+        send = ad.get_capability(IMCapability).send_group_message
+        # 3.0 的 capability 默认不主动兜底，给一条收到的消息当回复目标
+        try:
+            ad.get_capability(IMCapability)._proactive_enabled = True
+        except Exception:
+            pass
+    else:
+        send = ad.send_group_message
+    _holder = getattr(send, "__self__", None)
+    _label = f"{type(_holder).__name__}.send_group_message" if _holder is not None \
+        else "adapter.send_group_message（已被补丁包装为实例属性）"
+    print(f"      框架发送入口 = {_label}")
+
     # 先让机器人发一条（登记别名），再用展示态 id 引用它 —— 与线上一致
     r1 = loop.run_until_complete(
-        ad.send_group_message("G1", MessageChain([Text("我是第一条")])))
+        send("G1", MessageChain([Text("我是第一条")])))
     mid1 = getattr(r1, "message_id", None)
     check("★ 先发的消息有展示态 id", bool(mid1) and str(mid1).startswith("qqo-"),
           repr(mid1))
 
     chain = MessageChain([Reply(str(mid1)), MarkdownText("## 标题\n正文")])
-    loop.run_until_complete(ad.send_group_message("G1", chain))
+    loop.run_until_complete(send("G1", chain))
     got = sent[-1]
     print(f"      实际报文：msg_type={got.get('msg_type')} "
           f"content={got.get('content')!r} "
@@ -166,7 +203,7 @@ def main():
     # ---------------- 3. 单发 md（无 reply）也要正常 ----------------
     print("\n[3] 对照：单独发 markdown（无 reply）")
     sent.clear()
-    loop.run_until_complete(ad.send_group_message(
+    loop.run_until_complete(send(
         "G1", MessageChain([MarkdownText("## 只有md")])))
     got2 = sent[-1]
     check("★ 也走 markdown 分支", got2.get("msg_type") == 2, str(got2))

@@ -14,6 +14,8 @@ import asyncio
 import json
 import os
 import sys
+import time
+import datetime
 
 ROOT = "/var/minis/workspace/qqbot_bridge_review"
 sys.path.insert(0, f"{ROOT}/kira-v3")
@@ -156,13 +158,28 @@ class FakeEvent:
         self.adapter = adapter_info
 
 
+def _now_iso() -> str:
+    """当前时刻的 ISO 时间戳（带 +08:00 偏移）。
+
+    ★ 为什么必须动态生成（2026-10-07 踩到）：原来这里写死
+    `"2026-10-07T12:00:00+08:00"`，而 KiraAI 3.0 的**被动回复窗口是 300 秒**
+    （`im.py:_reply_is_valid`）—— 夹具时间戳一旦比真实时间早 5 分钟，
+    核心就会认为"这条消息太旧、回复 id 已失效"而把它丢掉，
+    表现为 `payload["msg_id"] is None`（`audit_e2e` 的 1f 就是这么红的）。
+    日期写死的测试 = 定时炸弹。
+    """
+    return datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=8))
+    ).isoformat()
+
+
 INBOUND = {
     "id": "ROBOT1.0_inbound",
     "author": {"id": "MEM1", "member_openid": "MEM1", "username": "小明", "bot": False},
     "content": "看看这个",
     "group_openid": "G1",
     "message_type": 0,
-    "timestamp": "2026-10-07T12:00:00+08:00",
+    "timestamp": _now_iso(),
     "message_scene": {"source": "default", "ext": ["msg_idx=REFIDX_1=="]},
     "mentions": [],
 }
