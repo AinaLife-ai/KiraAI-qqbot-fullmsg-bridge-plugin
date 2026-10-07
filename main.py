@@ -1999,11 +1999,38 @@ class QQOfficialGroupBridge(BasePlugin):
         async def _send_message(target_id, send_message_obj, is_group):
             ref = self._quote_ref_for(adapter, target_id, send_message_obj, is_group) \
                 if self.quote_reply else None
-            token = QUOTE_REF.set(ref)
+            # ★★★ 这里必须把 markdown / keyboard 也提取出来放进 contextvar ——
+            #   与 3.0 那条路径（`_patch_send_entry` 里的 wrapped）**保持一致**。
+            #
+            #   漏了这一步的后果（线上实测）：`api_send._send` 读不到 PENDING_MD
+            #   ⇒ 不会走 `msg_type=2 + markdown.content`，
+            #   而是把**原链**交给适配器 ⇒ 适配器 `_text_content` 不认识我们的
+            #   自定义元素（`MarkdownText`）⇒ 拼出 `[Unsupported message element]`
+            #   发给群 ⇒ 用户看到的就是那句占位文本（原本好好的 md 全没了）。
+            #
+            #   触发条件：**同一条消息里既有 `<reply>` 又有 `<markdown>`**
+            #   （模型很喜欢这么写）—— 所以不是每次都出，属于"偶尔全坏"。
+            md_text = kb = None
+            try:
+                if self.markdown_enabled or self.keyboard_enabled:
+                    found_md, found_kb, changed = split_markdown_and_keyboard(send_message_obj)
+                    if changed:
+                        if self.markdown_enabled:
+                            md_text = found_md
+                        if self.keyboard_enabled:
+                            kb = found_kb
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 提取 markdown/keyboard 失败: %s", exc)
+
+            md_token = PENDING_MD.set(md_text)
+            kb_token = PENDING_KB.set(kb)
+            ref_token = QUOTE_REF.set(ref)
             try:
                 result = await original(target_id, send_message_obj, is_group)
             finally:
-                QUOTE_REF.reset(token)
+                QUOTE_REF.reset(ref_token)
+                PENDING_KB.reset(kb_token)
+                PENDING_MD.reset(md_token)
             if result is not None and bool(getattr(result, "ok", True)):
                 return result
             err = str(getattr(result, "err", "") or "")

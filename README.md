@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.4
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,57 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.5</b> — ★ 修回归：`<reply>` + `<markdown>` 同条消息会发出 `[Unsupported message element]`</summary>
+
+你报的："原本她 md 发的好好的，结果现在这样了" —— 确实是我引入的回归。
+
+### 现象
+
+群里只显示一句：
+
+```
+[Unsupported message element]
+```
+
+### 根因（已复现）
+
+2.x 的发送补丁 `_patch_send_path` 里，`_send_message` 包装**只设了 `QUOTE_REF`**，
+**漏了 `PENDING_MD` / `PENDING_KB`**（3.0 那条路径是有的）。
+
+后果链：
+
+1. `api_send._send` 读不到 `PENDING_MD`；
+2. ⇒ 不走 `msg_type=2 + markdown.content`；
+3. ⇒ 把**原链**交给适配器；
+4. ⇒ 适配器 `_text_content()` **不认识我们的自定义元素**（`MarkdownText`）；
+5. ⇒ 拼出 `"[Unsupported message element]"` 当正文发出去。
+
+### 触发条件
+
+**同一条消息里既有 `<reply>` 又有 `<markdown>`**（模型很喜欢这么写）。
+单独发 md 也会受影响 —— 只要 markdown 提取没传到 api 层就坏。
+
+### 实测前后
+
+```
+修复前：msg_type=0   content='[Unsupported message element]'
+修复后：msg_type=2   content=None   markdown={'content': '## 标题\n正文'}
+```
+
+### 修法
+
+在 `_send_message` 包装里补齐 `PENDING_MD` / `PENDING_KB` 的设置与 reset，
+**与 3.0 路径完全一致**。
+
+### 测试
+
+新增 `tests/audit_md_regression.py`（11 项）：静态检查两条路径都提取 markdown
++ **决定性实测**（`<reply>`+`<markdown>` 的报文必须是 `msg_type=2` 且不含占位文本）
++ 单发 md 对照。
+
+</details>
+
+<details>
 <summary><b>v1.4.4</b> — ★ 已有会话的名字也能补成中文（含私聊昵称）</summary>
 
 会话名在**建立那一刻**就定死了 —— 以前装插件时群名还拉不到，

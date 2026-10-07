@@ -28,6 +28,8 @@
                        工具/标签真的注入进 TagSet/ToolSet，以及与四个合作插件
                        （accelerator / xml_tag_fixer / session_merger / sustained_chat）
                        的共存前提（补丁目标不重叠、标签不被破坏）。
+  audit_md_regression.py ★ 回归：`<reply>` + `<markdown>` 同条消息发出
+                       `[Unsupported message element]`（2.x 发送补丁漏传 markdown）。
   audit_session_backfill.py ★ 会话名回填：只改「名字还是 openid」的会话（用户手动
                        改名的一律不碰）；群走群名、私聊走通讯录；拉不到不编造。
   audit_task_leak.py     ★ 后台任务泄漏：重载插件会漏 `_request_reconnect` 任务
@@ -90,7 +92,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "smoke_v3.py", "audit_quality.py", "audit_static.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
-          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py", "audit_recall_alias.py", "audit_hot_install.py", "audit_all_on.py", "audit_hot_install_live.py", "audit_msgid_source.py", "audit_msgid_own_bug.py", "audit_task_leak.py", "audit_session_backfill.py"]
+          "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py", "audit_recall_alias.py", "audit_hot_install.py", "audit_all_on.py", "audit_hot_install_live.py", "audit_msgid_source.py", "audit_msgid_own_bug.py", "audit_task_leak.py", "audit_session_backfill.py", "audit_md_regression.py"]
 
 rc = 0
 for suite in SUITES:
