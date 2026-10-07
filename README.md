@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.2
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.4.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -121,6 +121,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `at_markup_style` | **legacy** | @ 标记形态：`legacy` = `<@openid>`（**默认**，平台自己下发用的那种）/ `new` = `<qqbot-at-user id="…" />`（官方文档推荐，但实测部分环境会被当纯文本原样显示） |
 | `enhance_rich_content` | 开 | **富内容归一化**：语音（含平台免费 ASR）/ 结构化卡片 / QQ 表情标记 → 都能读 |
 | `self_openid` | 空 | 通常留空＝全自动。只有自动识别猜错时才把它钉死 |
+| `backfill_session_titles` | 开 | 把**已存在**会话的名字补成中文（只改「名字还是乱码」的，你手动改过名的一律不碰）。群聊走群名，私聊只在「本机器人认得这个人」时补昵称 |
 | `group_name_enabled` | 开 | 后台把会话标题从群 OpenID 换成中文群名。该接口是**白名单（内邀）**，拿不到就自动降级为 OpenID（只提示一次），**用户不需要在 QQ 那边做任何设置** |
 | `markdown_enabled` | 开 | 注册 `<markdown>` 标签，让模型能发富文本（官方 2026-04-23 起自定义 markdown 对所有机器人开放，无需申请模板） |
 | `keyboard_enabled` | 开 | 注册 `<keyboard>` 标签，让模型能在消息下挂内联按钮 |
@@ -447,6 +448,90 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.4.4</b> — ★ 已有会话的名字也能补成中文（含私聊昵称）</summary>
+
+会话名在**建立那一刻**就定死了 —— 以前装插件时群名还拉不到，
+于是名字里存的就是那串 openid，一直显示到现在（WebUI 会话列表里那些乱码）。
+
+### 新增：自动回填
+
+插件挂载后**自动把这类会话的名字补成中文**（只做一次，后台进行）。
+
+| 会话类型 | 补成什么 |
+|---|---|
+| **群聊** | 中文群名（走已有的群名缓存，分批限流） |
+| **私聊** | 对方昵称 —— **仅在「本机器人认得这个人」时** |
+
+### 安全边界（你逐条确认过的）
+
+* **只改「名字还是 openid」的会话**（空、或 title 等于会话 ID）——
+  **你自己手动改过名的一律不碰**；
+* 拉不到群名 → **保持原样，绝不编造**；
+* 写之前**再确认一次**，防止在这期间被你改过名；
+* 只跑**一次**，不反复拉；
+* 后台任务，不阻塞消息处理；复用已有分批限流（不撞接口）。
+
+### 关于私聊：能，但有一半做不到
+
+我逐页核实了官方文档：
+
+* 「用户添加好友」事件 —— 只有 `openid`，**没有昵称**；
+* 「单聊消息接收」事件 —— `author` 里**只有 `user_openid`**；
+* 官方**全站没有任何「按 openid 查用户资料」的接口**。
+
+⇒ 所以私聊昵称**只能从我们自己的通讯录来**：
+**这个人在机器人所在的群里发过言 / 被 @ 过 / 被引用过**，才认得出来。
+从没在群里露过面的陌生人，**补不了** —— 这是平台限制，不是没做。
+
+### 开关
+
+`backfill_session_titles`（默认**开**）。关掉就完全不碰会话名。
+
+</details>
+
+<details>
+<summary><b>v1.4.3</b> — ★ 修「反复装卸载插件后同一条消息变成 3 条」（后台任务泄漏）</summary>
+
+### 你的猜测是对的
+
+> 有没有可能是我点了插件卸载，重新安装后，又点插件重载，然后就出现这种bug？
+
+**实测复现，数字完全吻合**：
+
+```
+装 → 卸载 → 装 → 卸载 → 装
+第 1 轮后，仍在跑的 reconnect 任务数 = 1
+第 2 轮后，仍在跑的 reconnect 任务数 = 2
+第 3 轮后，仍在跑的 reconnect 任务数 = 3   ← 和"3 条"对上
+```
+
+### 根因
+
+`_request_reconnect` 里：
+
+```python
+asyncio.get_running_loop().create_task(_worker())   # ← 返回值没保存！
+```
+
+而 `terminate()` 只 cancel 巡检任务，**碰不到它** ⇒ **每次卸载/重载都漏一个在跑**。
+
+**后果链**：每个遗留任务都会去 `gw._conn.close()` **关网关 socket**
+⇒ 多个任务轮流关 ⇒ botpy **反复重连** ⇒ 重连期间 / 多连接并存
+⇒ **同一条事件被处理多次**。
+
+这个 bug 是 **v1.3.2** 加 `_request_reconnect`（"让订阅位立刻生效"那次）时引入的。
+之所以到最近才暴露：**平时不会反复装卸载**，只有折腾插件时才攒得起来。
+
+### 修法
+
+* `create_task` 的返回值**存进 `self._reconnect_tasks`**；
+* `terminate()` 里**全部 cancel 并 await**。
+
+**验证**：修完后三轮操作，**残留 = 0**。
+
+</details>
+
+<details>
 <summary><b>v1.4.2</b> — ★ 找到真凶：`<msg message_id="">` 是**我自己 v1.4.0 引入的 bug**</summary>
 
 你提示得对：**"以前版本没问题"** —— 查了确实是我引入的。

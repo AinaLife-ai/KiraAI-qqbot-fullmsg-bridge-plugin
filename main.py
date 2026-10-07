@@ -281,6 +281,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self.pinned_self_openid = str(basic.get("self_openid", "") or "").strip()
         # ---- 新增：群名 / markdown / 键盘 / 互动 / 群管理工具（默认全开） ----
         self.group_name_enabled = bool(basic.get("group_name_enabled", True))
+        #: 把**已存在**会话的名字也补成中文（只改名字仍是 openid 的）
+        self.backfill_session_titles = bool(basic.get("backfill_session_titles", True))
         self.markdown_enabled = bool(basic.get("markdown_enabled", True))
         self.keyboard_enabled = bool(basic.get("keyboard_enabled", True))
         self.interaction_enabled = bool(basic.get("interaction_enabled", True))
@@ -334,6 +336,12 @@ class QQOfficialGroupBridge(BasePlugin):
         self._capability_cache: dict = {}
         #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
         self._group_prefetch_task = None
+        #: ★ 本实例发起的「请重连」任务 —— terminate 时必须全部取消，
+        #   否则每次重载都漏一个在跑（会让连接反复重连 ⇒ 消息重复）。
+        self._reconnect_tasks: list = []
+        #: 会话名回填：已处理过的适配器（只做一次）
+        self._backfilled: set = set()
+        self._backfill_tasks: list = []
         self._task = None
         self._stop = asyncio.Event()
         self._patch_state = {}
@@ -469,6 +477,22 @@ class QQOfficialGroupBridge(BasePlugin):
             except asyncio.CancelledError:
                 pass
         self._task = None
+        # ★★★ 把「请重连」的后台任务也**全部取消**。
+        #   不取消的话：每次「卸载 / 重载插件」都漏一个在跑（实测三轮累积 3 个），
+        #   它们会反复去 close 网关 socket ⇒ 连接反复重连、
+        #   可能多条网关连接并存 ⇒ **同一条消息被重复处理多次**。
+        for t in self._reconnect_tasks:
+            if not t.done():
+                t.cancel()
+        for t in self._reconnect_tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reconnect_tasks = []
+        for t in getattr(self, "_backfill_tasks", []):
+            if not t.done():
+                t.cancel()
         await self._flush_identities(force=True)
         await self._flush_group_names(force=True)
         logger.info(
@@ -911,6 +935,9 @@ class QQOfficialGroupBridge(BasePlugin):
         #   `_group_reply_ids`（我们见过的群）反推 —— 没来消息的群确实没法补，
         #   这是平台限制，不是我们偷懒。
         self._prefetch_group_names(adapter, name, client)
+
+        # ---- 会话名回填（只做一次；只改名字仍是乱码的会话）----
+        self._backfill_session_titles(name, adapter)
 
         # ---- 成员事件解析器（需要 intent 1<<24；缺解析器时补上）----
         if self.extra_intents and self.member_notice_enabled and state is not None:
@@ -1572,7 +1599,14 @@ class QQOfficialGroupBridge(BasePlugin):
                 logger.debug("[QQBOT-BRIDGE] 请求重连失败（忽略）: %s", exc)
 
         try:
-            asyncio.get_running_loop().create_task(_worker())
+            # ★★★ v1.4.3 修的真 bug：**必须记住这个 task**。
+            #   原来 `create_task(_worker())` 的返回值没保存 ⇒ `terminate()` 取消不到它
+            #   ⇒ 每次「卸载 / 重载插件」都漏一个在跑。
+            #   实测「装→卸载→装→卸载→装」三轮后**累积 3 个**（与用户报的
+            #   "同一条消息出现 3 条"数字吻合）；每个都会去 close 网关 socket
+            #   ⇒ 反复重连、可能多条网关连接并存 ⇒ 同一条事件被处理多次。
+            self._reconnect_tasks.append(
+                asyncio.get_running_loop().create_task(_worker()))
         except RuntimeError:
             pass
 
@@ -1761,6 +1795,122 @@ class QQOfficialGroupBridge(BasePlugin):
             if val is not None:
                 return val
         return default
+
+    def _backfill_session_titles(self, name: str, adapter) -> None:
+        """把**已存在**会话的名字补成中文（群名 / 私聊昵称）。
+
+        ★ 解决什么：会话名在**建立那一刻**就定死了。以前装插件时群名还拉不到
+        （或那时还没这功能），于是名字里存的就是那串 openid，一直显示到现在
+        （用户在 WebUI 会话列表里看到的就是这些）。
+
+        ★ 数据在哪：`data/memory/chat_memory.json` 的 `title` 字段；
+        读全部会话用 `session_mgr.get_session_info()`（无参），
+        改写用 `session_mgr.update_session_info(sid, title=...)` —— 两版核心接口一致。
+
+        ★ 安全边界（用户明确要求）：
+          * **只改「名字还是 openid」的会话** —— 用户自己改过名的一律不碰；
+          * **只群聊拉群名**；私聊**只在通讯录里认得这个人**时才补昵称
+            （官方没有任何"按 openid 查资料"的接口，好友/单聊事件也不带昵称）；
+          * 拉不到就**保持原样，绝不编造**；
+          * 只跑**一次**（`_backfilled` 标记），不反复拉；
+          * 全程后台任务 + 复用群名缓存的分批限流，不阻塞、不撞限流。
+        """
+        if not getattr(self, "backfill_session_titles", True):
+            return
+        if name in self._backfilled:
+            return
+        self._backfilled.add(name)
+        try:
+            mgr = getattr(self.ctx, "session_mgr", None)
+            if mgr is None or not hasattr(mgr, "get_session_info"):
+                return
+            sessions = mgr.get_session_info()
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 读取会话列表失败（忽略）: %s", exc)
+            return
+        if not isinstance(sessions, list):
+            return
+
+        todo = []
+        for s in sessions:
+            try:
+                if str(getattr(s, "adapter_name", "")) != name:
+                    continue
+                sid = str(getattr(s, "session_id", "") or "")
+                if not sid:
+                    continue
+                stype = str(getattr(s, "session_type", "") or "")
+                title = str(getattr(s, "session_title", "") or "")
+                # ★ 只碰「名字还是 openid」的：空、或等于 session_id。
+                #   用户手动改过名的（title 既非空也不等于 id）⇒ 跳过，绝不覆盖。
+                if title and title != sid:
+                    continue
+                if stype == "gm":
+                    todo.append(("gm", sid))
+                elif stype == "dm":
+                    # 私聊：只有通讯录里认得这个人才补（官方无查资料接口）
+                    nick = None
+                    try:
+                        if self.identities is not None:
+                            nick = self.identities.lookup(name, sid)
+                    except Exception:
+                        nick = None
+                    if nick:
+                        todo.append(("dm", sid))
+            except Exception:
+                continue
+        if not todo:
+            return
+        logger.info(
+            "[QQBOT-BRIDGE] %s: 发现 %d 个会话的名字还是乱码，开始后台补成中文"
+            "（只改这类，已改过名的不动）", name, len(todo),
+        )
+        try:
+            asyncio.get_running_loop().create_task(
+                self._backfill_worker(name, adapter, mgr, todo))
+        except RuntimeError:
+            pass
+
+    async def _backfill_worker(self, name: str, adapter, mgr, todo: list) -> None:
+        """后台把会话名补成中文：群聊走群名缓存，私聊走通讯录。"""
+        fixed = 0
+        client = None
+        try:
+            client = adapter.get_client()
+        except Exception:
+            client = None
+        for stype, sid in todo:
+            try:
+                new_title = None
+                if stype == "gm":
+                    # 先看缓存；没有就排队拉一次（复用已有的分批限流）
+                    new_title = self.group_names.lookup(name, sid)
+                    if not new_title and client is not None:
+                        try:
+                            self.group_names.schedule_fetch(adapter, name, sid, client, logger)
+                        except Exception:
+                            pass
+                        continue          # 这次先跳过，等下一轮缓存里有值再写
+                else:
+                    if self.identities is not None:
+                        new_title = self.identities.lookup(name, sid)
+                if not new_title or str(new_title) == sid:
+                    continue
+                key = f"{name}:{stype}:{sid}"
+                # 二次确认：写之前再看一眼，确保名字仍是 openid（防覆盖用户改动）
+                try:
+                    cur = mgr.get_session_info(key)
+                    cur_title = str(getattr(cur, "session_title", "") or "")
+                    if cur_title and cur_title != sid:
+                        continue
+                except Exception:
+                    pass
+                mgr.update_session_info(key, title=str(new_title))
+                fixed += 1
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 会话名回填失败（%s）: %s", sid, exc)
+        if fixed:
+            logger.info("[QQBOT-BRIDGE] %s: 已把 %d 个会话的名字补成中文", name, fixed)
 
     def _group_name_for(self, adapter_name: str, adapter, group_id: str, client) -> str:
         """取群名；没有就顺手丢一个后台任务去拉，并保持 openid（不阻塞）。"""
