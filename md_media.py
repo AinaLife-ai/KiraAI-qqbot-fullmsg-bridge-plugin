@@ -521,6 +521,15 @@ async def _upload_bytes_to_qq(
     if api is None or not data:
         return None
 
+    # ★ 平台上传接口只收 png/jpg：GIF/WEBP 直传会被拒（850019）⇒ 先规范化
+    try:
+        from media_types import normalize_image_data
+
+        data, name, _note = normalize_image_data(data, name or "image.png", logger)
+    except Exception:
+        pass
+    if not data:
+        return None
     size = len(data)
     name = name or "image.png"
     md5 = hashlib.md5(data).hexdigest()

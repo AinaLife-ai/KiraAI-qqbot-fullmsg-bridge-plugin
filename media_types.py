@@ -143,8 +143,85 @@ def _guess_name(element: Any) -> str:
     return str(getattr(element, "file", "") or "")
 
 
+# --------------------------------------------------------------------------- #
+# 图片格式规范化（★ 2026-10-09：GIF 被平台拒，实测 850019）
+# --------------------------------------------------------------------------- #
+#: 官方「文件类型与限制」表里 `file_type=1 图片` 只列 **png / jpg**；
+#: 概览页虽然写"支持 jpg/png/gif/webp/bmp"，但**实测 GIF 直传会被拒**：
+#:     400 {'code': 850019, 'message': '富媒体文件格式不支持'}
+#: ⇒ 上传前把平台不认的格式（gif/webp/bmp/tiff/…）**转成 PNG** 再传。
+_QQ_OK_FORMATS = ("png", "jpeg")
+
+_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"BM", "bmp"),
+)
+
+
+def sniff_image_format(data: bytes) -> str:
+    """按**字节魔数**判断图片格式（认不出返回空串）。"""
+    head = data[:16] if data else b""
+    for magic, fmt in _MAGIC:
+        if head.startswith(magic):
+            return fmt
+    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def normalize_image_data(data: bytes, name: str = "", logger_: Any = None):
+    """把平台不认的图片格式转成 PNG。返回 ``(data, name, note)``。
+
+    * 已经是 png/jpeg ⇒ **原样返回**（零开销，绝不动用户内容）；
+    * gif / webp / bmp / 其它 ⇒ 用 Pillow 转 PNG（**动图只取第一帧** —— QQ 的上传接口
+      根本不收 GIF，这是平台限制，不是我们偷懒）；转不了就原样返回，上层照旧会失败但日志会说明。
+    """
+    fmt = sniff_image_format(data)
+    if fmt in _QQ_OK_FORMATS:
+        return data, name, ""
+    if not data:
+        return data, name, ""
+    try:
+        import io
+
+        from PIL import Image as _PILImage
+
+        with _PILImage.open(io.BytesIO(data)) as im:
+            frames = getattr(im, "n_frames", 1)
+            if frames > 1:
+                im.seek(0)                     # 动图取第一帧
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGBA")
+            buf = io.BytesIO()
+            im.save(buf, "PNG", optimize=True)
+            out = buf.getvalue()
+        new_name = (os.path.splitext(name or "image")[0] or "image") + ".png"
+        note = (f"{fmt or '未知'} → png"
+                + ("（动图只发第一帧：QQ 上传接口不收 GIF）" if frames > 1 else ""))
+        if logger_ is not None:
+            logger_.info(
+                "[QQBOT-BRIDGE] 图片格式已规范化：%s（%s，%d 字节 → %d 字节）"
+                "—— 平台的上传接口只接受 png/jpg，GIF/WEBP 直传会被拒（850019）",
+                note, os.path.basename(name or "?"), len(data), len(out),
+            )
+        return out, new_name, note
+    except Exception as exc:
+        if logger_ is not None:
+            logger_.warning(
+                "[QQBOT-BRIDGE] 图片格式 %s 平台可能不收，但转 PNG 失败（%s: %s）—— 按原样上传",
+                fmt or "未知", type(exc).__name__, str(exc)[:100],
+            )
+        return data, name, ""
+
+
 #: 只提示一次：模型把音频用 `<file>`（而非 `<file type="record">`）发出来
 _AUDIO_AS_FILE_LOGGED = False
+
+#: 只提示一次：每种 file_type 首次上传的"字节头部"自检
+_HEAD_LOGGED: set = set()
 
 #: 只提示一次：每种 file_type 实际发出的上传体形状（排查"平台为什么不认"的关键信息）
 _SHAPE_LOGGED: set = set()
@@ -337,9 +414,21 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         try:
             return await _upload(target_id, media_element, is_group, want)
         except Exception as exc:
+            # ★★★ 这一条**必须是 WARNING**（原来在 debug，等于没有）：
+            #   "媒体按语音上传失败 ⇒ 交回核心按文件发" 正是"语音变成文件卡片"的现场，
+            #   而日志里看不到它时，用户只能看到一张文件卡片、查无可查（2026-10-09 踩到）。
             if logger is not None:
-                logger.debug("[QQBOT-BRIDGE] 按 file_type=%s 上传失败，交回原逻辑: %s",
-                             want, exc)
+                try:
+                    _hint = humanize_upload_error(exc)
+                except Exception:
+                    _hint = ""
+                logger.warning(
+                    "[QQBOT-BRIDGE] 按 file_type=%s 上传失败（%s: %s）%s"
+                    " —— 已交回核心逻辑（多半会降级成**文件卡片**，不是语音条）。"
+                    "请把这条连同上面的错误码一起反馈",
+                    want, type(exc).__name__, str(exc)[:180],
+                    ("\n    → " + _hint) if _hint else "",
+                )
             return await _orig(target_id, media_element, is_group)
 
     async def _upload(target_id, media_element, is_group, file_type):
@@ -380,9 +469,10 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
                 #   ⇒ 先直传试一次；被平台拒了下面会自动再试一次转码（见 _retry_as_silk）。
                 _pending_silk_retry = True
                 if logger is not None:
-                    logger.info(
-                        "[QQBOT-BRIDGE] 没有可用的 silk 编码器 —— 该音频（%s）先按官方"
-                        "支持的格式直传一次；若被平台拒，会再尝试转 silk",
+                    logger.warning(
+                        "[QQBOT-BRIDGE] 该音频（%s）不是有效 silk，且**没有可用的 silk 编码器** "
+                        "⇒ 只能原样直传，平台大概率把它降级成**文件卡片**（不是语音条）。"
+                        "修复：pip install silk-python imageio-ffmpeg",
                         os.path.splitext(_elem_name or "")[1] or "?",
                     )
             else:
@@ -415,6 +505,13 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         # 有转码产物就用它；否则用元素自己的路径
         file_path = silk_path or await media_element.to_path()
         data = await asyncio.to_thread(Path(file_path).read_bytes)
+        _up_name = os.path.basename(silk_path) if silk_path else _guess_name(media_element)
+        if file_type == FT_IMAGE:
+            # ★ GIF/WEBP 直传会被平台拒（850019）⇒ 先规范化成 PNG
+            data, _new_name, _note = await asyncio.to_thread(
+                normalize_image_data, data, _up_name, logger)
+            if _note:
+                _up_name = _new_name
         payload: dict = {
             "file_type": file_type,
             "file_data": base64.b64encode(data).decode("ascii"),
@@ -440,7 +537,7 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         #   ⇒ 我们原来给**语音**也带文件名（`jbf_v2.silk`），而用户看到的正是
         #     **文件卡片 + 那个文件名**。给语音带名字属于超出文档约定的用法，
         #     按官方口径对齐：非 FILE 一律不带。（图片/视频同理，一并去掉。）
-        name = os.path.basename(silk_path) if silk_path else _guess_name(media_element)
+        name = _up_name
         if file_type == FT_FILE and name:
             payload["file_name"] = os.path.basename(name.split("?")[0])
         # 一次性诊断：把"我们到底发了什么形状的体"写进日志（不含 file_data）
@@ -475,6 +572,14 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
                 if retried is not None:
                     return retried
             raise
+        if logger is not None and file_type not in _HEAD_LOGGED:
+            _HEAD_LOGGED.add(file_type)
+            logger.info(
+                "[QQBOT-BRIDGE] 媒体上传自检：file_type=%s 字节=%s 头部=%s 文件名=%s"
+                "（语音条要求 file_type=3 且内容为 silk：腾讯系头 \\x02 或标准头 #!SILK_V3）",
+                file_type, len(data), data[:12].hex(),
+                payload.get("file_name") or "（未发文件名）",
+            )
         if logger is not None:
             _fi = result.get("file_info") if isinstance(result, dict) else getattr(result, "file_info", None)
             logger.info(

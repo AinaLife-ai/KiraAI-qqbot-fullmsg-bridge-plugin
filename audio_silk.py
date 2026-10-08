@@ -456,10 +456,16 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
     #   **多半只是把 ogg/mp3 改了个名**。这种情况绝不能原样发 ——
     #   QQ 会（不报错地）把它降级成**文件卡片**。下面按普通音频重新编码。
     if path.lower().endswith(_SILK_EXT) and logger_ is not None:
+        try:
+            with open(path, "rb") as _f:
+                _head = _f.read(12).hex()
+        except Exception:
+            _head = "?"
         logger_.warning(
-            "[QQBOT-BRIDGE] %s 扩展名是 silk，但内容不是 silk（前几字节不是 "
-            "#!SILK_V3）—— 多半只是改了个名；将按普通音频重新编码成语音条",
-            os.path.basename(path),
+            "[QQBOT-BRIDGE] %s 扩展名是 silk，但**内容不是 silk**（前 12 字节=%s）——"
+            "多半只是改了个名（或编码器产出的不是 QQ 认的格式）。"
+            "接下来会按普通音频重新编码成语音条；**若编码器不可用，这条只能以文件卡片发出**",
+            os.path.basename(path), _head,
         )
     try:
         if os.path.getsize(path) > _MAX_SOURCE_BYTES:
@@ -480,8 +486,10 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
     if not silk_available():
         if logger_ is not None:
             logger_.warning(
-                "[QQBOT-BRIDGE] 未安装 pilk / imageio-ffmpeg，无法把音频转成语音条 —— "
-                "本条按「文件」发送。装好后即可自动转（插件已在 requirements.txt 声明）",
+                "[QQBOT-BRIDGE] ★ 缺少语音转码依赖，这条发不成语音条 —— "
+                "需要 silk 编码器（pysilk/pilk 之一）**和** ffmpeg（系统的或 imageio-ffmpeg）。"
+                "修复：pip install silk-python imageio-ffmpeg（或让 KiraAI 的插件依赖安装重跑一次）。"
+                "装好后本插件会自动转码，无需任何配置",
             )
         return None
 

@@ -300,6 +300,42 @@ async def main():
     check("★ 链已还原成第三方元素", type(chain_plus[1]).__name__ == "StickerPlus",
           type(chain_plus[1]).__name__)
 
+    print("\n[5e] ★★★ GIF 表情包：平台拒收 GIF（850019）⇒ 上传前转成 PNG")
+    gif_b64 = None
+    try:
+        import io as _io
+
+        from PIL import Image as _PIL
+
+        frames = [_PIL.new("RGB", (8, 8), (255, 0, 0)),
+                  _PIL.new("RGB", (8, 8), (0, 255, 0))]
+        buf = _io.BytesIO()
+        frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], duration=100)
+        gif_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as exc:
+        print(f"  skip  没有 Pillow，跳过 GIF 用例（{exc}）")
+
+    if gif_b64:
+        sent.clear()
+        ch_gif = MessageChain([Text("gif 的"), Sticker("9", sticker=gif_b64, caption="动图")])
+        await ad.send_group_message("G1", ch_gif)
+        up_gif = [x["__upload__"] for x in sent if "__upload__" in x]
+        data_up = base64.b64decode(up_gif[-1].get("file_data") or "") if up_gif else b""
+        check("★★★ GIF 被转成 PNG 再上传（平台只收 png/jpg，GIF 直传=850019）",
+              data_up[:8] == b"\x89PNG\r\n\x1a\n", data_up[:12].hex())
+        check("★ file_type 仍是 1（图片）", bool(up_gif) and up_gif[-1].get("file_type") == 1)
+        check("★ 上传的不是原始 GIF 字节",
+              bool(gif_b64) and data_up != base64.b64decode(gif_b64))
+        check("★ 链已还原", type(ch_gif[1]).__name__ == "Sticker")
+
+        print("\n[5f] 已经 OK 的格式（png/jpg）**原样上传**，不做多余转换")
+        sent.clear()
+        ch_png = MessageChain([Sticker("10", sticker=STICKER_B64)])
+        await ad.send_group_message("G1", ch_png)
+        up_png = [x["__upload__"] for x in sent if "__upload__" in x]
+        check("★★ PNG 一个字节都没动",
+              bool(up_png) and base64.b64decode(up_png[-1].get("file_data") or "") == PNG)
+
     print("\n[6] ★ 关掉插件 ⇒ 类型清单恢复原样")
     p._restore_all()
     check("★ sticker 已从清单里移除", "sticker" not in (supported_list() or []),

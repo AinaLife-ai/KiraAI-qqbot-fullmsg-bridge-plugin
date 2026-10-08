@@ -43,5 +43,10 @@
 silk-python>=0.2.8      ; python_version >= "3.8"
 pilk>=0.2.4             ; python_version < "3.12"
 
-# ② ffmpeg（带静态二进制的 pip 包；**系统已有 ffmpeg 时会优先用系统的**）
+# ② 图片格式规范化（把 GIF/WEBP 转成 PNG）—— 平台上传接口只收 png/jpg，
+#    GIF 直传实测会被拒：400 850019 富媒体文件格式不支持。
+#    没有 Pillow 时插件不会报错，只是这类图片仍会失败（日志会说明）。
+Pillow>=9.0.0
+
+# ③ ffmpeg（带静态二进制的 pip 包；**系统已有 ffmpeg 时会优先用系统的**）
 imageio-ffmpeg>=0.5.1

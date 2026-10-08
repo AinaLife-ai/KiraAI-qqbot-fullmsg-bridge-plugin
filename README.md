@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.7
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -452,6 +452,62 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.8</b> — ★★★ GIF 表情包转 PNG + 语音排障（日志级别/启动横幅）+ 输入中序号修正</summary>
+
+### 1. ★★★ GIF：**官方上传接口只收 png/jpg**，实测 GIF 被拒
+
+用户实测（日志）：
+
+```
+POST /v2/users/{openid}/files → 400
+{'message': '富媒体文件格式不支持', 'code': 850019}
+```
+
+**文档自相矛盾，以上传接口为准**：概览页写「图片：支持 jpg/png/gif/webp/bmp」，但
+**上传接口文档**（单聊/群聊富媒体上传）写的是「`1=图片(png/jpg)`」。
+
+**三家官方/官方推荐实现都不做图片格式转换**（都查过源码）：
+
+| 实现 | 图片走的链路 | 遇到 GIF |
+|---|---|---|
+| 官方 Node SDK `@tencent-connect/qqbot-nodejs` | `MediaApi.uploadMedia` 原样 base64 上传（SDK 里**只有音频转换**，没有任何图片转换） | 一样失败 |
+| 官方 openclaw-qqbot | 走同一个 SDK | 一样失败 |
+| QQ 官方推荐的 Hermes | `send_image_file` → `_send_media` → `_upload_local_file` **原样上传，无格式校验/转换** | 一样失败 |
+
+⇒ **我们的做法比它们都进一步**：上传前把平台不认的格式（**gif / webp / bmp / 其它**）
+转成 **PNG** 再传（Pillow，**动图取第一帧**并如实打日志）；**png/jpg 一个字节都不动**。
+（新增依赖声明 `Pillow`；没装时不会报错，只是这类图仍会失败且日志会说明。）
+
+> 想发**动图**：把它放到公网 URL，用 markdown 图片 `![](url)` 发 —— md 图片是
+> 平台自己下载转存（另一条链路），不受上传接口的 png/jpg 限制。
+
+### 2. ★★ 语音排障：日志级别修正 + 启动横幅 + 字节自检
+
+* 「按 `file_type=3` 上传失败 ⇒ 交回核心按文件发」这条原来在 **debug 级别**（等于没有）
+  ⇒ 改成 **WARNING** 并附上**错误码人话**（`850019`/`40093002`/`850026`…）。
+  这正是"语音变成文件卡片"的现场 —— 之前**查无可查**就是因为它没露头。
+* 新增**启动横幅**（每次挂载打一行）：**版本号 + silk 编码器/ffmpeg/Pillow 是否就位**
+  ⇒ 一眼确认"跑的是哪版""语音依赖缺不缺"。
+* 每种 `file_type` 首次上传会打一条**字节自检**（头部 hex + 大小 + file_type + 有没有带文件名）。
+
+> 语音的查证结论（三家一致，**没有第二条路**）：**必须先把音频变成 silk** ——
+> openclaw 用 `silk-wasm`（我们实测它的产物头是 `\x02#!SILK_V3`，与我们的腾讯系判定**完全一致**），
+> Hermes 则要求上游直接给出 silk 并**原样上传**。本插件已内置
+> 「ffmpeg 解码 → pysilk/pilk 编码」自动转码；**依赖缺失时日志会直接给出安装命令**
+> （`pip install silk-python imageio-ffmpeg`）。
+
+### 3. ★ 输入中状态：序号接进框架自己的序列
+
+原来用独立编号（1000+）；现在改为**读框架的 `msg_seq` 计数器、用掉一格、再写回去**
+（官方 Node SDK 就是"同一个计数器供所有发送共用"）。这样状态帧与正式回复处在
+**同一条递增序列**上，不可能互相踩（平台对同一 `msg_id` 是有去重的：`40054005`）。
+
+> 顺带说明：**它显示在聊天顶部的标题下方**（「正在输入…」），
+> 不是机器人名字下面那个「在线」——「在线」是在线状态，跟这个能力无关。
+
+</details>
+
+<details>
 <summary><b>v1.6.7</b> — ★★★ 让官 bot 能发**表情包**（框架内置插件的 `<sticker>` 标签）</summary>
 
 ### 现象（用户日志）
