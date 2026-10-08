@@ -1,19 +1,47 @@
 # QQ 官方 bot 语音条（silk）所需依赖 —— 由 KiraAI 插件加载器自动安装。
 #
-# 为什么需要这两个（2026-10-08 查证）：
-#   ★ **ffmpeg 只能解码 silk，不能编码**（实测 `ffmpeg -encoders | grep silk` 为空）。
-#     Silk 是 Skype 的专有编解码器，编 silk 必须用专门的实现 ⇒ 用 `pilk`
-#     （纯绑定，官方带 Windows 预编译 wheel）。
-#   ★ pilk 只接受 **PCM** 输入 ⇒ 还要有个东西把 mp3/wav/ogg 解成 PCM。
-#     用户机器上没有系统 ffmpeg（`where ffmpeg` 失败），所以用
-#     `imageio-ffmpeg` —— 它把一份**静态 ffmpeg 二进制**一起打包进 wheel，
-#     `pip install` 就有，不需要用户自己装、不需要管理员权限。
+# ══════════════════════════════════════════════════════════════════════════
+# ★ 为什么需要这些（2026-10-08 查证 + 实测）
+# ══════════════════════════════════════════════════════════════════════════
 #
-# 两个包都有 Windows / macOS / Linux 的预编译 wheel（pilk 覆盖 cp36–cp311），
-# 无需编译工具链。
+# **ffmpeg 本身压不出 silk**：
+#     ffmpeg -encoders | grep silk   →  空
+#     ffmpeg -decoders | grep silk   →  空
+#     ffmpeg ... -c:a silk out.silk  →  Unable to choose an output format
+#   Silk 是 Skype 的专有编解码器，ffmpeg **只能解、不能编**。
 #
-# 说明：这两个只在「要发语音条且源文件不是 silk」时才会用到；
-# 缺了也不影响其它功能（会自动退回"按文件发送"，见 audio_silk.py）。
+# 所以链路必须分两步：
+#
+#     mp3/wav/ogg ──① 解码成 PCM──> PCM ──② 编码成 silk──> silk
+#
+#   ① 用 ffmpeg（见下面 imageio-ffmpeg；系统已有 ffmpeg 时**优先用系统的**）
+#   ② 用下面这几个 silk 编码器之一
+#
+# ── 关于 silk 编码器的选择（这里踩过坑）───────────────────────────────
+#
+# 原来只写了 `pilk`，但它的 Windows wheel **只到 cp311**（36/37/38/39/310/311）。
+# 用 Python 3.12+ 的机器（例如 KiraAI 自带的 3.13）pip 会去**编译源码**，
+# 而 Windows 上编译需要 Visual C++ Build Tools ⇒ 报错：
+#
+#     error: Microsoft Visual C++ 14.0 or greater is required.
+#     ERROR: Failed building wheel for pilk
+#
+# ⇒ 现在**首选 `silk-python`**，它的 wheel 覆盖 **cp38–cp314**（含 cp313），
+#    在 py3.12/3.13 上**直接装预编译包，不需要编译器**。
+#    它同样是 `silk-v3-decoder` 的绑定（支持腾讯系 silk）。
+#
+# 三个后端都留着，代码会自动选**能用的那个**（见 audio_silk.py）：
+#     1) silk-python（pysilk）—— wheel 覆盖最广，**首选**
+#     2) pilk                 —— 老牌，cp311 及以下可用
+#     3) silk_v3_encoder      —— 外部可执行文件（如果用户自己装了）
+#
+# 注意：这几个**不是硬依赖** —— 全装不上时插件会**自动退回「按文件发送」**，
+#       功能降级但绝不报错、绝不丢消息。
+# ──────────────────────────────────────────────────────────────────────
 
-pilk>=0.2.4
+# ① silk 编码器（三选一即可，优先第一个）
+silk-python>=0.2.8      ; python_version >= "3.8"
+pilk>=0.2.4             ; python_version < "3.12"
+
+# ② ffmpeg（带静态二进制的 pip 包；**系统已有 ffmpeg 时会优先用系统的**）
 imageio-ffmpeg>=0.5.1

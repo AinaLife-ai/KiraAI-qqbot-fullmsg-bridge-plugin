@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.5
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,76 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.6</b> — ★ 修掉装不上的根因（pilk 只到 cp311）+ md 图片补尺寸后缀</summary>
+
+### 1. ★ 语音条装不上的真因：`pilk` 的 wheel 只到 cp311
+
+你的日志：
+
+```
+Building wheel for pilk (pyproject.toml) did not run successfully.
+error: Microsoft Visual C++ 14.0 or greater is required.
+ERROR: Failed building wheel for pilk
+```
+
+根因：**`pilk` 的 Windows 预编译包只覆盖 cp36–cp311**。
+你的 KiraAI 跑在 **Python 3.13**，pip 找不到匹配的 wheel ⇒ 去**编译源码** ⇒
+Windows 编译需要 MSVC ⇒ 直接失败。
+
+**修法**：换成 **`silk-python`（导入名 `pysilk`）** ——
+它的 wheel 覆盖 **cp38–cp314**（**含 cp313**），
+**装预编译包即可，完全不需要编译器**。
+它同样是 `silk-v3-decoder` 的绑定（支持腾讯系 silk）。
+
+现在**三个后端自动选**（哪个能用用哪个）：
+
+| 后端 | wheel 覆盖 | 说明 |
+|------|-----------|------|
+`pysilk`（silk-python） | **cp38–cp314** | **首选**，py3.12+ 不用编译 |
+`pilk` | cp36–cp311 | 老牌，低版本 Python 可用 |
+`silk_v3_encoder` | 外部可执行文件 | 用户自己装了就用 |
+
+全装不上时**自动退回「按文件发送」**，功能降级但不报错、不丢消息。
+
+### 2. ★ md 图片补上**尺寸后缀**（`![alt #0 #0](url)`）
+
+查证了三个来源，**图片示例全都带尺寸**：
+
+* QQ 官方文档「图片」节**唯一**的示例：`![text #208px #320px](…)`
+* 官方 markdown 模板示例：`![img#618px #249px]({{.image}})`
+* Koishi 论坛实践者：「图片可以使用 **`![img#0 #0]`** 进行自动缩放」
+
+而我们现在生成的是 `![香香立绘](url)` —— **没有尺寸**。
+QQ 的渲染器拿不到布局信息时，表现就是**只渲染出 alt 文字**
+（标题/换行都正常，唯独图片变成 `[香香立绘]` —— 和你截图完全一致）。
+
+**修**：替换 URL 时自动补 `#0 #0`（= 按原图自动缩放，不需要真去读图片尺寸）。
+模型**已经写了尺寸就不动**它。
+
+```
+![香香立绘](data/temp/x.jpg)
+   ↓
+![香香立绘 #0 #0](https://cos.xxx/xxx?sign=...)
+```
+
+md 正文仍然**零改动**（只动图片的 alt 尺寸后缀与 URL）。
+
+### 3. 顺带
+
+* `audio_silk` 支持三个后端 + 结果缓存；
+* 测试断言改为**归一化比较**（允许"URL + 尺寸"这两个已知差异）。
+
+### 新增测试
+
+`tests/audit_silk_backends.py`(9)：三个后端的选择与调用参数、
+两个都没有时优雅降级。
+`tests/audit_md_img_size.py`(6)：尺寸补全（含官方两种写法都不覆盖）。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.5</b> — 性能与健壮性：ffmpeg 获取方式对齐老插件 + 图片并行 + 总预算 + 临时文件不再泄漏</summary>
 
 ### 1. ffmpeg 的获取方式（对照 `KiraAI_video_comprehension_plugin` 改进）

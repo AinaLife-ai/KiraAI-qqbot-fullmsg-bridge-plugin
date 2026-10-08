@@ -59,6 +59,35 @@ _MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*
 #: 判定"这已经是公网地址"，不需要转存
 _REMOTE_RE = re.compile(r"^https?://", re.I)
 
+#: QQ 的 markdown 图片**尺寸后缀**：`alt #宽 #高`（可以是 px，也可以只写数字）。
+#: 官方两个示例都带它：`![text #208px #320px]`、`![img#618px #249px]`。
+_SIZE_RE = re.compile(r"#[^#\]]*(?:px)?\s*#[^#\]]*(?:px)?\s*$")
+
+#: 默认尺寸：`#0 #0` = **按原图自动缩放**
+#: （Koishi 论坛实践者给的写法：「图片可以使用 ![img#0 #0] 进行自动缩放」）
+_DEFAULT_SIZE = "#0 #0"
+
+
+def _ensure_size(alt: str) -> str:
+    """给图片 alt 补上 QQ 要求的**尺寸后缀**（已有就不动）。
+
+    ★ 为什么必须补（2026-10-08 查证）：
+
+    * QQ 官方 markdown 文档里，图片那节**唯一的示例**是带尺寸的：
+      `![text #208px #320px](…)`；
+    * 模板示例同样是 `![img#618px #249px]({{.image}})`；
+    * Koishi 论坛实践者写得最清楚：「图片可以使用 **`![img#0 #0]`** 进行自动缩放」。
+
+    缺了尺寸，QQ 的渲染器拿不到布局信息 ⇒ 表现就是**只渲染出 alt 文字**
+    （用户实测：md 的标题/换行都正常，唯独图片位置变成 `[香香立绘]`）。
+
+    `#0 #0` 表示"按原图尺寸自动缩放"，不需要我们真的去读图片尺寸。
+    """
+    a = (alt or "").rstrip()
+    if _SIZE_RE.search(a):
+        return a                      # 模型已经写了尺寸 ⇒ 尊重它
+    return (a + " " + _DEFAULT_SIZE).strip()
+
 _MIME_BY_EXT = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
@@ -554,7 +583,7 @@ async def fix_markdown_images(
         new_url = new_urls.get(i, url)
         if new_url != url:
             changed += 1
-        out.append(f"![{alt}]({new_url})")
+        out.append(f"![{_ensure_size(alt)}]({new_url})")
         last = m.end()
     out.append(md_text[last:])
 
