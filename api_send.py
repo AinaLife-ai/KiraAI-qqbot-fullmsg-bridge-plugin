@@ -174,6 +174,13 @@ class ApiSendPatcher:
                     "[QQBOT-BRIDGE] markdown 内图片已换成公网可访问地址"
                     "（QQ 只认公网 URL，本地路径会退化成 alt 文字）"
                 )
+            # ★ 诊断：把**最终要发出去的 markdown** 原样记一条（图片相关时才记）。
+            #   线上排查图片问题时，"我们到底发了什么"是最关键的信息，
+            #   而之前日志里完全没有 —— 只能靠猜（2026-10-08 教训）。
+            if "![" in out and not flags.get("md_final_logged"):
+                flags["md_final_logged"] = True
+                self.logger.info(
+                    "[QQBOT-BRIDGE] 本条 markdown 实际内容（含图片地址）：\n%s", out)
             return out
         except Exception as exc:
             self.logger.debug("[QQBOT-BRIDGE] markdown 图片处理失败（原样发送）: %s", exc)

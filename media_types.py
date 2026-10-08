@@ -172,6 +172,24 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         #   转不了（缺依赖 / 解码失败）就**退回 file_type=4 按文件发** ——
         #   宁可降级成文件，也绝不失败。
         silk_path = None
+        _orig_kind = getattr(media_element, "_kira_bridge_orig_kind", None)
+        _elem_name = _guess_name(media_element)
+        _elem_size = None
+        try:
+            _p = await media_element.to_path()
+            if _p and os.path.isfile(_p):
+                _elem_size = os.path.getsize(_p)
+        except Exception:
+            pass
+        # ★ 诊断：让用户（和排查的人）能一眼看到"到底按什么类型、发哪个文件"。
+        #   之前线上出问题完全看不到这些，只能猜（2026-10-08 教训）。
+        if logger is not None:
+            logger.info(
+                "[QQBOT-BRIDGE] 发送媒体：原始类型=%s 文件=%s 大小=%s 计划 file_type=%s",
+                _orig_kind or type(media_element).__name__,
+                _elem_name or "?", f"{_elem_size}B" if _elem_size else "?",
+                file_type,
+            )
         if file_type == FT_RECORD:
             got = await maybe_convert_to_silk(media_element, logger)
             if got == KEEP_AS_IS:
@@ -216,7 +234,27 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         else:
             payload["openid"] = target_id
             route = Route("POST", "/v2/users/{openid}/files", openid=target_id)
-        return await api._http.request(route, json=payload)
+        # ★ 上传结果也记一条：成功/失败都要看得见（否则线上只能靠猜）。
+        #   失败时把平台的原始响应也带出来 —— 像 `500 call inner proxy error`
+        #   这种是**平台侧**的问题，有日志才能一眼分清是谁的锅。
+        try:
+            result = await api._http.request(route, json=payload)
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(
+                    "[QQBOT-BRIDGE] 媒体上传失败（file_type=%s，文件=%s）：%s: %s",
+                    file_type, os.path.basename(str(file_path)),
+                    type(exc).__name__, str(exc)[:200],
+                )
+            raise
+        if logger is not None:
+            _fi = result.get("file_info") if isinstance(result, dict) else getattr(result, "file_info", None)
+            logger.info(
+                "[QQBOT-BRIDGE] 媒体上传完成：file_type=%s 文件=%s → %s",
+                file_type, os.path.basename(str(file_path)),
+                "拿到 file_info" if _fi else f"响应异常 {str(result)[:120]}",
+            )
+        return result
 
     setattr(_upload_file, "_kira_bridge_ftype", True)
     setattr(_upload_file, "_kira_bridge_orig", current)

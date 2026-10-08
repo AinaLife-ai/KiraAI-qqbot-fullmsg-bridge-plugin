@@ -170,9 +170,11 @@ async def main():
     M.clear_caches()
     remote_calls = {"n": 0}
 
-    async def fake_remote_upload(client, tid, isg, url, logger=None, timeout=30.0):
+    async def fake_remote_upload(client, tid, isg, url, logger=None, timeout=30.0,
+                                 want_size=False):
         remote_calls["n"] += 1
-        return "https://cos.example.com/converted.png?sign=qqq"
+        r = "https://cos.example.com/converted.png?sign=qqq"
+        return (r, (300, 180)) if want_size else r
     M.upload_remote_to_public_url = fake_remote_upload
     md_r = "![香香](https://storage.moegirl.org.cn/moegirl/commons/3/39/Luka_v4x_final.png)\n"
     out_r = await M.fix_markdown_images(md_r, client=None, target_id="G1", is_group=True)
@@ -186,8 +188,9 @@ async def main():
     print("\n[3c] 转存失败 ⇒ 退回验真，仍然不许丢内容")
     M.clear_caches()
 
-    async def fail_remote(client, tid, isg, url, logger=None, timeout=30.0):
-        return None
+    async def fail_remote(client, tid, isg, url, logger=None, timeout=30.0,
+                          want_size=False):
+        return (None, None) if want_size else None
     M.upload_remote_to_public_url = fail_remote
 
     async def ok_resolve(client, url, logger=None, timeout=12.0):

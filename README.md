@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.6
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.9
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,216 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.9</b> — ★★★ 挖到语音条的根：**腾讯系 silk 头 `\x02`**（缺了 QQ 就当文件发）</summary>
+
+### 从 silk 编码器源码里挖出的**确切差异**
+
+读了 `silk-v3-decoder` 的 `Encoder.c`，`-tencent` 到底做了什么终于清楚了：
+
+```c
+// ① 开头：腾讯系**多写一个 0x02 字节**
+if (tencent) {
+    static const char Tencent_break[] = "\x02";
+    fwrite(Tencent_break, 1, 1, bitOutFile);
+}
+fwrite("#!SILK_V3", ...);
+
+// ② 结尾：非腾讯系多写一个 0x00（腾讯系不写）
+if (!tencent) {
+    fwrite(&nBytes, 2, 1, bitOutFile);
+}
+```
+
+⇒ **腾讯系 = `\x02` + `#!SILK_V3` …**
+   **标准系 = `#!SILK_V3` … + `\x00`**
+
+**这不是"可选优化"，是 QQ 认不认的分水岭**：
+用标准系产出的 silk，QQ 会**当成文件**发 —— 显示成**文件卡片**而不是语音条。
+
+### 这解释了你遇到的现象
+
+你的 bot 用 `silk-wasm` 压 silk，而它的 API 是：
+
+```ts
+function encode(input, sampleRate): Promise<EncodeResult>
+                ^^^^^^  ^^^^^^^^^^   ← 只有两个参数，**没有 tencent 选项**
+```
+
+⇒ 产出的是**标准系 silk**（`#!SILK_V3` 开头，无 `\x02`）
+⇒ **QQ 不认** ⇒ 你看到的就是**文件卡片**。
+
+### 本版：加一道**保险**（每次都在这里校验）
+
+不管用哪个后端，产物出来都过一遍 `_fix_tencent_header`：
+
+* 已是腾讯系（`\x02#!SILK_V3`）⇒ 不动；
+* **是标准系 ⇒ 自动补上 `\x02` 头**（并打日志说明）；
+* 头部乱码 ⇒ 判失败，本条按文件发送（不硬改）。
+
+这样**即便某个后端的默认值变了**（或用户自己接了个不兼容的编码器），
+我们也一定能发出**语音条**。
+
+> 顺带确认：我们用的 `pysilk`（silk-python）的 `tencent` 参数**默认就是 True**，
+> `pilk` 我们也显式传了 `tencent=True`，`silk_v3_encoder` 带 `-tencent`。
+> 三道保险 + 这一道校验。
+
+### 测试
+
+`tests/audit_silk_tencent_header.py`（5 断言）：
+
+* 腾讯系 ⇒ 判 True 且不改动；
+* **标准系 ⇒ 自动补 `\x02` 头**，且修完就是腾讯系；
+* 乱码 ⇒ 判 False（**不硬改**）；
+* 文件不存在 ⇒ 不抛异常。
+
+另有两个测试的"silk 魔数"断言更新为**腾讯系头**（`\x02#!SILK_V3`）。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
+<summary><b>v1.5.8</b> — ★★ 图片尺寸**必需且必须真实**（用户拿到了决定性证据）</summary>
+
+### 决定性证据
+
+用户给了一个**没装本插件**的 KiraAI 3.0 **成功显示图片**的例子 ——
+它用的正是 **QQ 官方文档里那个示例原样**：
+
+```
+![text #208px #320px](https://resource5-.../abcmouse_word_watch/markdown/building.png)
+             ^^^^^^^^^^ 官方示例本身就是带尺寸的
+```
+
+官方文档「图片」节的原话：
+
+> 图片：`![text #wpx #hpx](图片链接)` —— **必须带尺寸**，否则可能加载失败
+
+### 我踩过的两个坑（都在这一版收口）
+
+| 做法 | 结果 |
+|------|------|
+| `![alt](url)`（**不带尺寸**） | 只显示 `[alt 文字]` —— 图渲染不出来 |
+| `![alt #0 #0](url)`（**假尺寸**） | **连占位都没有** —— QQ 把它当真实的 0×0 像素 ⇒ 零尺寸 ⇒ 不可见 |
+| **`![alt #208px #320px](url)`（真实尺寸）** | ✅ **正常显示**（用户实测成功） |
+
+⇒ 结论很清楚：**尺寸是必需的，而且必须填图片的真实宽高**。
+
+### 本版实现
+
+替换图片 URL 时，**顺便把真实宽高读出来填进去**：
+
+* **本地图** → 用 Pillow 读（读不出则退回手写 PNG/JPEG/GIF/WEBP 文件头解析，零依赖）；
+* **远程图** → 转存时我们**本来就要把字节下载下来**，顺手算一次 —— **零额外开销**；
+  尺寸在**压缩之前**读，保证填的是原图真实宽高。
+
+**拿不到尺寸时保持原样（不加）** —— 宁可维持"有占位"的现状，
+也不能塞个假值把它变成"完全不可见"。
+
+```
+![香香立绘](data/temp/pic.png)
+   ↓
+![香香立绘 #300px #180px](https://cos.xxx/xxx?sign=...)
+```
+
+md 正文依旧**零改动** —— 只动图片的尺寸后缀与 URL。
+
+### 诊断日志
+
+```
+[QQBOT-BRIDGE] markdown 图片处理：共 1 张，1 张换成了公网地址，1 张补上了真实尺寸
+              （QQ 的 md 图片**必须**带 `#宽px #高px`，否则不渲染）
+```
+
+### 测试
+
+`tests/audit_md_img_real_size.py`（**10 断言**）：
+
+* PNG 各种尺寸（含 1×1、1600×900）读取正确；
+* JPEG / 本地文件读取正确；
+* 有真实尺寸 ⇒ 补 `#Wpx #Hpx`；
+* **拿不到尺寸 ⇒ 不加**（不塞假值）；
+* 模型已写尺寸 ⇒ 不动；0 尺寸 ⇒ 不加。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
+<summary><b>v1.5.7</b> — 撤销我上一版的错改（#0 #0 让图**完全消失**）+ 补诊断日志</summary>
+
+### ⚠️ 先说我的错
+
+v1.5.6 我给所有图片补了 `#0 #0` 尺寸后缀（依据是论坛上一句「可以用
+`![img#0 #0]` 自动缩放」）。**结果更糟**：
+
+| 版本 | 群里显示 |
+|------|---------|
+v1.5.5 及以前 | `![香香立绘](url)` → 显示 `[香香立绘]`（**至少有个占位**） |
+v1.5.6 | `![香香立绘 #0 #0](url)` → **什么都没有** |
+
+你的原话：「**md图片都没有占位符了**」—— 正是这个改动的结果。
+
+**推断**：QQ 把 `#0 #0` 当成**真实的 0×0 像素** ⇒ 图被渲染成零尺寸 ⇒ 完全不可见。
+那句话多半只适用于**模板插值**场景，不适用于自定义 `content`。
+
+### ✅ 本次回退
+
+**不猜了** —— `_ensure_size` 现在**原样返回 alt**：
+
+* 模型自己写了尺寸 → 尊重它，不动；
+* 模型没写 → **也不加**。
+
+要不要加、加多少，等有**确定性证据**再说。功能上不再擅自改动用户/模型的内容。
+
+### 补诊断日志（这次排查最大的障碍是"看不见"）
+
+之前线上出问题，日志里**看不到**「到底按什么类型发、发出去的 md 是什么」，
+所以只能靠猜（我前几轮就是这么走弯路的）。现在加了两条：
+
+```
+[QQBOT-BRIDGE] 发送媒体：原始类型=Record 文件=jbf_v2.silk 大小=123146B 计划 file_type=3
+[QQBOT-BRIDGE] 媒体上传完成：file_type=3 文件=jbf_v2.silk → 拿到 file_info
+[QQBOT-BRIDGE] 本条 markdown 实际内容（含图片地址）：
+<完整 md>
+```
+
+失败时也会记下**平台的原始响应**，例如：
+
+```
+[QQBOT-BRIDGE] 媒体上传失败（file_type=3，文件=jbf_v2.silk）：ServerError: ...
+```
+
+### 关于语音：你的日志给了两条硬信息
+
+1. **30 秒那条根本没发出去**：
+
+```
+[botpy] 请求 .../files  错误代码: 500
+        {'message': 'call inner proxy error', 'code': 850012}
+ERROR   Failed to upload QQ official media (ServerError)
+<msg message_id="">        ← 消息 ID 是空的
+```
+
+`850012 call inner proxy error` 是**平台侧的**错误（不是插件的问题）。
+但**它到底是怎么触发的，现在还判断不了** —— 是这份 silk 本身有问题、
+还是文件太大/太频繁，都缺乏证据。
+
+2. **60 秒那条发出去了，但是文件卡片** ⇒ 说明那次 `file_type` **不是 3**。
+
+⚠️ 这两条我都**还没能定论**。装上这一版后，日志里会有上面那两条诊断，
+届时就能一眼看清「类型对不对、文件是什么」。**请下次把新日志发我**，
+我按数据定位，不再靠推测。
+
+### 测试
+
+`audit_md_img_size.py` 改为断言**原样保留**（不再期望补尺寸）。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.6</b> — ★ 修掉装不上的根因（pilk 只到 cp311）+ md 图片补尺寸后缀</summary>
 
 ### 1. ★ 语音条装不上的真因：`pilk` 的 wheel 只到 cp311
