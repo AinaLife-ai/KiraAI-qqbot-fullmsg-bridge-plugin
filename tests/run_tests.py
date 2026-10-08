@@ -122,7 +122,8 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "audit_md_img_content_type.py", "audit_v3_nickname_fallback.py",
           "audit_upload_payload_shape.py", "audit_typing_indicator.py",
           "audit_stream_retry.py", "audit_c2c_stream.py",
-          "audit_llm_stream_bridge.py", "audit_sticker.py"]
+          "audit_llm_stream_bridge.py", "audit_sticker.py",
+          "audit_media_guard.py"]
 
 rc = 0
 for suite in SUITES:

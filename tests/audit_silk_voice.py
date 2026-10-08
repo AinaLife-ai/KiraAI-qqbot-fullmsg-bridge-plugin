@@ -64,6 +64,20 @@ def _enc(pcm_path, silk_path, pcm_rate=None, tencent=False):
 _fake.encode = _enc
 sys.modules["pilk"] = _fake
 
+# ★ 2026-10-09：把编码器探测**固定到桩 pilk**。开发机若真装了 pysilk
+#   （插件 requirements 里就有），优先探测会选中它 ⇒ 桩记录全空、断言失真。
+#   测试制品必须任何机器一致（见 tests/_env.py 的约定）。
+import importlib as _importlib
+
+def _pin_encoder():
+    try:
+        _m = _importlib.import_module("audio_silk")
+        _m._ENCODER_CACHE, _m._ENCODER_TRIED = "pilk", True
+    except Exception:
+        pass
+
+_pin_encoder()
+
 # ---- 测试素材 ----
 D = "/tmp/silktest"
 os.makedirs(D, exist_ok=True)
@@ -239,6 +253,7 @@ async def main():
     finally:
         import importlib
         importlib.reload(_asilk)
+        _pin_encoder()                      # reload 会重置探测缓存 ⇒ 重新固定到桩 pilk
         import media_types as _m2
         importlib.reload(_m2)
 

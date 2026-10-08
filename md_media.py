@@ -492,6 +492,113 @@ async def _call_part_finish(api: Any, route: Any, body: dict, *, label: str,
                 exc = exc2
 
 
+# --------------------------------------------------------------------------- #
+# ★★★ 动图策略（2026-10-09 新增）：候选链「原图 → APNG → 静态 PNG」
+# --------------------------------------------------------------------------- #
+#
+# 背景：平台上传接口只收 png/jpg，GIF 直传实测被拒（850019）；
+# 而官方文档又把 gif 列进了"图片"支持格式（`富媒体消息概述`：
+# 「支持 jpg/png/gif/webp/bmp 格式，发送后直接展示图片」）——口径矛盾。
+# APNG 是"魔数仍是 PNG"的保底（平台一定收），但**客户端是否播放动画不可控**
+# （用户实测：显示出来只有一帧）。
+# ⇒ 既然"哪个形态能真动"没人能打包票，就让**平台自己挑**：
+#   先试原始动图（唯一有机会真动的形态），被拒再 APNG、最后静态 PNG。
+#   每一级都写日志 —— 下次线上哪个通道能用，一眼可见。
+#   `md_gif_mode=static` 可回到"直接转存 APNG/PNG"的保守行为。
+
+#: 动图策略（由插件配置注入；auto=试原图优先 / static=直接转存）
+_MD_GIF_MODE = "auto"
+
+#: 原始动图被平台拒过（(md5) -> 时间戳）；10 分钟内不再重复试，
+#: 免得同一条动图每发一次就白撞一次 850019。有界（最多 64 条）。
+_RAW_GIF_REJECTED: dict = {}
+_RAW_GIF_REJECT_TTL = 600.0
+
+
+def set_md_gif_mode(mode: str) -> None:
+    """插件在初始化/巡检时注入动图策略（幂等）。
+
+    取值：
+      * ``auto``   —— 候选链「原图 → APNG → 静态 PNG」（默认；保证显示，动画看平台脸色）；
+      * ``url``    —— 远程动图**保留原始公网地址**（平台自己下载转存，绕开上传接口的
+                      格式限制；本地动图仍走候选链）；
+      * ``static`` —— 跳过原图直传，直接 APNG/静态 PNG（最保守）。
+    """
+    global _MD_GIF_MODE
+    m = str(mode or "auto").strip().lower()
+    _MD_GIF_MODE = m if m in ("auto", "url", "static") else "auto"
+
+
+def get_md_gif_mode() -> str:
+    return _MD_GIF_MODE
+
+
+def _count_frames(data: bytes) -> int:
+    """动图帧数（读不出来按 1 帧算）。"""
+    try:
+        import io
+
+        from PIL import Image as _PILImage
+
+        with _PILImage.open(io.BytesIO(data)) as im:
+            return int(getattr(im, "n_frames", 1) or 1)
+    except Exception:
+        return 1
+
+
+def _make_upload_candidates(data: bytes, name: str, logger: Any):
+    """按当前策略给出转存候选链：[(标签, bytes, 文件名), ...]。
+
+    * png/jpeg ⇒ 原样一条（零开销）；
+    * 动图（gif/webp 多帧）且 auto ⇒ 原图 → APNG → 静态 PNG（逐级退守）；
+    * 其它非 png/jpg（webp 静图 / bmp / …）⇒ 一次规范化（静态 PNG / 可转 APNG）。
+    """
+    try:
+        from media_types import normalize_image_data, sniff_image_format
+    except Exception:
+        return [("", data, name)]
+    fmt = sniff_image_format(data)
+    if fmt in ("png", "jpeg") or not data:
+        return [("", data, name)]
+
+    base_name = name or "image.png"
+    if fmt in ("gif", "webp") and _count_frames(data) > 1:
+        if _MD_GIF_MODE == "auto":
+            import hashlib as _h
+            import time as _t
+
+            key = _h.md5(data).hexdigest()
+            ts = _RAW_GIF_REJECTED.get(key, 0.0)
+            fresh = (_t.time() - ts) < _RAW_GIF_REJECT_TTL
+            cands = [] if fresh else [("原始动图（保动画优先）", data, base_name)]
+            apng, apng_name, _n1 = normalize_image_data(data, base_name, logger,
+                                                        allow_anim=True)
+            if apng is not data and not any(apng == c[1] for c in cands):
+                cands.append(("APNG（动图版 PNG）", apng, apng_name))
+            png, png_name, _n2 = normalize_image_data(data, base_name, logger,
+                                                      allow_anim=False)
+            if png is not data and not any(png == c[1] for c in cands):
+                cands.append(("静态 PNG（第一帧）", png, png_name))
+            return cands or [("", data, base_name)]
+        # static：跳过原图，直接 APNG → PNG
+        cands = []
+        apng, apng_name, _n1 = normalize_image_data(data, base_name, logger,
+                                                    allow_anim=True)
+        if apng is not data:
+            cands.append(("APNG（动图版 PNG）", apng, apng_name))
+        png, png_name, _n2 = normalize_image_data(data, base_name, logger,
+                                                  allow_anim=False)
+        if png is not data and not any(png == c[1] for c in cands):
+            cands.append(("静态 PNG（第一帧）", png, png_name))
+        return cands or [("", data, base_name)]
+
+    # 非动图：一次规范化（保持 v1.6.8 行为）
+    norm, nname, _note = normalize_image_data(data, base_name, logger)
+    if norm is data:
+        return [("", data, base_name)]
+    return [("PNG 规范化", norm, nname)]
+
+
 async def _upload_bytes_to_qq(
     client: Any, target_id: str, is_group: bool, data: bytes, name: str,
     logger: Any = None, file_type: int = 1,
@@ -505,34 +612,107 @@ async def _upload_bytes_to_qq(
         upload_part_finish（逐片确认）
         上传接口（带 upload_id）合并  →  file_info **+ raw_url**
 
-    官方原文：
-
-        raw_url  string  文件下载链接（COS 预签名 GET URL），有效期与 ttl 一致
-                 ★ 仅分片上传合并（upload_id 路径）且 file_type 为图片/视频/语音时返回；
-                   URL 直传和文件类型(file_type=4) 不返回此字段
+    ★ 2026-10-09：按「候选链」逐级退守（见 `_make_upload_candidates`）——
+    动图先试**原图**（有机会真动），被平台以格式为由拒收就换 APNG，再不行静态 PNG。
+    每个候选成功/被拒都会写日志，哪条路通、哪条路不通一清二楚。
 
     失败返回 None（调用方按原样发送，绝不会因此丢掉整条消息）。
     """
+    if not data:
+        return None
+    try:
+        api = getattr(client, "api", None)
+        if api is None:
+            return None
+    except Exception:
+        return None
+
+    candidates = await asyncio.to_thread(_make_upload_candidates, data, name, logger)
+    last_exc: Optional[BaseException] = None
+    for _i, (label, cdata, cname) in enumerate(candidates):
+        try:
+            url = await _upload_one_bytes(client, target_id, is_group, cdata,
+                                          cname, logger=logger, file_type=file_type)
+        except Exception as exc:
+            from media_types import is_format_error as _is_fmt
+
+            if _is_fmt(exc):
+                last_exc = exc
+                # 「原图被平台拒」要记下来：10 分钟内不再对同一张图白撞
+                if label.startswith("原始动图"):
+                    try:
+                        import hashlib as _h
+                        import time as _t
+
+                        _RAW_GIF_REJECTED[_h.md5(data).hexdigest()] = _t.time()
+                        if len(_RAW_GIF_REJECTED) > 64:
+                            _oldest = sorted(_RAW_GIF_REJECTED.items(),
+                                             key=lambda kv: kv[1])[:16]
+                            for _k, _ in _oldest:
+                                _RAW_GIF_REJECTED.pop(_k, None)
+                    except Exception:
+                        pass
+                nxt = candidates[_i + 1][0] if _i + 1 < len(candidates) else None
+                if logger is not None:
+                    if nxt:
+                        logger.info(
+                            "[QQBOT-BRIDGE] 动图候选「%s」被平台拒收（%s）—— 换下一个（%s）",
+                            label or "原样", str(exc)[:70], nxt)
+                    else:
+                        logger.warning(
+                            "[QQBOT-BRIDGE] 动图候选「%s」被平台拒收（%s）—— 没有更多候选了",
+                            label or "原样", str(exc)[:70])
+                continue
+            if logger is not None:
+                logger.warning("[QQBOT-BRIDGE] 转存上传失败（%s: %s）",
+                               type(exc).__name__, str(exc)[:120])
+            return None
+        if url:
+            if logger is not None and label:
+                if label.startswith("原始动图"):
+                    logger.info(
+                        "[QQBOT-BRIDGE] ★ 动图**原图直传成功**（平台收了 %s）——"
+                        "md 里这条**有机会真动**；若客户端仍显示静图，把 md_gif_mode 设为 static 可回退",
+                        name or "动图")
+                    # 清掉"曾被拒"的旧记忆（平台侧行为可能已变化）
+                    try:
+                        import hashlib as _h
+
+                        _RAW_GIF_REJECTED.pop(_h.md5(data).hexdigest(), None)
+                    except Exception:
+                        pass
+                else:
+                    logger.info(
+                        "[QQBOT-BRIDGE] 动图已按「%s」转存成功（逐步退守的结果）", label)
+            return url
+        # 返回 None 且无异常（例如响应里没有 raw_url）：
+        # 还有候选就继续换（可能"原图"路径给不出 raw_url 而"转档"路径可以）；
+        # 最后一个候选也拿不到 ⇒ 停（失败如实返回 None，由调用方按原样处理）。
+        if _i + 1 < len(candidates):
+            if logger is not None:
+                logger.info("[QQBOT-BRIDGE] 候选「%s」转存未拿到 raw_url —— 换下一个",
+                            label or "原样")
+            continue
+        if logger is not None and len(candidates) > 1:
+            logger.warning("[QQBOT-BRIDGE] 所有候选都没拿到 raw_url —— 本条按原地址/alt 处理")
+        return None
+    if logger is not None:
+        logger.warning("[QQBOT-BRIDGE] 动图所有候选都被平台拒收（最后：%s）—— 本条按原地址/alt 处理",
+                       str(last_exc)[:100] if last_exc else "?")
+    return None
+
+
+async def _upload_one_bytes(
+    client: Any, target_id: str, is_group: bool, data: bytes, name: str,
+    logger: Any = None, file_type: int = 1,
+) -> Optional[str]:
+    """单个候选的实际转存（分片上传 → raw_url）。逻辑与 v1.6.8 相同。"""
     try:
         from botpy.http import Route
     except Exception:
         return None
     api = getattr(client, "api", None)
     if api is None or not data:
-        return None
-
-    # ★ 平台上传接口只收 png/jpg：GIF/WEBP 直传会被拒（850019）⇒ 先规范化。
-    #   `allow_anim=True`（默认）⇒ **md 里的动图也会转成 APNG**（动图版 PNG，
-    #   魔数仍是 \x89PNG），于是它同样有机会在 md 里内嵌显示；
-    #   APNG 过大（>4MB）或转换失败 ⇒ 退回静态 PNG（第一帧）。
-    try:
-        from media_types import normalize_image_data
-
-        data, name, _note = normalize_image_data(data, name or "image.png", logger,
-                                                allow_anim=True)
-    except Exception:
-        pass
-    if not data:
         return None
     size = len(data)
     name = name or "image.png"
@@ -698,12 +878,15 @@ async def _upload_bytes_to_qq(
             except Exception:
                 _hint = ""
             logger.warning(
-                "[QQBOT-BRIDGE] 图片转存到 QQ 失败（%s: %s）%s —— 本条图片按原地址发送，"
-                "QQ 可能仍显示成 alt 文字；若持续如此请把本条连同日志反馈",
+                "[QQBOT-BRIDGE] 图片转存到 QQ 失败（%s: %s）%s",
                 type(exc).__name__, str(exc)[:160],
                 ("\n    → " + _hint) if _hint else "",
             )
-        return None
+        # ★★★ 2026-10-09：**必须重新抛出** —— 外层候选链要靠异常类型做退守
+        #   （`850019` ⇒ 换下一个候选：原图→APNG→静态 PNG）。
+        #   原来这里 `return None` 把格式类错误也吞成了"无声的 None"，
+        #   候选链根本看不到"被平台拒收"这件事 ⇒ 直接放弃、不会退守。
+        raise
 
 
 async def upload_local_to_public_url(
@@ -1012,6 +1195,64 @@ async def _gather_with_budget(tasks: Dict[int, Any], logger: Any = None) -> List
         return out
 
 
+async def _remote_animated_keep_url(client: Any, url: str, logger: Any):
+    """``md_gif_mode=url``：远程**动图**保留原公网地址（让平台自己下载转存）。
+
+    返回 ``(最终URL, 尺寸)``；返回 None = "这条不适用"（拉不到 / 不是动图 / 过大），
+    调用方原样落回常规"下载 → 转存"路径（保证显示）。
+
+    背景（2026-10-09 用户情报）：QQ 里能看到别的机器人发出**会动的 GIF**。
+    官方文档「富媒体消息概述」把 gif 列进了图片支持格式，但**上传接口**只收
+    png/jpg（GIF 直传实测 850019）——两处口径矛盾。md 图片走的是**平台侧的
+    下载转存管道**（"开放平台会下载转存该资源"），与上传接口的限制无关，
+    是"让平台自己挑格式"的另一条路。此模式只对**确实的动图**生效：
+    我们仍然把图拉下来验证一次（确认多帧动图 + 量出真实尺寸，尺寸是 md
+    图片的必需项），但**不转存**，原址交给平台。
+    """
+    try:
+        data = await _fetch_bytes(url, logger=logger)
+        if not data:
+            return None
+        if len(data) > 20 * 1024 * 1024:
+            if logger is not None:
+                logger.info(
+                    "[QQBOT-BRIDGE] 动图超过图片软限制（20MB）—— 不使用『保留原址』"
+                    "（平台大概率转存失败），改走转存/压缩路径")
+            return None
+        fmt = ""
+        frames = 1
+        try:
+            from media_types import sniff_image_format
+
+            fmt = sniff_image_format(data)
+            import io as _io
+
+            from PIL import Image as _PILImage
+
+            with _PILImage.open(_io.BytesIO(data)) as im:
+                frames = int(getattr(im, "n_frames", 1) or 1)
+        except Exception:
+            return None
+        if frames <= 1 or fmt not in ("gif", "webp"):
+            return None                     # 静图 / 认不出 ⇒ 走常规转存（稳）
+        size = _image_size_from_bytes(data)
+        final = url
+        try:
+            got = await resolve_image_url(client, url, logger=None)
+            if got:
+                final = got
+        except Exception:
+            pass
+        if logger is not None:
+            logger.info(
+                "[QQBOT-BRIDGE] 动图走『保留原址』（md_gif_mode=url）：%s（%s，%d 帧，"
+                "%.1f KB）——平台会自己下载转存；若群里显示不出/不动，把 md_gif_mode 改回 auto",
+                url, fmt, frames, len(data) / 1024.0)
+        return final, size
+    except Exception:
+        return None
+
+
 async def _resolve_image_url(url: str, *, client: Any, target_id: str,
                              is_group: bool, adapter: Any, logger: Any,
                              want_size: bool = False):
@@ -1036,6 +1277,20 @@ async def _resolve_image_url(url: str, *, client: Any, target_id: str,
         #     顺便还能把过大的图压到软限制内。
         cached = _cache_get(_URL_CACHE, url)
         if cached is None:
+            # ★ md_gif_mode=url（2026-10-09 新增）：远程**动图**保留原公网地址，
+            #   让平台自己下载转存 —— 绕开上传接口只收 png/jpg 的限制。
+            #   拉不到 / 不是动图 / 过大 ⇒ 返回 None，原样落回下面的常规转存路径。
+            if get_md_gif_mode() == "url":
+                try:
+                    got = await _remote_animated_keep_url(client, url, logger)
+                except Exception:
+                    got = None
+                if got is not None:
+                    _cache_put(_URL_CACHE, url, got, _URL_TTL)
+                    _fu, _fs = got
+                    if want_size:
+                        return _fu, _fs
+                    return _fu
             pub = None
             size = None
             try:

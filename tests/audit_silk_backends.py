@@ -10,6 +10,16 @@ def ck(n,c,e=""):
     else: F+=1; print(f"  FAIL {n}  {e}")
 
 CALLS=[]
+#: 模块屏蔽器（见 fresh() 的说明）
+_BLOCKERS = []
+class _Blocker:
+    def __init__(self, names):
+        self.names = set(names)
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in self.names:
+            raise ImportError(f"blocked by test: {fullname}")
+        return None
+
 # ── 桩 pysilk（file-like API）──
 ps=types.ModuleType("pysilk")
 def ps_encode(pcm_fp, silk_fp, pcm_rate, bit_rate):
@@ -31,11 +41,34 @@ subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-f","lavfi",
                 "-i","sine=frequency=440:duration=1","-b:a","64k",mp3,"-y"],capture_output=True)
 
 def fresh(mods):
-    """按给定的可用模块重新加载 audio_silk。"""
-    for k in ("pysilk","pilk"): sys.modules.pop(k, None)
-    for m in mods: sys.modules[m[0]] = m[1]
+    """按给定的可用模块重新加载 audio_silk。
+
+    ★ 2026-10-09：加**模块屏蔽**。原来只 pop sys.modules —— 若开发机/沙箱
+    真的装了 `pysilk`（比如插件 requirements 已经装上），`__import__("pysilk")`
+    会直接成功 ⇒ "只有 pilk" / "两个都没有" 的场景全部失真
+    （实测：装了 silk-python 后本套件 4 条断言变红）。
+    现在按场景把"不该有"的模块用 meta_path 屏蔽掉，保证**任何机器上结果一致**。
+    """
+    global _BLOCKERS
+    for b in _BLOCKERS:
+        try:
+            sys.meta_path.remove(b)
+        except ValueError:
+            pass
+    _BLOCKERS = []
+    names = [m[0] for m in mods]
+    for k in ("pysilk", "pilk"):
+        sys.modules.pop(k, None)
+    blocked = [n for n in ("pysilk", "pilk") if n not in names]
+    if blocked:
+        b = _Blocker(blocked)
+        sys.meta_path.insert(0, b)
+        _BLOCKERS.append(b)
+    for m in mods:
+        sys.modules[m[0]] = m[1]
     sys.modules.pop("audio_silk", None)
     import importlib
+
     return importlib.import_module("audio_silk")
 
 print("═══ ① 有 pysilk 时的选择 ═══")
