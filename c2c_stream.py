@@ -1,5 +1,19 @@
 """C2C 流式消息（`stream_messages`）—— 让私聊回复**一边生成一边长出来**。
 
+## ★★★ 铁律：**一条 `<msg>` = 一条消息，绝不合并**
+
+KiraAI 核心是**逐条发送**的（`core/message_manager.py`）：
+
+    for action in actions:                 # 每个 <msg> 段
+        result = await self.send_message_chain(event.sid, action, ...)
+        for handler in sent_handlers: ...  # 每发一条广播一次 ON_MESSAGE_SENT
+        await asyncio.sleep(random.uniform(min_message_delay, max_message_delay))
+
+⇒ **分段是模型/框架的意图**（框架甚至刻意在两条之间留了随机间隔）。
+所以本模块"**一次发送 = 一条消息 = 一条流**"：每个 `<msg>` 段各自开一条流式消息、
+各自补结束帧，**绝不把多段合成一条**。
+（v1.6.3 那版把同轮的段累积进一条流 —— 那是错的，会毁掉分段行为，已改。）
+
 ## 这是官方能力，KiraAI 核心没有
 
 官方接口（`POST /v2/users/{openid}/stream_messages`）：
@@ -30,10 +44,8 @@
 
 ## ★ 两条硬规则（2026-10-09 修正 —— 之前的两处真问题）
 
-* **累积，不能覆盖**：权威段是"一条条独立消息"，但写进流里必须是**累加**的全文
-  （replace 契约要求新正文以已下发内容为前缀）⇒ 之前写成 `sess.text = 本段`，
-  多段回复会把前一段顶掉、甚至构成非法请求。现在拆成 `base`（权威累积）+
-  `preview`（当前段预览），发出去的永远是 `base + preview`。
+* **一条 `<msg>` = 一条消息**（见文件顶部说明）：权威内容到达时**只覆盖这一条**并立刻收尾，
+  下一段的 token 会开**新的**一条流 —— 绝不把两段并进同一条消息。
 * **绝不 sleep 拖慢发送**：节流只用"跳过本次更新"，**不用 `await sleep`** ——
   否则提速器抢发得越快我们反而越慢（本末倒置）。
 
@@ -63,6 +75,8 @@ MAX_FRAMES = 30
 MIN_FRAME_INTERVAL = 0.5
 #: 命中限流（HTTP 429 / err_code 50002）时的重试次数（官方 MAX_FLUSH_RETRIES=3）
 MAX_RATE_LIMIT_RETRIES = 3
+#: 限流退避基数（官方 RATE_LIMIT_BASE_DELAY_MS = 1000）
+RATE_LIMIT_BASE_DELAY = 1.0
 #: 连续失败几次后对该目标冷却，不再尝试流式
 FAILURE_COOLDOWN = 2
 COOLDOWN_SECONDS = 600.0
@@ -115,10 +129,9 @@ def display_text_of(raw: str) -> str:
 class _Session:
     """一条流式消息的状态。"""
 
-    __slots__ = ("target", "msg_id", "seq", "index", "stream_msg_id", "base",
-                 "preview", "last_sent_text", "last_frame_at", "done",
-                 "content_type", "frames", "adapter", "flusher",
-                 "authoritative_seen")
+    __slots__ = ("target", "msg_id", "seq", "index", "stream_msg_id", "value",
+                 "last_sent_text", "last_frame_at", "done", "finalized",
+                 "content_type", "frames", "adapter", "flusher")
 
     def __init__(self, target: str, msg_id: str, seq: int, content_type: str,
                  adapter: Any = None):
@@ -128,26 +141,25 @@ class _Session:
         self.seq = seq
         self.index = 0
         self.stream_msg_id: Optional[str] = None
-        #: 权威分段的累积全文（框架真正发出去的那几段）
-        self.base = ""
-        #: 当前段的预览（token 观察者给的，尚未被权威内容覆盖）
-        self.preview = ""
+        #: **这一条消息**的正文（预览时是半句，权威内容到达后被整体替换）
+        self.value = ""
         self.last_sent_text = ""
         self.last_frame_at = 0.0
         self.done = False
         self.content_type = content_type
         self.frames = 0
         self.flusher: Optional[asyncio.Task] = None
-        self.authoritative_seen = False
+        #: 权威内容已经写进这条消息（之后到达的 token 属于**下一条**消息）
+        self.finalized = False
 
     @property
     def text(self) -> str:
-        """要写进流式消息的**全量正文**（必须以已下发内容为前缀）。"""
-        return (self.base + self.preview).strip("\n")
+        """这条流式消息的正文（预览或权威内容）。"""
+        return self.value.strip("\n")
 
 
 class _NoSession:
-    preview = ""
+    value = ""
 
 
 _NO_SESSION = _NoSession()
@@ -197,48 +209,68 @@ class C2CStreamManager:
 
     async def maybe_stream(self, adapter: Any, client: Any, target: str,
                            kwargs: dict) -> Optional[dict]:
-        """把这次发送接进流式消息。**返回 None 表示"没接管"**（调用方照常发送）。"""
+        """把这次发送**收尾到已经预览出来的那条消息**上。返回 None 表示"没接管"。
+
+        ## 为什么只在"已有预览"时才接管（而不是每次都改写成流式）
+
+        * 没有预览 ⇒ 这条消息在用户那里**还没有出现过半句**，走流式与走普通发送在观感上
+          完全一样（都是"一次到位"），却要多吃一次 API 调用、还改动了既有报文 ——
+          **没必要**，所以直接交给普通发送（行为与从前**完全一致**）。
+        * 有预览 ⇒ 用户已经看到过这半句，必须用权威内容把它**补全并收尾**，
+          否则那条消息会永远停在"生成中"。
+        """
         content_type = self.eligible(target, kwargs)
         if content_type is None:
             return None
         text = str(kwargs.get("content") or "")
-        msg_id = str(kwargs.get("msg_id") or "")
-        if not msg_id:                       # 主动发送没有 msg_id ⇒ 流式发不出去
-            msg_id = self._reply_id_of(adapter, target)
-        if not msg_id or client is None:
+        sess = self._sessions.get(target)
+        if sess is None or sess.done or sess.finalized or not sess.frames:
+            return None                      # 没有正在预览的那条 ⇒ 照旧普通发送
+        if not self._same_segment(sess.text, text.strip()):
+            # 预览内容与这次要发的内容对不上（极少见：例如发的是**上一段**）
+            # ⇒ 先把预览如实收尾，本条交给普通发送（绝不显示错的文字）
+            try:
+                await self._close_preview(sess, client, "mismatch")
+            except Exception:
+                self._retire(sess)
             return None
-
-        sess = self._ensure(adapter, target, msg_id, content_type)
-        if sess is None:
-            return None
-        # ★★ 累积而不是覆盖（replace 契约：新正文必须以已下发内容为前缀）。
-        #    权威段之间是"先后两段" ⇒ 累加；若这次给的本身就是全量
-        #    （故障重发 / 框架补发整段）⇒ 以它为准。
-        if not sess.authoritative_seen or text.startswith(sess.base):
-            sess.base = text
-        else:
-            sess.base = (sess.base + text) if sess.base else text
-        sess.authoritative_seen = True
-        sess.preview = ""                    # 这一段已有权威版本，预览作废
-
+        sess.value = text                    # 权威内容覆盖预览（同一条消息）
         try:
-            resp = await self._flush(sess, client, force=True)
+            return await self._finish_and_return(sess, client)
         except Exception as exc:
             self._note_failure(target, exc)
             return None                      # ★ 放手：调用方照常普通发送
-        if resp is None and self._frame_cap_hit(sess):
-            self._log_once("cap", "[QQBOT-BRIDGE] 流式消息片数达上限（%d），本条回退普通发送",
-                           MAX_FRAMES)
+
+    @staticmethod
+    def _same_segment(preview: str, auth: str) -> bool:
+        """这次要发的内容，是不是"那条预览"的完整版？（两者应为前缀关系）"""
+        a, b = (preview or "").strip(), (auth or "").strip()
+        if not a or not b:
+            return False
+        return a.startswith(b) or b.startswith(a)
+
+    async def _close_preview(self, sess: _Session, client: Any, reason: str) -> None:
+        """把"只预览过、没等到权威内容"的那条消息如实收尾（补 input_state=10）。"""
+        if sess.done or not sess.text:
             self._retire(sess)
+            return
+        await self._send_frame(client, sess, sess.text, STATE_DONE)
+        sess.finalized = True
+        self._retire(sess)
+
+    async def _finish_and_return(self, sess: _Session, client: Any) -> Optional[dict]:
+        """给这条流补结束帧并收尾（一条 `<msg>` 的生命周期到此为止）。"""
+        if sess.frames and sess.text == sess.last_sent_text and sess.frames:
+            pass                              # 内容与预览一致，也仍要补 input_state=10
+        if sess.frames >= MAX_FRAMES:
             return None
-        self._arm_idle(client, target, sess)
-        if "first" not in self._logged:
-            self._logged.add("first")
-            self._log_info(
-                "[QQBOT-BRIDGE] 私聊流式消息已启用：这一轮的回复会写成**同一条会生长的消息**"
-                "（官方 stream_messages；群里/图文/语音照旧走普通发送）"
-            )
-        return {"id": sess.stream_msg_id, "ext_info": self._last_ext_info}
+        await self._send_frame(client, sess, sess.text, STATE_DONE)
+        sess.frames += 1
+        sess.finalized = True
+        sess.last_sent_text = sess.text
+        out = {"id": sess.stream_msg_id, "ext_info": self._last_ext_info}
+        self._retire(sess)                    # 下一条 <msg> 会开新的一条流
+        return out
 
     # ------------------------------------------------------------------ #
     # 对外 B：token 预览（旁听提速器的 chat_stream，**同步、非阻塞**）
@@ -259,12 +291,18 @@ class C2CStreamManager:
             text = display_text_of(raw)
         except Exception:
             return
-        if not text or text == self._sessions.get(target, _NO_SESSION).preview:
+        if not text or text == self._sessions.get(target, _NO_SESSION).value:
             return
-        sess = self._ensure(adapter, target, msg_id, "text")
-        if sess is None or sess.done:
-            return
-        sess.preview = text
+        sess = self._sessions.get(target)
+        if sess is None or sess.done or sess.finalized:
+            # ★ 上一条已经收尾（权威内容已发出）⇒ 这些 token 属于**下一条消息**：
+            #   开新的流，**绝不往同一条消息里塞**（保住模型的分段）
+            if sess is not None:
+                self._retire(sess)
+            sess = self._ensure(adapter, target, msg_id, "text")
+            if sess is None:
+                return
+        sess.value = text
         self._ensure_flusher(client, sess)
 
     # ------------------------------------------------------------------ #
@@ -380,6 +418,9 @@ class C2CStreamManager:
         await self._send_frame(client, sess, text, STATE_GENERATING)
         sess.frames += 1
         sess.last_sent_text = text
+        # ★ 每次成功写片都（重新）武装空闲收尾：**只预览、最终没等到权威内容**时
+        #   也必须有人补 input_state=10，否则那条消息会永远停在「生成中」。
+        self._arm_idle(client, sess.target, sess)
         return {"id": sess.stream_msg_id, "ext_info": self._last_ext_info}
 
     def _ensure_flusher(self, client: Any, sess: _Session) -> None:
@@ -392,12 +433,23 @@ class C2CStreamManager:
             sess.flusher = None
 
     async def _preview_loop(self, client: Any, sess: _Session) -> None:
-        """后台把预览按 500ms 节流写进流式消息（不占用提速器的循环）。"""
+        """后台把预览按 500ms 节流写进流式消息（不占用提速器的循环）。
+
+        退出条件：这条流已被权威内容收尾（`finalized`），或连续两轮都没有新内容
+        （那说明这一段的预览已经写完，收尾交给空闲定时器）。
+        """
         try:
-            while not sess.done:
+            idle_rounds = 0
+            while not sess.done and not sess.finalized:
                 await asyncio.sleep(MIN_FRAME_INTERVAL)
-                if sess.text == sess.last_sent_text and not sess.preview:
+                if sess.finalized:
                     return
+                if sess.text == sess.last_sent_text:
+                    idle_rounds += 1
+                    if idle_rounds >= 2:
+                        return
+                    continue
+                idle_rounds = 0
                 try:
                     await self._flush(sess, client)
                 except Exception as exc:
@@ -436,7 +488,7 @@ class C2CStreamManager:
                 last = exc
                 if not self._is_rate_limit(exc) or attempt >= MAX_RATE_LIMIT_RETRIES:
                     raise
-                delay = 1.0 * (2 ** attempt)
+                delay = RATE_LIMIT_BASE_DELAY * (2 ** attempt)
                 self._log_warn(
                     "[QQBOT-BRIDGE] 流式消息被限流，%.1fs 后重试（%d/%d）",
                     delay, attempt + 1, MAX_RATE_LIMIT_RETRIES,
@@ -461,7 +513,7 @@ class C2CStreamManager:
         return "429" in low or "50002" in low or "rate limit" in low or "too many" in low
 
     async def _finish(self, sess: _Session, reason: str) -> None:
-        if sess.done:
+        if sess.done or sess.finalized:
             return
         sess.done = True
         try:

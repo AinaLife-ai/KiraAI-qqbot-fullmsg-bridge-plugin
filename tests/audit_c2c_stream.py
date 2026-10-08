@@ -1,38 +1,34 @@
-"""★★ C2C 流式消息（`stream_messages`）：把同一轮的多段私聊回复写成**同一条会生长的消息**。
+"""★★ C2C 流式消息（`stream_messages`）：**一条 `<msg>` = 一条消息，绝不合并**。
 
-## 官方口径（本测试逐项对齐）
+## 契约（本测试逐条钉死）
 
-`POST /v2/users/{openid}/stream_messages`：
+KiraAI 核心是**逐条发送**的（`core/message_manager.py`）：
 
-    input_mode   replace（ContentRaw = **当前全量正文**，须以已下发前缀开头）
-    input_state  1=生成中  10=生成结束
-    index        分片序号，从 0 递增
-    content_type text | markdown
-    content_raw  当前全量文本
-    msg_id       被动回复消息 ID
-    stream_msg_id 首片由服务端返回，**后续分片必须携带**
-    msg_seq      同一条流的所有分片**共用一个**（只有 index 递增）
+    for action in actions:                 # 每个 <msg> 段
+        result = await self.send_message_chain(event.sid, action, ...)
+        for handler in sent_handlers: ...  # 每发一条广播一次 ON_MESSAGE_SENT
+        await asyncio.sleep(random.uniform(min_message_delay, max_message_delay))
 
-腾讯官方 Node SDK（`src/streaming.ts`）与 QQ 官方推荐的 Hermes 都这么用；
-限流（HTTP 429 / err_code 50002）时指数退避并**推进 index**。
+⇒ **分段是模型/框架的意图**（框架甚至刻意在两条之间留随机间隔）。
+本插件的铁律：**一次发送 = 一条消息 = 一条流**，两段绝不合并。
 
-## 为什么本插件是"分段驱动"
+## 流式只在"已经预览出半句"时才接管
 
-KiraAI 回复路径**非流式**（`model.chat()` 一次拿完整结果），核心没有把 token 增量
-暴露给插件；但提速器插件会把**已成型的 `<msg>` 段**经框架发送层发出来 ⇒
-对插件来说"一次发送 = 一段文本"。所以这里把这些段合成一条流式消息。
+* 没有预览 ⇒ 走流式与普通发送观感一样（都是一次到位），却多吃一次 API 调用 ⇒
+  **直接交给普通发送**（行为与从前完全一致）；
+* 有预览 ⇒ 用权威内容把那条消息补全并补 `input_state=10` 收尾（否则它会永远停在"生成中"）。
 
-## 本测试断言（不依赖核心，跑得快）
+## 断言
 
-1. 判据保守：群聊 / 富媒体 / markdown / 键盘 / 引用 / 太短 一律**不接管**；
-2. 首片形状正确（index=0、state=1、无 stream_msg_id、msg_seq 与核心错开）；
-3. 次片累积全文、index 递增、**带上首片返回的 stream_msg_id**；
-4. 空闲后自动补 `input_state=10` 收尾；
-5. 任何失败 ⇒ 返回 None（调用方回退普通发送，**消息不丢**）+ 连续失败后冷却；
-6. 限流 429 ⇒ 重试并推进 index；
-7. `close_all()` 收尾且不抛；
-8. 关掉开关 ⇒ 完全不接管（行为与从前一致）；
-9. api 层集成：C2C 纯文本走 `stream_messages`（**不再发普通消息**），其余照旧。
+1. 判据保守（群聊/富媒体/md/键盘/引用/过短都不接管）；
+2. **没有预览 ⇒ 不接管**（返回 None ⇒ 调用方普通发送，报文与从前一致）；
+3. 有预览 ⇒ 接管：首片 `input_state=1` + 收尾 `input_state=10`，内容 = 权威内容；
+4. ★★★ **两段 = 两条独立消息**（各自的 `msg_seq` / `stream_msg_id`，内容各自独立，绝不拼接）；
+5. 预览与权威内容对不上 ⇒ 预览如实收尾 + 本条普通发送（不显示错文字）；
+6. 预览等不到权威内容 ⇒ 空闲自动收尾；
+7. 失败 ⇒ 返回 None（消息不丢）+ 连续失败冷却；限流（429）指数退避并推进 index；
+8. `close_all()` 干净收尾；关掉开关 ⇒ 完全不接管；
+9. api 层集成：没预览时 C2C 纯文本**照旧走普通接口**（兼容性回归）。
 """
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
@@ -46,6 +42,11 @@ sys.path.insert(0, _BR())
 
 import api_send  # noqa: E402
 import c2c_stream as CS  # noqa: E402
+
+try:                      # 预热：botpy 首次 import 约 0.5s，别让它落进计时敏感区
+    import botpy.http  # noqa: F401
+except Exception:
+    pass
 
 PASS = FAIL = 0
 
@@ -78,12 +79,13 @@ class _Log:
 
 
 class HTTP:
-    """记录 stream_messages 的每一片；可注入故障。"""
+    """记录每一片；每条流给一个独立的 id（便于断言"这是两条消息"）。"""
 
     def __init__(self, fail_times=0, rate_limit_times=0):
         self.frames = []
         self.fail = fail_times
         self.rate = rate_limit_times
+        self.n = 0
 
     async def request(self, route, **kw):
         if self.rate > 0:
@@ -94,7 +96,11 @@ class HTTP:
             raise RuntimeError("Server Disconnected")
         body = kw.get("json") or {}
         self.frames.append(body)
-        return {"id": "SMID-1", "timestamp": "t", "ext_info": {"ref_idx": "REF1"}}
+        if body.get("stream_msg_id") is None:
+            self.n += 1
+            return {"id": f"SMID-{self.n}", "timestamp": "t",
+                    "ext_info": {"ref_idx": f"REF-{self.n}"}}
+        return {"id": body["stream_msg_id"], "timestamp": "t"}
 
 
 class Adapter:
@@ -111,8 +117,6 @@ class Adapter:
 
 class Plugin:
     def __init__(self, enabled=True):
-        self.identities = None
-        self._attr = type("X", (), {"get": lambda s, k, d=None: None})()
         self.remembered = []
 
     @staticmethod
@@ -124,175 +128,164 @@ class Plugin:
 
 
 async def main():
-    CS.IDLE_DONE_SECONDS = 0.15        # 缩短空闲收尾，测试快
-    CS.MIN_FRAME_INTERVAL = 0.0
+    # 正常收尾靠"权威内容到达 / 下一轮开始"；空闲只是**兜底**，别设短
+    # （设短会把"模型中途歇几秒"的预览误当结束，导致半句定格 + 后面重复一条）
+    CS.IDLE_DONE_SECONDS = 3.0
+    CS.MIN_FRAME_INTERVAL = 0.05
     CS.MAX_RATE_LIMIT_RETRIES = 3
+    CS.RATE_LIMIT_BASE_DELAY = 0.02
 
-    print("═══ C2C 流式消息 ═══")
+    print("═══ C2C 流式消息：一条 <msg> 一条消息 ═══")
 
-    print("\n[1] 判据必须保守（宁可不流式，也不改变既有行为）")
+    print("\n[1] 判据保守（宁可不流式，也不改变既有行为）")
     mgr = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
     plain = {"msg_type": 0, "content": "这是一段足够长的正常回复文本", "msg_id": "M1"}
-    check("★ 纯文本私聊 ⇒ 接管", mgr.eligible("T", plain) == "text")
-    check("★ 群聊（由调用方传 is_group 控制）不看这里，但 markdown 不接管",
-          mgr.eligible("T", {**plain, "markdown": {"content": "x"}}) is None)
+    check("★ 纯文本私聊 ⇒ 可接管", mgr.eligible("T", plain) == "text")
+    check("★ markdown 不接管", mgr.eligible("T", {**plain, "markdown": {"content": "x"}}) is None)
     check("★ 键盘不接管", mgr.eligible("T", {**plain, "keyboard": {"id": "1"}}) is None)
     check("★ 富媒体不接管", mgr.eligible("T", {**plain, "media": {"file_info": "f"}}) is None)
-    check("★ 引用不接管", mgr.eligible("T", {**plain, "message_reference": {"message_id": "r"}}) is None)
+    check("★ 引用不接管",
+          mgr.eligible("T", {**plain, "message_reference": {"message_id": "r"}}) is None)
     check("★ 太短不接管（<8 字）", mgr.eligible("T", {"msg_type": 0, "content": "嗯嗯"}) is None)
-    check("★ msg_type=2（markdown 消息）不接管",
-          mgr.eligible("T", {**plain, "msg_type": 2}) is None)
+    check("★ msg_type=2 不接管", mgr.eligible("T", {**plain, "msg_type": 2}) is None)
     check("★ 关掉开关 ⇒ 永不接管",
           CS.C2CStreamManager(Plugin(), _Log(), enabled=False).eligible("T", plain) is None)
 
-    print("\n[2] 首片形状（对齐官方示例）")
+    print("\n[2] ★★ 没有预览 ⇒ **不接管**（报文与从前完全一致）")
     http = HTTP()
     ad = Adapter(http)
-    res = await mgr.maybe_stream(ad, ad.get_client(), "T1", {"msg_type": 0,
-                                                             "content": "第一段足够长的文本",
-                                                             "msg_id": "M1"})
+    r = await mgr.maybe_stream(ad, ad.get_client(), "T0",
+                               {"msg_type": 0, "content": "没预览过就直接发的文本", "msg_id": "M1"})
+    check("★★ 返回 None（调用方照常普通发送）", r is None, repr(r))
+    check("★★ 一个流式请求都没发", http.frames == [], str(http.frames))
+
+    print("\n[3] 有预览 ⇒ 接管：首片 input_state=1 + 收尾 input_state=10")
+    http = HTTP()
+    ad = Adapter(http)
+    mgr = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
+    mgr.observe_raw(ad, ad.get_client(), "T1", "M1", "<msg><text>哥ww 我在呀，这是一句够长的预览")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
+    check("★ 预览帧已发出（input_state=1）",
+          bool(http.frames) and http.frames[0].get("input_state") == 1, str(http.frames[:1]))
+    r = await mgr.maybe_stream(ad, ad.get_client(), "T1",
+                               {"msg_type": 0, "content": "哥ww 我在呀，这是一句够长的预览",
+                                "msg_id": "M1"})
     check("★ 接管成功并返回结果（框架当成一次正常发送）",
-          isinstance(res, dict) and res.get("id") == "SMID-1", str(res))
-    f = http.frames[0]
-    check("★ input_mode=replace", f.get("input_mode") == "replace", str(f))
-    check("★ input_state=1（生成中）", f.get("input_state") == 1, str(f))
-    check("★ index=0", f.get("index") == 0, str(f))
-    check("★ content_type=text（纯文本消息就用 text，避免 markdown 改写观感）",
-          f.get("content_type") == "text", str(f))
-    check("★ content_raw = 当前全文", f.get("content_raw") == "第一段足够长的文本", str(f.get("content_raw")))
-    check("★ 带 msg_id", f.get("msg_id") == "M1", str(f))
-    check("★ 首片**不带** stream_msg_id（由服务端生成）", "stream_msg_id" not in f, str(f))
-    check("★ msg_seq 与核心的 1..N 错开（同一条流共用一个）",
-          isinstance(f.get("msg_seq"), int) and f["msg_seq"] > 1000, str(f.get("msg_seq")))
+          isinstance(r, dict) and str(r.get("id", "")).startswith("SMID-"), str(r))
+    check("★★ 收尾帧 input_state=10 且内容 = 权威内容",
+          http.frames[-1].get("input_state") == 10
+          and http.frames[-1].get("content_raw") == "哥ww 我在呀，这是一句够长的预览",
+          str(http.frames[-1]))
+    check("★ 同一条流共用一个 msg_seq / stream_msg_id",
+          len({f.get("msg_seq") for f in http.frames}) == 1
+          and len({f.get("stream_msg_id") for f in http.frames if f.get("stream_msg_id")}) == 1,
+          str([(f.get("msg_seq"), f.get("stream_msg_id")) for f in http.frames]))
 
-    print("\n[3] 次片：累积全文 + index 递增 + **带上 stream_msg_id**")
-    res2 = await mgr.maybe_stream(ad, ad.get_client(), "T1",
-                                  {"msg_type": 0, "content": "第一段足够长的文本第二段续写",
-                                   "msg_id": "M1"})
-    f2 = http.frames[1]
-    check("★ index=1", f2.get("index") == 1, str(f2))
-    check("★★ content_raw 是**全量**（replace 语义，必须以已下发前缀开头）",
-          f2.get("content_raw") == "第一段足够长的文本第二段续写", str(f2.get("content_raw")))
-    check("★★ 带上首片返回的 stream_msg_id", f2.get("stream_msg_id") == "SMID-1", str(f2))
-    check("★ msg_seq 与首片相同（同一条流）",
-          f2.get("msg_seq") == f.get("msg_seq"), f"{f2.get('msg_seq')} vs {f.get('msg_seq')}")
-    check("★ 两次都返回结果（框架侧无感）", isinstance(res2, dict))
-
-    print("\n[3b] ★★★ 多段回复必须**累积**（replace 契约：新正文须以已下发前缀开头）")
-    # 换一条被动消息 ⇒ 开一条新流，模拟"提速器抢发两段独立消息"
-    n0 = len(http.frames)
-    await mgr.maybe_stream(ad, ad.get_client(), "T1",
-                           {"msg_type": 0, "content": "第一句在这里，够长了吧。", "msg_id": "M3"})
-    await mgr.maybe_stream(ad, ad.get_client(), "T1",
-                           {"msg_type": 0, "content": "第二句接着往下说。", "msg_id": "M3"})
-    new_frames = http.frames[n0:]
-    check("★ 两段各写了一片", len(new_frames) == 2, str(len(new_frames)))
-    check("★★★ 第二段之后正文 = 第一段 + 第二段（不是把第一段顶掉）",
-          bool(new_frames) and new_frames[-1].get("content_raw")
-          == "第一句在这里，够长了吧。第二句接着往下说。",
-          repr(new_frames[-1].get("content_raw") if new_frames else None))
-    check("★ 两段共用同一条流（msg_seq / stream_msg_id 一致）",
-          bool(new_frames) and new_frames[0].get("msg_seq") == new_frames[-1].get("msg_seq")
-          and new_frames[-1].get("stream_msg_id") == "SMID-1",
-          str(new_frames[-1] if new_frames else None))
-
-    print("\n[3c] ★★ 节流只「跳过更新」，**绝不 sleep 拖慢发送**")
-    n1 = len(http.frames)
-    t0 = time.monotonic()
-    await mgr.maybe_stream(ad, ad.get_client(), "T1",
-                           {"msg_type": 0, "content": "第三句紧接着也要立刻发出去哦。", "msg_id": "M3"})
-    dt = time.monotonic() - t0
-    check("★★ 紧接着的下一段**立即**发（<100ms，没等 500ms 节流）",
-          dt < 0.1 and len(http.frames) == n1 + 1, f"{dt:.3f}s frames+{len(http.frames) - n1}")
-
-    print("\n[4] 空闲后自动补收尾帧（input_state=10）")
-    n_before = len(http.frames)
-    await asyncio.sleep(0.35)
-    check("★ 出现收尾帧", len(http.frames) > n_before, f"{len(http.frames)} vs {n_before}")
-    f3 = http.frames[-1]
-    check("★ input_state=10", f3.get("input_state") == 10, str(f3))
-    check("★ 收尾帧带全文（= 本轮已累积的全部文本）与 stream_msg_id",
-          f3.get("content_raw") == "第一句在这里，够长了吧。第二句接着往下说。第三句紧接着也要立刻发出去哦。"
-          and f3.get("stream_msg_id") == "SMID-1", str(f3))
-
-    print("\n[3d] ★ token 预览：从原始 XML 里安全抽文字")
-    check("★ 正常一段：抽出正文", CS.display_text_of("<msg><text>哥ww 我在</text></msg>") == "哥ww 我在",
-          repr(CS.display_text_of("<msg><text>哥ww 我在</text></msg>")))
-    check("★ 还没闭合：也能给出已成型部分",
-          CS.display_text_of("<msg><text>哥ww 我") == "哥ww 我")
-    check("★★ 半截标签绝不外传（截到 < 之前）",
-          CS.display_text_of("<msg><text>哥ww 我<") == "哥ww 我")
-    check("★★ 工具调用轮不展示", CS.display_text_of('<msg><tool_call>{"name":"x"}</tool_call>') == "")
-    check("★ 只取最后一段（前面几段由权威发送负责，避免重复显示）",
-          CS.display_text_of("<msg><text>第一段</text></msg><msg><text>第二段") == "第二段")
-    check("★ 还没写到正文 ⇒ 空", CS.display_text_of("<msg><markdown") == ""
-          or CS.display_text_of("<msg>") == "")
-    check("★ markdown 段也能预览",
-          CS.display_text_of("<msg><markdown>## 标题") == "## 标题")
-    check("★ 空输入安全", CS.display_text_of("") == "" and CS.display_text_of(None or "") == "")
-
-    print("\n[3e] ★★ 预览帧由后台节流任务发出，且会被权威内容覆盖（最终以框架为准）")
+    print("\n[4] ★★★ 两段 = 两条独立消息（**绝不合并**）")
     http2 = HTTP()
     ad2 = Adapter(http2)
-    mgr4 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
-    mgr4.observe_raw(ad2, ad2.get_client(), "T9", "M9", "<msg><text>正在生成的半句话")
-    check("★ 预览是**同步**调用（不 await、不阻塞提速器循环）", True)
-    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.2)
-    check("★ 预览帧已发出", len(http2.frames) >= 1, str(len(http2.frames)))
-    check("★ 预览帧内容是那半句",
-          http2.frames[0].get("content_raw") == "正在生成的半句话",
-          repr(http2.frames[0].get("content_raw")))
-    await mgr4.maybe_stream(ad2, ad2.get_client(), "T9",
-                            {"msg_type": 0, "content": "正在生成的半句话，完整版。", "msg_id": "M9"})
-    check("★★ 权威内容覆盖预览（同一条消息，无重复、无残留）",
-          http2.frames[-1].get("content_raw") == "正在生成的半句话，完整版。",
-          repr(http2.frames[-1].get("content_raw")))
-    await mgr4.close_all()
-
-    print("\n[5] 换一条被动消息 ⇒ 开一条新流（不会串到上一轮）")
-    res3 = await mgr.maybe_stream(ad, ad.get_client(), "T1",
-                                  {"msg_type": 0, "content": "新的一轮回复内容在此",
-                                   "msg_id": "M2"})
-    f4 = http.frames[-1]
-    check("★ 新流 index 从 0 开始", f4.get("index") == 0, str(f4))
-    check("★ 新流不带旧 stream_msg_id", "stream_msg_id" not in f4, str(f4))
-    check("★ msg_seq 也换了", f4.get("msg_seq") != f.get("msg_seq"), str(f4.get("msg_seq")))
-    await asyncio.sleep(0.35)
-
-    print("\n[6] 失败 ⇒ 返回 None（调用方回退普通发送）+ 冷却")
-    http_bad = HTTP(fail_times=99)
-    ad_bad = Adapter(http_bad)
     mgr2 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
-    r = await mgr2.maybe_stream(ad_bad, ad_bad.get_client(), "T2",
-                                {"msg_type": 0, "content": "这段发不出去应该回退", "msg_id": "M1"})
-    check("★★ 失败时返回 None（消息交给普通路径发，不会丢）", r is None, str(r))
-    for _ in range(3):
-        await mgr2.maybe_stream(ad_bad, ad_bad.get_client(), "T2",
-                                {"msg_type": 0, "content": "再来一段失败的文本内容", "msg_id": "M1"})
-    check("★ 连续失败后该会话被冷却（不再尝试流式）",
-          mgr2.eligible("T2", {"msg_type": 0, "content": "冷却期内不该接管了", "msg_id": "M1"}) is None)
-    check("★ 其它会话不受影响（不是全局停用）",
-          mgr2.eligible("T3", {"msg_type": 0, "content": "另一个会话照常可用", "msg_id": "M1"}) == "text")
+    # 第 1 段：预览 → 权威
+    mgr2.observe_raw(ad2, ad2.get_client(), "T2", "M1", "<msg><text>第一句在这里，够长了吧。")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
+    await mgr2.maybe_stream(ad2, ad2.get_client(), "T2",
+                            {"msg_type": 0, "content": "第一句在这里，够长了吧。", "msg_id": "M1"})
+    # 第 2 段：预览 → 权威
+    mgr2.observe_raw(ad2, ad2.get_client(), "T2", "M1", "<msg><text>第一句在这里，够长了吧。"
+                     "</text></msg><msg><text>第二句接着往下说。")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.15)
+    await mgr2.maybe_stream(ad2, ad2.get_client(), "T2",
+                            {"msg_type": 0, "content": "第二句接着往下说。", "msg_id": "M1"})
+    seqs = [f.get("msg_seq") for f in http2.frames]
+    check("★★★ 两条消息用**不同的** msg_seq（不是同一条流）",
+          len(set(seqs)) == 2, str(seqs))
+    ids = {f.get("stream_msg_id") for f in http2.frames if f.get("stream_msg_id")}
+    check("★★★ 两条消息各有自己的 stream_msg_id",
+          len(ids) == 2, str(ids))
+    done = [f for f in http2.frames if f.get("input_state") == 10]
+    check("★★ 两条消息各自收尾（各有一个 input_state=10）", len(done) == 2, str(len(done)))
+    check("★★★ 第二条的内容**只有第二句**（第一句没有被拼进去）",
+          done[-1].get("content_raw") == "第二句接着往下说。",
+          repr(done[-1].get("content_raw")))
+    check("★★★ 第一条的内容**只有第一句**（没有被第二句覆盖）",
+          done[0].get("content_raw") == "第一句在这里，够长了吧。",
+          repr(done[0].get("content_raw")))
 
-    print("\n[7] 限流（429）⇒ 指数退避重试并推进 index（官方做法）")
-    http_rl = HTTP(rate_limit_times=2)
-    ad_rl = Adapter(http_rl)
+    print("\n[5] 预览与权威内容对不上 ⇒ 预览如实收尾 + 本条普通发送")
+    http3 = HTTP()
+    ad3 = Adapter(http3)
     mgr3 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
-    rl = await mgr3.maybe_stream(ad_rl, ad_rl.get_client(), "T4",
+    mgr3.observe_raw(ad3, ad3.get_client(), "T3", "M1", "<msg><text>这是下一段的预览文字")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
+    r3 = await mgr3.maybe_stream(ad3, ad3.get_client(), "T3",
+                                 {"msg_type": 0, "content": "完全对不上的另一段内容", "msg_id": "M1"})
+    check("★★ 返回 None（不给框架错误的结果）", r3 is None, repr(r3))
+    check("★★ 预览被**如实收尾**（不留「生成中」的消息）",
+          http3.frames[-1].get("input_state") == 10
+          and http3.frames[-1].get("content_raw") == "这是下一段的预览文字",
+          str(http3.frames[-1]))
+
+    print("\n[6] 预览等不到权威内容 ⇒ 空闲自动收尾")
+    http4 = HTTP()
+    ad4 = Adapter(http4)
+    mgr4 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
+    _idle_save = CS.IDLE_DONE_SECONDS
+    CS.IDLE_DONE_SECONDS = 0.15          # 这一节专门测"越过空闲时限"的兜底收尾
+    mgr4.observe_raw(ad4, ad4.get_client(), "T4", "M1", "<msg><text>只有预览没有权威版本")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
+    n = len(http4.frames)
+    await asyncio.sleep(0.4)
+    CS.IDLE_DONE_SECONDS = _idle_save     # ★ 立刻还原，别污染后面的小节
+    check("★ 空闲后补了收尾帧", len(http4.frames) > n and http4.frames[-1].get("input_state") == 10,
+          str(len(http4.frames)))
+    check("★ 收尾内容是那句预览", http4.frames[-1].get("content_raw") == "只有预览没有权威版本",
+          repr(http4.frames[-1].get("content_raw")))
+
+    print("\n[7] ★ token 预览：从原始 XML 里安全抽文字")
+    check("★ 正常一段", CS.display_text_of("<msg><text>哥ww 我在</text></msg>") == "哥ww 我在")
+    check("★ 还没闭合也能给已成型部分", CS.display_text_of("<msg><text>哥ww 我") == "哥ww 我")
+    check("★★ 半截标签绝不外传", CS.display_text_of("<msg><text>哥ww 我<") == "哥ww 我")
+    check("★★ 工具调用轮不展示",
+          CS.display_text_of('<msg><tool_call>{"name":"x"}</tool_call>') == "")
+    check("★ 只取最后一段（前几段由它们自己的消息负责）",
+          CS.display_text_of("<msg><text>第一段</text></msg><msg><text>第二段") == "第二段")
+    check("★ markdown 段也能预览", CS.display_text_of("<msg><markdown>## 标题") == "## 标题")
+    check("★ 空/无正文 ⇒ 空", CS.display_text_of("") == "" and CS.display_text_of("<msg>") == "")
+
+    print("\n[8] 失败 ⇒ 返回 None（回退普通发送）+ 冷却；限流退避")
+    bad_http = HTTP(fail_times=99)
+    bad_ad = Adapter(bad_http)
+    mgr5 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
+    mgr5.observe_raw(bad_ad, bad_ad.get_client(), "T5", "M1", "<msg><text>这段发不出去的预览")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
+    r5 = await mgr5.maybe_stream(bad_ad, bad_ad.get_client(), "T5",
+                                 {"msg_type": 0, "content": "这段发不出去的预览", "msg_id": "M1"})
+    check("★★ 失败时返回 None（消息交给普通路径发，不会丢）", r5 is None, repr(r5))
+    for _ in range(3):
+        mgr5.observe_raw(bad_ad, bad_ad.get_client(), "T5", "M1", "<msg><text>再来一段失败的预览")
+        await asyncio.sleep(0.02)
+    check("★ 连续失败后该会话被冷却",
+          mgr5.eligible("T5", {"msg_type": 0, "content": "冷却期内不该接管了", "msg_id": "M1"}) is None)
+    check("★ 其它会话不受影响",
+          mgr5.eligible("T6", {"msg_type": 0, "content": "另一个会话照常可用", "msg_id": "M1"}) == "text")
+
+    rl_http = HTTP(rate_limit_times=2)
+    rl_ad = Adapter(rl_http)
+    mgr6 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
+    mgr6.observe_raw(rl_ad, rl_ad.get_client(), "T7", "M1", "<msg><text>被限流也要最终发出去")
+    await asyncio.sleep(0.8)          # 等后台节流任务把限流重试跑完
+    rl = await mgr6.maybe_stream(rl_ad, rl_ad.get_client(), "T7",
                                  {"msg_type": 0, "content": "被限流也要最终发出去", "msg_id": "M1"})
     check("★ 限流后仍然成功", isinstance(rl, dict), str(rl))
-    check("★★ 重试时 index 被推进（官方做法，避免陈旧 index 冲突）",
-          bool(http_rl.frames) and http_rl.frames[-1].get("index") >= 2,
-          str(http_rl.frames[-1] if http_rl.frames else None))
-    await asyncio.sleep(0.35)
+    check("★★ 重试时 index 被推进（官方做法）",
+          bool(rl_http.frames) and max(f.get("index", 0) for f in rl_http.frames) >= 2,
+          str(rl_http.frames[-1] if rl_http.frames else None))
 
-    print("\n[8] close_all() 收尾且不抛（插件停止/卸载时调用）")
-    n_before = len(http.frames)
-    await mgr.close_all()
+    print("\n[9] close_all() 收尾且不抛")
+    await mgr4.close_all()
     check("★ 不抛异常", True)
-    check("★ 未收尾的流被补上结束帧", len(http.frames) >= n_before)
 
-    print("\n[9] api 层集成：C2C 纯文本被流式接管，其余照旧")
+    print("\n[10] api 层集成：没有预览时 C2C 纯文本**照旧走普通接口**（兼容性回归）")
     calls = []
 
     class API2:
@@ -316,24 +309,29 @@ async def main():
     patcher.install(None, "qqo", client)
 
     await api.post_c2c_message(openid="OPENID", msg_type=0,
-                               content="私聊纯文本应该走流式消息通道", msg_id="M1")
-    check("★★ 私聊纯文本**没走**普通消息接口（被流式接管）",
-          not any(k == "c2c" for k, _ in calls), str(calls))
-    check("★ 流式通道收到了这一片", len(api._http.frames) == 1, str(len(api._http.frames)))
-
-    await api.post_c2c_message(openid="OPENID", msg_type=0, content="短", msg_id="M1")
-    check("★ 太短 ⇒ 照旧走普通消息接口", any(k == "c2c" for k, _ in calls), str(calls))
-
+                               content="私聊纯文本没有被预览过，应该走普通发送", msg_id="M1")
+    check("★★★ 走的还是普通消息接口（报文与从前完全一致）",
+          any(k == "c2c" for k, _ in calls) and api._http.frames == [],
+          f"calls={calls} stream_frames={api._http.frames}")
     calls.clear()
-    await api.post_group_message(group_openid="G", msg_type=0,
-                                 content="群聊里的纯文本永远不走流式（官方只支持单聊）")
-    check("★★ 群聊照旧走普通消息接口（官方只支持 C2C）",
+    await api.post_group_message(group_openid="G", msg_type=0, content="群聊纯文本照旧")
+    check("★ 群聊照旧走普通消息接口（官方只支持 C2C）",
           any(k == "group" for k, _ in calls), str(calls))
-
     calls.clear()
-    await api.post_c2c_message(openid="OPENID", msg_type=2,
-                               markdown={"content": "# 标题"}, content=None, msg_id="M1")
-    check("★ markdown 消息照旧走普通接口", any(k == "c2c" for k, _ in calls), str(calls))
+    await api.post_c2c_message(openid="OPENID", msg_type=2, markdown={"content": "# 标题"},
+                               content=None, msg_id="M1")
+    check("★ markdown 照旧走普通接口", any(k == "c2c" for k, _ in calls), str(calls))
+
+    # 有预览时才接管
+    calls.clear()
+    plugin.c2c_stream.observe_raw(None, client, "OPENID", "M1",
+                                  "<msg><text>这次先有预览的文本")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
+    await api.post_c2c_message(openid="OPENID", msg_type=0, content="这次先有预览的文本",
+                               msg_id="M1")
+    check("★★ 有预览 ⇒ 被流式接管（不再发普通消息）",
+          not any(k == "c2c" for k, _ in calls) and len(api._http.frames) >= 2,
+          f"calls={calls} frames={len(api._http.frames)}")
 
     patcher.restore("qqo")
     await plugin.c2c_stream.close_all()
