@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.2
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -127,6 +127,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `keyboard_enabled` | 开 | 注册 `<keyboard>` 标签，让模型能在消息下挂内联按钮 |
 | `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
 | `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
+| `c2c_stream_enabled` | 开 | **私聊流式消息**（官方 `stream_messages`）：把这一轮的多段回复写成**同一条会生长的消息**（`input_mode=replace`、`index` 递增、空闲 2.5s 自动补 `input_state=10`）。只对单聊纯文本生效；群里/图文/语音/按钮照旧。任何失败都会**回退普通发送**（消息不丢），连续失败对该会话冷却 |
 | `extra_intents` | **开** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；插件会在连接时自动补上订阅位并请一次重连，**需重启 KiraAI** 生效。个别环境被平台拒绝订阅时会自动回退 |
 
 ### 关于「发文件」——本插件**不做**（框架原生已支持）
@@ -449,6 +450,59 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.3</b> — ★★ 分片上传重试（官方策略）+ 新能力「私聊流式消息」</summary>
+
+### 1. ★★ 分片上传重试：网络抖一下不再整条失败
+
+**问题**：md 图片走的是官方分片上传（prepare → 逐片 PUT → part_finish → 合并），
+而我们**一个都没重试** —— 任意一步抖一下，整条转存失败、图片退化成原地址。
+
+**修法**：逐条对齐官方实现（腾讯 Node SDK `retry.ts` ⇄ Hermes `chunked_upload.py`，
+两边数字完全一致，照抄不自创）：
+
+| 步骤 | 重试 | 退避 | 依据 |
+|---|---|---|---|
+| 预上传（upload_prepare） | 2 次（共 3 次） | 1s 指数 | UPLOAD_RETRY_POLICY |
+| 逐片 PUT（COS） | 2 次（共 3 次） | 1s 指数，单次超时 300s | PART_UPLOAD_MAX_RETRIES |
+| 分片确认（upload_part_finish） | 2 次；命中 **40093001** 进**持久重试**（间隔 1s，时限取 prepare 下发的 retry_timeout，默认 120s、上限 600s） | 1s | PART_FINISH_RETRY_POLICY + buildPartFinishPersistentPolicy |
+| 合并（/files） | 2 次 | **2s** 指数 | COMPLETE_UPLOAD_RETRY_POLICY |
+| **日额度 40093002** | **不重试** | — | 重试只会浪费额度，直接如实上报 |
+
+另外加了**软预算**（35s，小于图片处理总预算 45s）：预算内该重试就重试，
+超了立刻放手 —— 宁可这张图退回原地址，也不能把整条消息拖死。
+
+### 2. ★★ 新能力：私聊流式消息（官方 `stream_messages`）
+
+把**同一轮私聊回复的多个分段**写成**同一条会生长的消息**（`input_mode=replace`、
+`index` 递增、同一条流共用一个 `msg_seq`、首片返回的 `stream_msg_id` 后续必带、
+空闲 2.5s 自动补 `input_state=10`）。群里 / md 消息 / 图文 / 语音 / 按钮**一律照旧**。
+
+**为什么是"分段驱动"而不是"逐 token"**：KiraAI 的回复路径是**非流式**的
+（`core/agent/agent_executor.py` 用 `await model.chat(request)` 一次拿完整结果），
+核心**没有**把 token 增量暴露给插件。但生态里已有增量来源 —— 提速器插件会在
+LLM 客户端内部改成 `chat_stream()`，把**已成型的 `<msg>` 段**经**框架发送层**发出来。
+对插件来说"一次发送 = 一段文本"，所以这里把这些段合成一条流式消息。
+
+**兼容设计（这段是重点）**：
+
+* 只碰 `msg_type=0` 的**私聊纯文本**；富媒体/键盘/引用/群聊一律原路返回；
+* 返回值和普通发送**同形**（`{"id", "ext_info"}`）⇒ 框架的展示态 id、引用索引、
+  `_sent_message_ids`（引用机器人 = 被唤醒）**全部照旧**，不用改核心一行；
+* **任何一步失败 ⇒ 返回 None，调用方照常发行**（消息绝不丢）；
+  连续失败 2 次对该会话冷却 10 分钟；平台明确无权限时全局停用；
+* 段数上限 30、最小间隔 500ms、限流（429/50002）指数退避并推进 `index`（官方做法）。
+
+### 3. 测试
+
+* `tests/audit_stream_retry.py` —— 脚本化故障真跑上传全链路：该重试的重试、
+  日额度不重试、持久重试、合并退避 2s、预算到点放手、官方参数逐项核对。
+* `tests/audit_c2c_stream.py` —— 判据保守性 / 首片与次片形状 / 累积全文 /
+  空闲收尾 / 失败回退与冷却 / 限流重试 / `close_all` / api 层集成
+  （私聊纯文本走流式，群聊与 md 照旧）。
+
+</details>
+
+<details>
 <summary><b>v1.6.2</b> — ★★★ 语音变成文件卡片的根因（`file_name`）+ 新能力「输入中…」</summary>
 
 ### 1. ★★★ 语音为什么仍是文件卡片：我们给语音带了 `file_name`

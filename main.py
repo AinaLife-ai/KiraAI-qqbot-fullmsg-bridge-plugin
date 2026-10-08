@@ -109,6 +109,7 @@ from core_profiles import (
     is_allowed as profile_is_allowed,
     message_types_of,
 )
+from c2c_stream import C2CStreamManager
 from group_names import GroupInfoCache
 from rich_content import (
     KEYBOARD_TAG_DESCRIPTION,
@@ -288,6 +289,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self.interaction_enabled = bool(basic.get("interaction_enabled", True))
         #: 私聊「输入中…」状态（官方能力，核心没有；见 _maybe_send_typing）
         self.typing_enabled = bool(basic.get("typing_enabled", True))
+        #: 私聊流式消息（官方 stream_messages；见 c2c_stream.py）
+        self.c2c_stream_enabled = bool(basic.get("c2c_stream_enabled", True))
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -390,6 +393,9 @@ class QQOfficialGroupBridge(BasePlugin):
         self.group_names = GroupInfoCache(
             path=_group_names_path() if self.group_name_enabled else None
         )
+        #: 私聊流式消息管理器（官方能力；关掉后行为与从前完全一致）
+        self.c2c_stream = C2CStreamManager(
+            self, logger, enabled=self.c2c_stream_enabled)
         #: api 层发送补丁（markdown / keyboard / 引用）
         self.api_send = ApiSendPatcher(self, logger)
         #: 3.0 增量增强（群名 + 引用唤醒补丁）
@@ -506,6 +512,11 @@ class QQOfficialGroupBridge(BasePlugin):
         for t in getattr(self, "_typing_tasks", []):
             if not t.done():
                 t.cancel()
+        # 流式消息：给还没收尾的补一个结束帧（best-effort，绝不抛）
+        try:
+            await self.c2c_stream.close_all()
+        except Exception:
+            pass
         await self._flush_identities(force=True)
         await self._flush_group_names(force=True)
         logger.info(
@@ -769,6 +780,13 @@ class QQOfficialGroupBridge(BasePlugin):
             self._maybe_send_typing(event)
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
+        # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
+        try:
+            target = self._c2c_target_of(event)
+            if target:
+                self.c2c_stream.note_turn_start(target)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 流式消息收尾调度异常（忽略）: %s", exc)
 
         # ---- 3.0 增量（群名 / 引用唤醒补洞），幂等 ----
         profile = self._profile_for(event)
@@ -1868,6 +1886,21 @@ class QQOfficialGroupBridge(BasePlugin):
     #: 刷新防抖：官方 SDK 建议在到期前刷新；Hermes 实测用 50 秒
     _TYPING_DEBOUNCE = 50.0
 
+    @staticmethod
+    def _c2c_target_of(event) -> str:
+        """这个事件是不是**单聊**？是就返回对方 openid，否则返回空串。
+
+        「输入中…」与「流式消息」都只对单聊生效（官方限制），共用这一个判据。
+        """
+        try:
+            message = getattr(event, "message", None)
+            if message is None or getattr(message, "group", None) is not None:
+                return ""
+            sender = getattr(message, "sender", None)
+            return str(getattr(sender, "user_id", "") or "")
+        except Exception:
+            return ""
+
     def _maybe_send_typing(self, event) -> bool:
         """模型开始思考时，给**私聊**会话发一个「输入中」状态。返回是否已排队。
 
@@ -1894,11 +1927,7 @@ class QQOfficialGroupBridge(BasePlugin):
         if not self.typing_enabled or not self.enabled:
             return False
         try:
-            message = getattr(event, "message", None)
-            if message is None or getattr(message, "group", None) is not None:
-                return False                      # 仅单聊（官方限制）
-            sender = getattr(message, "sender", None)
-            target = str(getattr(sender, "user_id", "") or "")
+            target = self._c2c_target_of(event)
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
             if not target or not adapter_name:
                 return False
