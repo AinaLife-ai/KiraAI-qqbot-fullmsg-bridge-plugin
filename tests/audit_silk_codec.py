@@ -38,7 +38,7 @@ print("\n[1] mp3 → silk（ffmpeg 解码 + pilk 编码）")
 out = asyncio.run(A.to_silk_if_needed(mp3, logger_=L()))
 print(f"      → {out}")
 ck("★ 成功产出 silk 文件", bool(out) and os.path.exists(out), repr(out))
-ck("★ 产物带 silk 魔数", bool(out) and open(out,'rb').read(9)==b"#!SILK_V3")
+ck("★ 产物带 silk 魔数", bool(out) and open(out,'rb').read(10)==b"\x02#!SILK_V3")
 ck("★ pilk.encode 参数正确（rate=24000, tencent=True）",
    len(CALLS)==1 and CALLS[0]["rate"]==24000 and CALLS[0]["tencent"] is True, str(CALLS))
 ck("★ 传入的 PCM 是 ffmpeg 真解出来的（非空）",

@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.8
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.9
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,75 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.9</b> — ★★★ 挖到语音条的根：**腾讯系 silk 头 `\x02`**（缺了 QQ 就当文件发）</summary>
+
+### 从 silk 编码器源码里挖出的**确切差异**
+
+读了 `silk-v3-decoder` 的 `Encoder.c`，`-tencent` 到底做了什么终于清楚了：
+
+```c
+// ① 开头：腾讯系**多写一个 0x02 字节**
+if (tencent) {
+    static const char Tencent_break[] = "\x02";
+    fwrite(Tencent_break, 1, 1, bitOutFile);
+}
+fwrite("#!SILK_V3", ...);
+
+// ② 结尾：非腾讯系多写一个 0x00（腾讯系不写）
+if (!tencent) {
+    fwrite(&nBytes, 2, 1, bitOutFile);
+}
+```
+
+⇒ **腾讯系 = `\x02` + `#!SILK_V3` …**
+   **标准系 = `#!SILK_V3` … + `\x00`**
+
+**这不是"可选优化"，是 QQ 认不认的分水岭**：
+用标准系产出的 silk，QQ 会**当成文件**发 —— 显示成**文件卡片**而不是语音条。
+
+### 这解释了你遇到的现象
+
+你的 bot 用 `silk-wasm` 压 silk，而它的 API 是：
+
+```ts
+function encode(input, sampleRate): Promise<EncodeResult>
+                ^^^^^^  ^^^^^^^^^^   ← 只有两个参数，**没有 tencent 选项**
+```
+
+⇒ 产出的是**标准系 silk**（`#!SILK_V3` 开头，无 `\x02`）
+⇒ **QQ 不认** ⇒ 你看到的就是**文件卡片**。
+
+### 本版：加一道**保险**（每次都在这里校验）
+
+不管用哪个后端，产物出来都过一遍 `_fix_tencent_header`：
+
+* 已是腾讯系（`\x02#!SILK_V3`）⇒ 不动；
+* **是标准系 ⇒ 自动补上 `\x02` 头**（并打日志说明）；
+* 头部乱码 ⇒ 判失败，本条按文件发送（不硬改）。
+
+这样**即便某个后端的默认值变了**（或用户自己接了个不兼容的编码器），
+我们也一定能发出**语音条**。
+
+> 顺带确认：我们用的 `pysilk`（silk-python）的 `tencent` 参数**默认就是 True**，
+> `pilk` 我们也显式传了 `tencent=True`，`silk_v3_encoder` 带 `-tencent`。
+> 三道保险 + 这一道校验。
+
+### 测试
+
+`tests/audit_silk_tencent_header.py`（5 断言）：
+
+* 腾讯系 ⇒ 判 True 且不改动；
+* **标准系 ⇒ 自动补 `\x02` 头**，且修完就是腾讯系；
+* 乱码 ⇒ 判 False（**不硬改**）；
+* 文件不存在 ⇒ 不抛异常。
+
+另有两个测试的"silk 魔数"断言更新为**腾讯系头**（`\x02#!SILK_V3`）。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.8</b> — ★★ 图片尺寸**必需且必须真实**（用户拿到了决定性证据）</summary>
 
 ### 决定性证据

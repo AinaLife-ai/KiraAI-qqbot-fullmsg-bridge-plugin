@@ -228,6 +228,67 @@ def _encode_silk(encoder: str, pcm_path: str, silk_path: str, rate: int) -> bool
     return False
 
 
+def _fix_tencent_header(silk_path: str, logger_: Any = None) -> bool:
+    """**确保产物是腾讯系 silk**（QQ/微信认的那种）。
+
+    ## ★★★ 为什么要这一步（2026-10-08 挖到根上）
+
+    从 `silk-v3-decoder` 的 `Encoder.c` 源码里确认了 `-tencent` 的**确切差异**：
+
+    ```c
+    // ① 开头：腾讯系**多写一个 0x02 字节**
+    if (tencent) {
+        static const char Tencent_break[] = "\\x02";
+        fwrite(Tencent_break, 1, 1, bitOutFile);
+    }
+    fwrite("#!SILK_V3", ...);
+
+    // ② 结尾：非腾讯系多写一个 0x00（腾讯系不写）
+    if (!tencent) {
+        fwrite(&nBytes, 2, 1, bitOutFile);
+    }
+    ```
+
+    ⇒ **腾讯系 = `\x02` + `#!SILK_V3` …（结尾不带 0x00）**
+      标准系   = `#!SILK_V3` … + 0x00
+
+    **这不是"可选优化"，是 QQ 认不认的分水岭** ——
+    用标准系（例如 `silk-wasm` 的 `encode(pcm, rate)`，它**没有 tencent 选项**）
+    产出的 silk，QQ 会**当成文件**发，显示成文件卡片而不是语音条。
+
+    所以我们**每次都在这里校验一遍**：头不对就自己补/修 ——
+    这样即便某个后端的默认值变了（或用户自己接了个不兼容的编码器），
+    我们也一定能发出语音条。
+    """
+    try:
+        with open(silk_path, "rb") as f:
+            head = f.read(16)
+        if head[:1] == b"\x02" and head[1:10] == b"#!SILK_V3":
+            return True                       # 已经是腾讯系，不用动
+        if head[:9] == b"#!SILK_V3":
+            # 标准系：#!SILK_V3 … ⇒ 前面补一个 0x02 就是腾讯系
+            with open(silk_path, "rb") as f:
+                data = f.read()
+            with open(silk_path, "wb") as f:
+                f.write(b"\x02" + data)
+            if logger_ is not None:
+                logger_.info(
+                    "[QQBOT-BRIDGE] silk 产物原为**标准格式**，已自动补上腾讯系头部"
+                    "（QQ 只认腾讯系：\\x02 + #!SILK_V3）"
+                )
+            return True
+        if logger_ is not None:
+            logger_.warning(
+                "[QQBOT-BRIDGE] silk 产物头部异常（前 10 字节=%s），QQ 可能不认",
+                head[:10].hex(),
+            )
+        return False
+    except Exception as exc:
+        if logger_ is not None:
+            logger_.debug("[QQBOT-BRIDGE] 校验 silk 头失败: %s", exc)
+        return False
+
+
 def _convert_sync(src: str, out_dir: str) -> Optional[str]:
     """同步转码：`src`（任意音频）→ silk 文件路径；失败返回 None。
 
@@ -294,6 +355,10 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
 
     if not ok or not os.path.exists(silk_path) or os.path.getsize(silk_path) == 0:
         logger.warning("[QQBOT-BRIDGE] silk 转码产物为空（后端=%s）", encoder)
+        return None
+    # ★ 保险：**必须是腾讯系 silk**，否则 QQ 会当文件发（见 _fix_tencent_header）
+    if not _fix_tencent_header(silk_path, logger):
+        logger.warning("[QQBOT-BRIDGE] silk 产物不是 QQ 认的格式（后端=%s）—— 本条按文件发送", encoder)
         return None
     return silk_path
 

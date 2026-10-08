@@ -46,7 +46,7 @@ out = asyncio.run(A.to_silk_if_needed(mp3))
 ck("★ 转码成功", bool(out) and os.path.exists(out), repr(out))
 ck("★ 调用参数正确（pcm_rate=24000）",
    bool(CALLS) and CALLS[0][0]=="pysilk" and CALLS[0][1]==24000, str(CALLS))
-ck("★ 产物带 silk 魔数", bool(out) and open(out,'rb').read(9)==b"#!SILK_V3")
+ck("★ 产物带 silk 魔数", bool(out) and open(out,'rb').read(10)==b"\x02#!SILK_V3")
 
 print("\n═══ ② 只有 pilk 时退回它 ═══")
 CALLS.clear()
