@@ -146,6 +146,55 @@ def _guess_name(element: Any) -> str:
 #: 只提示一次：模型把音频用 `<file>`（而非 `<file type="record">`）发出来
 _AUDIO_AS_FILE_LOGGED = False
 
+#: 只提示一次：每种 file_type 实际发出的上传体形状（排查"平台为什么不认"的关键信息）
+_SHAPE_LOGGED: set = set()
+
+#: 官方上传/发送错误码 → 人话（来源：官方「单聊/群聊富媒体上传」错误码表）
+_UPLOAD_HINT = {
+    "850018": "群被禁言或机器人被禁言 —— 解禁后再发",
+    "850019": "平台不支持这个文件格式（语音只认 silk，图片只认 png/jpg）",
+    "850026": "平台下载不到这个 URL（转存失败），换一个可直接访问的地址",
+    "850027": "平台发送数据超时 —— 稍后重试即可",
+    "850031": "文件超过平台大小限制",
+    "304080": "文件信息无效（file_info 已过期或损坏 —— 重新上传即可）",
+    "40093001": "上传通道（BDH）异常 —— 重试即可",
+    "40093002": "★ **今天的分片上传日额度已用完** —— 只能等明天；"
+                "但小文件（<5MB、走 base64 直传）不受此额度限制",
+}
+
+
+def humanize_upload_error(exc: Any) -> str:
+    """把平台的上传/发送错误翻译成"用户看了知道该做什么"的一句话。
+
+    为什么要做：官方错误码表里 `40093002`（日额度）与 `850019`（格式不支持）
+    这两类**根本不是 bug**，但日志里只有一串英文/数字，
+    用户只会看到"图/语音又发不出去"，然后来问为什么。
+    """
+    text = str(exc)
+    for code, hint in _UPLOAD_HINT.items():
+        if code in text:
+            return f"[{code}] {hint}"
+    return ""
+
+
+def _log_upload_shape_once(file_type: int, payload: dict, logger_: Any) -> None:
+    """把**实际发出的上传体形状**记一条 INFO（去掉 file_data，只留字段名与大小）。
+
+    为什么值得单独记（2026-10-08）：排查"平台为什么把它当文件"时，
+    **"我们到底发了什么"是唯一能对齐官方实现的东西**，而日志里原来完全没有 ——
+    只能靠猜（已经因此浪费过好几轮）。
+    """
+    if logger_ is None or file_type in _SHAPE_LOGGED:
+        return
+    _SHAPE_LOGGED.add(file_type)
+    fields = {k: (f"<base64 {len(v) // 1024}KB>" if k == "file_data" else v)
+              for k, v in payload.items() if k not in ("group_openid", "openid")}
+    logger_.info(
+        "[QQBOT-BRIDGE] 媒体上传体形状（file_type=%s）：%s —— "
+        "官方口径：file_name 只对 file_type=4 发（腾讯 Node SDK / openclaw-qqbot / Hermes 三家一致）",
+        file_type, fields,
+    )
+
 
 def _maybe_log_audio_as_file(media_element: Any, logger_: Any) -> None:
     """音频被**当普通文件**发（`<file>` 而不是 `<file type="record">`）时提示一次。
@@ -226,11 +275,11 @@ async def _retry_as_silk(api, target_id, media_element, is_group, exc, logger_):
                 )
             return None
         data = await asyncio.to_thread(Path(silk).read_bytes)
+        # ⚠ 同样**不带 file_name**（见 `_upload` 里那段依据）：语音带文件名会被当文件渲染。
         payload = {
             "file_type": FT_RECORD,
             "file_data": base64.b64encode(data).decode("ascii"),
             "srv_send_msg": False,
-            "file_name": os.path.basename(silk),
         }
         if is_group:
             payload["group_openid"] = target_id
@@ -365,9 +414,31 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
             "file_data": base64.b64encode(data).decode("ascii"),
             "srv_send_msg": False,
         }
+        # ★★★ `file_name` **只对 file_type=4（文件）发** —— 2026-10-08 定案。
+        #
+        #   三家官方/官方推荐实现完全一致（都不给语音带文件名）：
+        #
+        #   ① 腾讯官方 Node SDK（`@tencent-connect/qqbot-nodejs`）
+        #      `src/protocol/api/media.ts`：
+        #          if (fileType === MediaFileType.FILE && opts.fileName) {
+        #              body.file_name = this.sanitize(opts.fileName);
+        #          }
+        #      其 `USAGE.md` 也写明：`fileName: ... // 仅 FILE 类型有效`。
+        #   ② 官方 openclaw-qqbot 走同一个 SDK（上传体里语音没有 file_name）。
+        #   ③ QQ 官方推荐的 Hermes（`gateway/platforms/qqbot/adapter.py`）：
+        #          body = {"file_type": file_type, "srv_send_msg": srv_send_msg}
+        #          ...
+        #          if file_type == MEDIA_TYPE_FILE and file_name:
+        #              body["file_name"] = file_name
+        #
+        #   ⇒ 我们原来给**语音**也带文件名（`jbf_v2.silk`），而用户看到的正是
+        #     **文件卡片 + 那个文件名**。给语音带名字属于超出文档约定的用法，
+        #     按官方口径对齐：非 FILE 一律不带。（图片/视频同理，一并去掉。）
         name = os.path.basename(silk_path) if silk_path else _guess_name(media_element)
-        if name:
+        if file_type == FT_FILE and name:
             payload["file_name"] = os.path.basename(name.split("?")[0])
+        # 一次性诊断：把"我们到底发了什么形状的体"写进日志（不含 file_data）
+        _log_upload_shape_once(file_type, payload, logger)
         if is_group:
             payload["group_openid"] = target_id
             route = Route("POST", "/v2/groups/{group_openid}/files",
@@ -382,10 +453,12 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
             result = await api._http.request(route, json=payload)
         except Exception as exc:
             if logger is not None:
+                _hint = humanize_upload_error(exc)
                 logger.warning(
-                    "[QQBOT-BRIDGE] 媒体上传失败（file_type=%s，文件=%s）：%s: %s",
+                    "[QQBOT-BRIDGE] 媒体上传失败（file_type=%s，文件=%s）：%s: %s%s",
                     file_type, os.path.basename(str(file_path)),
                     type(exc).__name__, str(exc)[:200],
+                    ("\n    → " + _hint) if _hint else "",
                 )
             # ★ 「原样发的 mp3/ogg 被平台拒了」⇒ **转 silk 再试一次**（只试一次）。
             #   这样既保留了「官方支持就直接发」的快路径，

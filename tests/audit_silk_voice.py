@@ -167,9 +167,12 @@ async def main():
     up = await send(Record(MP3, name="voice.mp3", mime="audio/mpeg"))
     ft = [u.get("file_type") for u in up]
     check("★ file_type=3（语音，不是 4=文件）", ft == [3], f"file_type={ft}")
-    check("★★ 已经转成 silk 再上传（文件名 .silk）",
-          bool(up) and str(up[0].get("file_name", "")).endswith(".silk"),
-          str(up[0].get("file_name")) if up else "")
+    import base64 as _b64
+    _data = _b64.b64decode((up[0].get("file_data") or "")) if up else b""
+    check("★★ 上传的**字节**是转码后的腾讯系 silk（\\x02#!SILK_V3）",
+          _data[:10] == b"\x02#!SILK_V3", _data[:12].hex())
+    check("★★ 语音上传体**不带 file_name**（腾讯 Node SDK / openclaw-qqbot / Hermes 三家一致）",
+          bool(up) and "file_name" not in up[0], str(list(up[0].keys())) if up else "")
     check("★ 确实调用了 silk 编码器（腾讯系）",
           len(SILK_CALLS) == 1 and SILK_CALLS[0]["tencent"] is True, str(SILK_CALLS))
 
@@ -248,9 +251,10 @@ async def main():
     check("★ file_type=3（当语音条发）", ft == [3], f"file_type={ft}")
     check("★★ 内容不是 silk ⇒ 走了转码（否则 QQ 会降级成文件卡片）",
           len(SILK_CALLS) == 1, str(SILK_CALLS))
-    check("★ 上传的是转码产物（不是那个假 silk）",
-          bool(up) and str(up[0].get("file_name", "")).endswith(".silk"),
-          str(up[0].get("file_name")) if up else "")
+    _d2 = _b64.b64decode((up[0].get("file_data") or "")) if up else b""
+    check("★ 上传的是转码产物（不是那个假 silk 的原字节）",
+          _d2[:10] == b"\x02#!SILK_V3" and len(_d2) != os.path.getsize(FAKE),
+          f"{_d2[:10]!r} len={len(_d2)} vs fake={os.path.getsize(FAKE)}")
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.1
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -126,6 +126,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `markdown_enabled` | 开 | 注册 `<markdown>` 标签，让模型能发富文本（官方 2026-04-23 起自定义 markdown 对所有机器人开放，无需申请模板） |
 | `keyboard_enabled` | 开 | 注册 `<keyboard>` 标签，让模型能在消息下挂内联按钮 |
 | `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
+| `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
 | `extra_intents` | **开** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；插件会在连接时自动补上订阅位并请一次重连，**需重启 KiraAI** 生效。个别环境被平台拒绝订阅时会自动回退 |
 
 ### 关于「发文件」——本插件**不做**（框架原生已支持）
@@ -448,6 +449,57 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.2</b> — ★★★ 语音变成文件卡片的根因（`file_name`）+ 新能力「输入中…」</summary>
+
+### 1. ★★★ 语音为什么仍是文件卡片：我们给语音带了 `file_name`
+
+三家官方/官方推荐实现**完全一致：`file_name` 只对 `file_type=4`（文件）发**：
+
+| 实现 | 源码 | 判据 |
+|---|---|---|
+| 腾讯官方 Node SDK `@tencent-connect/qqbot-nodejs` | `src/protocol/api/media.ts` | `if (fileType === MediaFileType.FILE && opts.fileName) { body.file_name = … }`，且 `USAGE.md` 写「`fileName` … **仅 FILE 类型有效**」 |
+| 官方 openclaw-qqbot | 走同一个 SDK | 语音上传体里**没有** `file_name` |
+| QQ 官方推荐的 Hermes | `gateway/platforms/qqbot/adapter.py` | `body = {"file_type":…, "srv_send_msg":…}`，`if file_type == MEDIA_TYPE_FILE and file_name:` 才加名字 |
+
+而我们一直给语音带上了文件名 —— 你截图里文件卡片上显示的名字
+（`jbf_v2.silk` / `jbf_voice60s.ogg`）**正是我们传过去的那个 `file_name`**。
+
+本版严格对齐：**非 FILE 一律不带 `file_name`**（图片/视频同理），文件仍然带。
+另外每次发媒体会记一条**上传体形状**日志（不含内容），下次万一还有问题，
+一眼就能和官方实现逐字段对齐 —— 前几轮排查最缺的就是这一行。
+
+### 2. ★★ 新能力：私聊「输入中…」（`msg_type=6`）
+
+模型开始思考时，在**单聊**里显示「对方正在输入…」，而不是让对方发呆 10~20 秒。
+KiraAI 核心两代都没有这个能力，官方两家都有：
+
+* 腾讯官方 Node SDK：`bot.sendTyping(target, 30)` —— 注释写明「**仅在 C2C 可用**」；
+* 官方推荐的 Hermes：`send_typing()` —— C2C-only、60 秒时长、**50 秒防抖**、必须有入站 `msg_id`。
+
+三个自我约束：**只做单聊**（官方限制）、**发失败绝不影响回复**（fire-and-forget）、
+**同会话 50 秒只发一次**（防 agent 多步循环刷屏）。
+配置项 `typing_enabled`，默认开。
+
+> 实现细节：**不能走 botpy 的 `post_c2c_message`** —— 它用 `payload = locals()`
+> 组装请求体，多传的 `input_notify` 会被**静默丢掉**（消息照发，但不是输入中状态）。
+> 所以直接走底层 `Route`。
+
+### 3. ★ 上传类错误「人话化」
+
+官方错误码表里的这几类根本不该让用户猜（`40093002` 是**今天的分片上传日额度用完了**，
+`850019` 是格式不支持，`850026` 是平台下载不到 URL…）。现在日志里会直接跟一句
+「→ 怎么办」，图片转存与媒体上传两条路径都覆盖。
+
+### 4. 测试
+
+* 新增 `tests/audit_upload_payload_shape.py` —— 真跑上传路径，断言
+  **`file_name` 只出现在 `file_type=4`**（含反向验证：旧形状会被抓到）+ 错误码人话化。
+* 新增 `tests/audit_typing_indicator.py` —— 输入中状态：只发单聊 / 需要入站 msg_id /
+  50 秒防抖 / 失败不影响调用方 / 走底层 Route。
+
+</details>
+
+<details>
 <summary><b>v1.6.1</b> — ★★★ 三个问题的真根因：md 图片缺 Content-Type / 语音「只信 silk」/ 私聊昵称记了没人读</summary>
 
 ### 0. 结论先摆出来（每个都有证据，不是"再试一次"）

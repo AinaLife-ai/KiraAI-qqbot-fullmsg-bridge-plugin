@@ -523,10 +523,17 @@ async def _upload_bytes_to_qq(
         #   然后来问"为什么"——而日志里什么都没有。线上就被这个坑过一次
         #   （`400 / 850019 富媒体文件格式不支持`，因为分片拼装错了）。
         if logger is not None:
+            try:
+                from media_types import humanize_upload_error
+
+                _hint = humanize_upload_error(exc)
+            except Exception:
+                _hint = ""
             logger.warning(
-                "[QQBOT-BRIDGE] 图片转存到 QQ 失败（%s: %s）—— 本条图片按原地址发送，"
+                "[QQBOT-BRIDGE] 图片转存到 QQ 失败（%s: %s）%s —— 本条图片按原地址发送，"
                 "QQ 可能仍显示成 alt 文字；若持续如此请把本条连同日志反馈",
                 type(exc).__name__, str(exc)[:160],
+                ("\n    → " + _hint) if _hint else "",
             )
         return None
 

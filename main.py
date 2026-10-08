@@ -286,6 +286,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self.markdown_enabled = bool(basic.get("markdown_enabled", True))
         self.keyboard_enabled = bool(basic.get("keyboard_enabled", True))
         self.interaction_enabled = bool(basic.get("interaction_enabled", True))
+        #: 私聊「输入中…」状态（官方能力，核心没有；见 _maybe_send_typing）
+        self.typing_enabled = bool(basic.get("typing_enabled", True))
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -341,6 +343,11 @@ class QQOfficialGroupBridge(BasePlugin):
         #: ★ 本实例发起的「请重连」任务 —— terminate 时必须全部取消，
         #   否则每次重载都漏一个在跑（会让连接反复重连 ⇒ 消息重复）。
         self._reconnect_tasks: list = []
+        #: 私聊「输入中」状态：target -> 上次发送时间（防抖，见 _maybe_send_typing）
+        self._typing_sent_at: dict = {}
+        self._typing_tasks: list = []
+        self._typing_logged = False
+        self._typing_seq = 1000
         #: 会话名回填：已处理过的适配器（只做一次）
         self._backfilled: set = set()
         self._backfill_tasks: list = []
@@ -493,6 +500,10 @@ class QQOfficialGroupBridge(BasePlugin):
                 pass
         self._reconnect_tasks = []
         for t in getattr(self, "_backfill_tasks", []):
+            if not t.done():
+                t.cancel()
+        # 「输入中」状态是 fire-and-forget 的小任务，顺手收干净（不留 pending）
+        for t in getattr(self, "_typing_tasks", []):
             if not t.done():
                 t.cancel()
         await self._flush_identities(force=True)
@@ -752,6 +763,12 @@ class QQOfficialGroupBridge(BasePlugin):
                 tag_set.register(cls(self.ctx, desc))
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 注册标签 %s 失败: %s", cls.__name__, exc)
+
+        # ---- 私聊「输入中…」（官方能力，核心没有；非阻塞、失败无副作用）----
+        try:
+            self._maybe_send_typing(event)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
 
         # ---- 3.0 增量（群名 / 引用唤醒补洞），幂等 ----
         profile = self._profile_for(event)
@@ -1842,6 +1859,106 @@ class QQOfficialGroupBridge(BasePlugin):
             cap = _resolve_im_capability(adapter)
         self._capability_cache[id(adapter)] = cap if cap is not None else _MISS
         return cap
+
+    # ------------------------------------------------------------------ #
+    # 私聊「输入中…」状态（官方能力，KiraAI 核心两代都没有）
+    # ------------------------------------------------------------------ #
+    #: 官方限制：`input_second` 最大 60 秒（腾讯 Node SDK 默认 30，Hermes 用 60）
+    _TYPING_SECONDS = 60
+    #: 刷新防抖：官方 SDK 建议在到期前刷新；Hermes 实测用 50 秒
+    _TYPING_DEBOUNCE = 50.0
+
+    def _maybe_send_typing(self, event) -> bool:
+        """模型开始思考时，给**私聊**会话发一个「输入中」状态。返回是否已排队。
+
+        ## 为什么加这个（核心没有，官方两家都有）
+
+        * 腾讯官方 Node SDK：`bot.sendTyping(target, 30)`
+          —— 注释写明「**仅在 `target.scope === "c2c"` 时可用**」，载荷
+          `{msg_type: 6, msg_id, input_notify: {input_type: 1, input_second: N}}`；
+        * QQ 官方推荐的 Hermes（`gateway/platforms/qqbot/adapter.py`）：
+          `send_typing()` —— C2C-only、60 秒时长、50 秒防抖、必须有入站 `msg_id`。
+
+        对聊天机器人来说这是**最直观的体验提升**：模型跑 10~20 秒时，
+        用户看到的是「对方正在输入…」，而不是发呆。
+
+        ## 三条自我约束
+
+        1. **只做单聊**（官方明确只支持 C2C；群里发会被拒）；
+        2. **必须有入站 msg_id**（被动窗口内才有效）；
+        3. **发失败绝不影响这一轮**：整个调用丢进 create_task，异常只写 debug。
+
+        挂点选在 `ON_LLM_REQUEST`（= "这一轮开始跑模型"的那一瞬间），
+        用同一个会话 50 秒防抖，避免多步 agent 循环每个 step 都发一次。
+        """
+        if not self.typing_enabled or not self.enabled:
+            return False
+        try:
+            message = getattr(event, "message", None)
+            if message is None or getattr(message, "group", None) is not None:
+                return False                      # 仅单聊（官方限制）
+            sender = getattr(message, "sender", None)
+            target = str(getattr(sender, "user_id", "") or "")
+            adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+            if not target or not adapter_name:
+                return False
+            now = time.time()
+            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
+                return False
+            adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
+            if adapter is None:
+                return False
+            client = adapter.get_client()
+            if client is None:
+                return False
+            reply_ids = self._adapter_attr(adapter, "_direct_reply_ids") or {}
+            msg_id = str(reply_ids.get(target) or "")
+            if not msg_id:
+                return False                      # 没有新鲜的入站 msg_id ⇒ 发了也没用
+            self._typing_sent_at[target] = now    # 先占位（并发时不会重复排）
+            task = asyncio.ensure_future(
+                self._send_typing(adapter, client, target, msg_id)
+            )
+            self._typing_tasks.append(task)
+            self._typing_tasks = [t for t in self._typing_tasks if not t.done()][-8:]
+            return True
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中状态：调度失败（忽略）: %s", exc)
+            return False
+
+    async def _send_typing(self, adapter, client, target: str, msg_id: str) -> None:
+        """真正发出「输入中」状态。
+
+        ⚠ **不能走 botpy 的 `post_c2c_message`**：它用 `payload = locals()` 组装请求体，
+        只包含它自己声明的参数 —— 多传的 `input_notify=` 会被**静默丢掉**
+        （消息照发，但不是输入中状态）。所以直接走底层 Route。
+        """
+        try:
+            from botpy.http import Route
+
+            api = getattr(client, "api", None)
+            http = getattr(api, "_http", None)
+            if http is None:
+                return
+            # msg_seq：与核心的 1..N 序号**刻意错开**（官方 SDK 用递增计数，
+            # Hermes 用随机数），避免和真正的回复撞 "同一 msg_id+msg_seq 重复"。
+            seq = self._typing_seq = (getattr(self, "_typing_seq", 1000) + 1) % 60000
+            route = Route("POST", "/v2/users/{openid}/messages", openid=target)
+            await http.request(route, json={
+                "msg_type": 6,
+                "msg_id": msg_id,
+                "msg_seq": seq,
+                "input_notify": {"input_type": 1, "input_second": self._TYPING_SECONDS},
+            })
+            if not self._typing_logged:
+                self._typing_logged = True
+                logger.info(
+                    "[QQBOT-BRIDGE] 已在私聊里发「输入中…」状态（msg_type=6，%d 秒）——"
+                    "官方能力，KiraAI 核心没有；只在单聊生效，发失败不影响回复",
+                    self._TYPING_SECONDS,
+                )
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中状态发送失败（忽略）: %s", exc)
 
     def _adapter_attr(self, adapter, attr: str, default=None):
         """取适配器上的方法/属性 —— **两处都找**（2.x 在实例上，3.0 在能力对象上）。
