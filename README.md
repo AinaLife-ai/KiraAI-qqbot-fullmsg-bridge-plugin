@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.9
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,70 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.0</b> — ★★ 修掉「已 silk 不走校验」的真 bug / mp3·wav·ogg 先原样发 / 3.0 私聊昵称</summary>
+
+### 1. ★★ 语音条的真 bug：**已经是 silk 的文件绕过了腾讯系头校验**
+
+v1.5.9 加了「腾讯系头校验」，但代码是这样：
+
+```python
+if path.lower().endswith(_SILK_EXT) or _is_silk_file(path):
+    return path          # ← 直接返回，**跳过了校验**！
+```
+
+⇒ 如果这个 silk 是**标准系**（例如 `silk-wasm` 的 `encode(pcm, rate)`
+产出 —— 它**没有 tencent 选项**），我们原样发给 QQ ⇒ **QQ 不认** ⇒ 文件卡片。
+
+**你的 `jbf_v2.silk` 正是这种情况** —— 我们一直没修它。
+
+**修**：已 silk 也要过一遍校验；标准系**就地补上 `\x02` 头**；头乱码才退回按文件发。
+
+### 2. ★ mp3 / wav / ogg **先原样发**（官方明说支持）
+
+官方「富媒体消息概述」写得很清楚：
+
+> **语音**：支持 **`silk/mp3/wav/ogg`** 格式，发送后展示语音条
+
+而同一页的「文件类型与限制」表里 `file_type=3` 只列了 silk —— 文档自身不一致。
+第三方实测称 mp3 会降级成文件。**两个说法都可能对**（平台版本/白名单差异）。
+
+⇒ 采取**两条路都走**：
+
+1. 源文件是 **mp3/wav/ogg** ⇒ **先原样按 `file_type=3` 发**
+   （**零转码、零依赖、最快** —— 连 pilk/ffmpeg 都不用装）；
+2. 被平台拒了 ⇒ **自动转 silk 再试一次**（只试一次）。
+3. 源文件**已经是 silk** ⇒ 校验腾讯系头后直接用。
+
+**全程不阻塞**：转码走 `asyncio.to_thread`，读文件也是 —— 事件循环不受影响。
+
+### 3. 3.0 私聊昵称（你说「又变回 hex 了」）
+
+**根因**：QQ 官方 API 里 **C2C（私聊）的 `author.username` 恒为空**，
+而**群消息是带 username 的**。核心的 `nickname()` 只从 `author.username` 取，
+取不到就回退成 `user_id`（那串 hex）。
+
+我们的 `IdentityStore` 就是为这件事写的（跨场景共享：群里认识过的人，私聊也认得），
+但它的学习入口挂在 **2.x 的事件处理**里 —— 3.0 上我们**不接管事件**，所以一直学不到。
+
+**修**（按你的要求，安全实现）：包一层 `_handle_message`（群/私聊的**统一入口**），
+**只旁听、只记昵称** —— 不接管、不造事件、不改任何返回值。
+学到群里的真昵称后，私聊也能用上。
+
+> ⚠️ 这是「旁听」而非「接管」：核心的事件流、去重、@ 解析全都不受影响。
+
+### 测试
+
+| 文件 | 断言 | 覆盖 |
+|------|-----|------|
+`tests/audit_silk_already.py` | 5 | **已 silk 也走校验**：标准系自动修、腾讯系不动、乱码拒收 |
+`tests/audit_silk_tencent_header.py` | 5 | 头校验本体 |
+`tests/audit_silk_voice.py` | 11 | mp3 原样发（不转码）／**被拒自动重试**／file→4／video→2 |
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.9</b> — ★★★ 挖到语音条的根：**腾讯系 silk 头 `\x02`**（缺了 QQ 就当文件发）</summary>
 
 ### 从 silk 编码器源码里挖出的**确切差异**

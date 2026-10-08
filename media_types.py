@@ -56,17 +56,49 @@ KEEP_AS_IS = "\x00KEEP"
 
 
 async def maybe_convert_to_silk(media_element: Any, logger_: Any) -> Optional[str]:
-    """`Record` 音频若不是 silk，就转成 silk 并返回**新文件路径**。
+    """决定 `Record` 音频该怎么发（silk 优先，但不强求）。
+
+    ## ★ 官方文档与实测的冲突（2026-10-08）
+
+    官方「富媒体消息概述」写：
+
+    > **语音**：支持 **`silk/mp3/wav/ogg`** 格式，发送后展示语音条
+
+    但同一页的「文件类型与限制」表里，`file_type=3 语音` 的格式只列了 **silk**；
+    第三方项目实测也称「MP3 直接上传会降级成文件」。
+
+    ⇒ **两个说法都可能有适用条件**（可能是平台版本/白名单差异）。
+    所以这里采取**两条路都试**的策略，而不是一刀切：
+
+    * 源文件**已经是 silk** ⇒ 校验腾讯系头后**直接用**（最省事）；
+    * 源文件是 **mp3/wav/ogg** ⇒ **先原样按 `file_type=3` 发**（官方说支持，
+      这样**零转码、零依赖、最快**）；调用方发现被降级再转 silk（见 `media_types`）。
 
     返回值语义（调用方必须区分）：
 
-    * ``KEEP_AS_IS`` —— 源文件本来就是 silk，**路径不用改**，`file_type` 保持 3；
-    * ``<路径>``     —— 转码成功，**改用这个路径**上传；
-    * ``None``       —— 转不了（缺依赖 / 解码失败 / 远程地址）
-      ⇒ 调用方**按文件（file_type=4）发**，宁可降级也不失败。
-
-    ★ 只处理**本地文件**；远程 URL 交给平台自己处理。
+    * ``KEEP_AS_IS`` —— 源文件本身就是（合法的）silk，**路径不用改**，类型保持 3；
+    * ``<路径>``     —— 已转码成 silk，改用这个路径；
+    * ``None``       —— 源文件不是 silk（mp3/ogg/wav）⇒ **先原样发**，别转。
+      调用方据此保持原路径 + `file_type=3`。
     """
+    try:
+        if getattr(media_element, "file_type", None) == "url":
+            return None                       # 远程地址：交给平台自己处理
+        from audio_silk import to_silk_if_needed, is_silk_path
+        path = await media_element.to_path()
+        if not path or not os.path.isfile(path):
+            return None
+        # ★ 只对"本来就是 silk"的做校验+放行；其它格式**先原样发**（不转码）
+        if not is_silk_path(path):
+            return None                       # ⇒ 调用方按原文件 + file_type=3 发
+        silk = await to_silk_if_needed(path, logger_=logger_)
+        if not silk:
+            return None                       # silk 但头不合法 ⇒ 退回按文件发
+        return KEEP_AS_IS                     # 合法 silk ⇒ 原路径、类型保持 3
+    except Exception as exc:
+        if logger_ is not None:
+            logger_.debug("[QQBOT-BRIDGE] silk 判断失败: %s", exc)
+        return None
     try:
         if getattr(media_element, "file_type", None) == "url":
             return None                       # 远程地址：不动
@@ -130,6 +162,49 @@ def classify(element: Any) -> Optional[int]:
     return None
 
 
+async def _retry_as_silk(api, target_id, media_element, is_group, exc, logger_):
+    """原样发被拒 ⇒ 转成 silk 再上传一次。返回结果或 None（转不了就交回）。
+
+    ⚠ **全程不阻塞**：转码本身在 `to_silk_if_needed` 里走 `asyncio.to_thread`，
+      读文件同样 `to_thread` —— 事件循环不会卡。
+    """
+    try:
+        from audio_silk import convert_to_silk_forced
+        src = await media_element.to_path()
+        silk = await convert_to_silk_forced(src, logger_= logger_)
+        if not silk:
+            if logger_ is not None:
+                logger_.warning(
+                    "[QQBOT-BRIDGE] 该音频被平台拒了，且无法转成 silk"
+                    "（缺 pilk/ffmpeg 或解码失败）—— 本条按「文件」发送",
+                )
+            return None
+        data = await asyncio.to_thread(Path(silk).read_bytes)
+        payload = {
+            "file_type": FT_RECORD,
+            "file_data": base64.b64encode(data).decode("ascii"),
+            "srv_send_msg": False,
+            "file_name": os.path.basename(silk),
+        }
+        if is_group:
+            payload["group_openid"] = target_id
+            route = Route("POST", "/v2/groups/{group_openid}/files",
+                          group_openid=target_id)
+        else:
+            payload["openid"] = target_id
+            route = Route("POST", "/v2/users/{openid}/files", openid=target_id)
+        if logger_ is not None:
+            logger_.info(
+                "[QQBOT-BRIDGE] 已把音频转成 silk 并重试上传（file_type=3，文件=%s）",
+                os.path.basename(silk),
+            )
+        return await api._http.request(route, json=payload)
+    except Exception as exc2:
+        if logger_ is not None:
+            logger_.warning("[QQBOT-BRIDGE] 转 silk 重试也失败：%s", exc2)
+        return None
+
+
 def install(holder: Any, client: Any, logger: Any = None) -> bool:
     """把 `holder._upload_file` 换成「类型更准」的版本。幂等。
 
@@ -172,6 +247,8 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         #   转不了（缺依赖 / 解码失败）就**退回 file_type=4 按文件发** ——
         #   宁可降级成文件，也绝不失败。
         silk_path = None
+        #: 原样发的音频被平台拒时，是否值得转 silk 重试（见下面 FT_RECORD 分支）
+        _pending_silk_retry = False
         _orig_kind = getattr(media_element, "_kira_bridge_orig_kind", None)
         _elem_name = _guess_name(media_element)
         _elem_size = None
@@ -193,16 +270,24 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         if file_type == FT_RECORD:
             got = await maybe_convert_to_silk(media_element, logger)
             if got == KEEP_AS_IS:
-                pass                          # 本来就是 silk，路径/类型都不动
+                pass                          # 本来就是（合法腾讯系）silk，全部不动
             elif got:
                 silk_path = got
             else:
-                # 转不了 ⇒ 按「文件」发（用户仍能下载/播放，不会丢消息）
-                file_type = FT_FILE
+                # ★ 不是 silk（mp3/wav/ogg）⇒ **先原样按 file_type=3 发**。
+                #
+                #   官方「富媒体概述」明说语音支持 `silk/mp3/wav/ogg`，
+                #   所以先按官方说的试一次 —— **零转码、零依赖、最快**，
+                #   也不用装 pilk/ffmpeg。
+                #
+                #   若平台把它降级成文件（第三方实测称 mp3 会降级），
+                #   下面 `_upload` 的重试逻辑会自动再转成 silk 发一次。
+                _pending_silk_retry = True
                 if logger is not None:
                     logger.info(
-                        "[QQBOT-BRIDGE] 无法把音频转成 silk（缺依赖或解码失败）——"
-                        "本条按「文件」发送；装上 pilk + imageio-ffmpeg 后即可自动转成语音条",
+                        "[QQBOT-BRIDGE] 该音频不是 silk（%s）—— 先按官方支持的格式"
+                        "直接以「语音」发送；若被平台降级，会自动转 silk 重试",
+                        os.path.splitext(_elem_name or "")[1] or "?",
                     )
 
         # ---- 与核心逐行一致，唯一区别是 file_type 由上面算出来 ----
@@ -246,6 +331,14 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
                     file_type, os.path.basename(str(file_path)),
                     type(exc).__name__, str(exc)[:200],
                 )
+            # ★ 「原样发的 mp3/ogg 被平台拒了」⇒ **转 silk 再试一次**（只试一次）。
+            #   这样既保留了「官方支持就直接发」的快路径，
+            #   又保证最终一定能发成语音条。
+            if _pending_silk_retry and silk_path is None:
+                retried = await _retry_as_silk(
+                    api, target_id, media_element, is_group, exc, logger)
+                if retried is not None:
+                    return retried
             raise
         if logger is not None:
             _fi = result.get("file_info") if isinstance(result, dict) else getattr(result, "file_info", None)
@@ -255,6 +348,7 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
                 "拿到 file_info" if _fi else f"响应异常 {str(result)[:120]}",
             )
         return result
+
 
     setattr(_upload_file, "_kira_bridge_ftype", True)
     setattr(_upload_file, "_kira_bridge_orig", current)
