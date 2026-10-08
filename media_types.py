@@ -65,7 +65,19 @@ def classify(element: Any) -> Optional[int]:
     """按元素类型 + 扩展名给出官方 `file_type`。
 
     返回 None 表示「交回核心原逻辑」（例如 `File`/`Sticker`，核心按 4 处理是对的）。
+
+    ★ 也认 `media_coerce` 留下的 `_kira_bridge_orig_kind` 标记：
+    为了让核心的 `media_elements` 白名单认得 ` Record`/`Video`，
+    我们会把它们**临时换成 `File`** 再发；换的时候把原始类型记在标记里，
+    这里按**原始类型**给值，保证 `视频→2 / 语音→3` 不会因为"变成 File"而丢。
     """
+    # ★ 先看"换壳"标记（见 media_coerce）
+    orig = getattr(element, "_kira_bridge_orig_kind", None)
+    if orig == "Video":
+        return FT_VIDEO
+    if orig == "Record":
+        return FT_RECORD
+
     name = type(element).__name__
     if name == "Video":
         return FT_VIDEO

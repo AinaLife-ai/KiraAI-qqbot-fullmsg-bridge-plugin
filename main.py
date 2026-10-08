@@ -1460,9 +1460,15 @@ class QQOfficialGroupBridge(BasePlugin):
                 md_token = PENDING_MD.set(md_text)
                 kb_token = PENDING_KB.set(kb)
                 ref_token = QUOTE_REF.set(ref)
+                # ★ 核心的 media_elements 白名单只有 (File, Image)，漏掉
+                #   Record / Video ⇒ 语音/视频进不了发送链。这里临时换壳成 File
+                #   让核心收下（发完还原），不动核心。
+                from media_coerce import coerce_media_chain, restore_media_chain
+                chain, _swapped = coerce_media_chain(chain)
                 try:
                     return await _orig(target_id, chain)
                 finally:
+                    restore_media_chain(chain, _swapped)
                     try:
                         PENDING_MD.reset(md_token)
                         PENDING_KB.reset(kb_token)
@@ -2121,6 +2127,18 @@ class QQOfficialGroupBridge(BasePlugin):
             return
 
         async def _send_message(target_id, send_message_obj, is_group):
+            # ★★★ 核心的 media_elements 白名单只有 (File, Image)，
+            #   **漏掉了 Record / Video**（两代都一样）⇒ 语音/视频根本进不了
+            #   发送链，还会被 `_text_content` 填成 `[Unsupported message element]`。
+            #   这里临时"换壳"成 File 让核心收下（发完还原），不动核心。
+            from media_coerce import coerce_media_chain, restore_media_chain
+            send_message_obj, _swapped = coerce_media_chain(send_message_obj)
+            try:
+                return await _send_message_inner(target_id, send_message_obj, is_group)
+            finally:
+                restore_media_chain(send_message_obj, _swapped)
+
+        async def _send_message_inner(target_id, send_message_obj, is_group):
             ref = self._quote_ref_for(adapter, target_id, send_message_obj, is_group) \
                 if self.quote_reply else None
             # ★★★ 这里必须把 markdown / keyboard 也提取出来放进 contextvar ——
