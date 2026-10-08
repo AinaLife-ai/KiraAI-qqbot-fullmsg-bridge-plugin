@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.4
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,72 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.5</b> — 性能与健壮性：ffmpeg 获取方式对齐老插件 + 图片并行 + 总预算 + 临时文件不再泄漏</summary>
+
+### 1. ffmpeg 的获取方式（对照 `KiraAI_video_comprehension_plugin` 改进）
+
+那个插件的做法是「**优先用系统已有的 ffmpeg，没有才自己下**」——
+不把 ffmpeg 当硬依赖。我们原先是「pip 装 `imageio-ffmpeg` 且必须有」。
+
+**两种方式各自的优劣：**
+
+| | 视频插件（下静态二进制） | 本插件（pip 装 wheel） |
+|---|---|---|
+| 体积 | 下载 ~30 MB | wheel 内嵌二进制 |
+| **国内网络** | ❌ 直连 gyan.dev/johnvansickle，常慢/被墙 | ✅ **pip 有镜像**（框架自带 `pypi_mirror`） |
+| 失败时 | 自己重试下载 | pip 失败 → 退回按文件发 |
+| 依赖 | 无 | pilk 需轮子（Windows 到 cp311） |
+
+**⇒ 采纳了它最好的一点：查找顺序改成「环境变量 → 系统 PATH → imageio 自带」**，
+与那个插件一致 —— 系统本来就装了 ffmpeg 就**直接用，不下载、不依赖 pip 包**。
+
+同时把「依赖可分离」做到位：
+
+```
+需要：pilk（编码器，硬前提） + 任一 ffmpeg（系统的 / imageio 自带的）
+```
+
+⇒ **单独装系统 ffmpeg、不装 imageio-ffmpeg 也能发语音条**。
+
+### 2. ★ 图片处理改为**并行**（原来串行）
+
+原来一条 md 里多张图是**挨个**处理的。现在并行（并发上限 4，避免打满网络
+与撞上传接口 10 QPS 限流）：
+
+```
+6 张图：串行 2.40s → 并行 0.80s（快 3x）
+替换仍按原顺序写回 ⇒ md 结构 / 图片顺序 / 行数全不变
+```
+
+### 3. ★★ 加**总预算**（这个很关键）
+
+图片处理是**内联在发送路径上**的。每张图最坏是「下载 30s + 分片上传 120s」，
+6 张图串起来能到 ≈5 分钟 —— 而 **QQ 被动回复窗口只有 5 分钟**，
+真拖满就**整条消息都发不出去**。
+
+⇒ 加了 **45 秒总预算**：超时就**保留原地址**先让消息发出去，并打一条 WARNING。
+**宁可图没换成、也不能整条消息发不出去。**
+
+### 4. 修掉临时文件泄漏
+
+silk 转码的临时目录原来会积累（缓存淘汰时只清字典、不删目录；失败路径也不清理）。
+现在：缓存淘汰**同时删目录**、失败路径清理、`clear_cache()` 真删文件。
+实测：连续转码后临时目录数**受控**，不再无限增长。
+
+### 新增测试
+
+| 文件 | 覆盖 |
+|------|------|
+`tests/audit_ffmpeg_deps.py` | ffmpeg 查找顺序、**依赖可分离**（没 imageio 也能转）、无 ffmpeg 时优雅降级 |
+`tests/audit_silk_tmpfiles.py` | 临时目录不泄漏（clear / 失败路径 / 缓存淘汰） |
+`tests/audit_md_img_parallel.py` | **并行生效**（3x）、结构不变 |
+`tests/audit_md_img_budget.py` | **超时预算**：按时返回、保留原地址、有告警 |
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.4</b> — ★ 语音条（自动转 silk）＋ 音频文件，**两条路同时可用**</summary>
 
 ### 官方限制（查证结果）

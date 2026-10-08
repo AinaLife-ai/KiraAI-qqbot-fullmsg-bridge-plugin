@@ -49,7 +49,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["to_silk_if_needed", "silk_available", "clear_cache"]
+__all__ = ["reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
 
 #: silk 文件以这个魔数开头（`#!SILK_V3`）
 SILK_MAGIC = b"#!SILK_V3"
@@ -77,28 +77,64 @@ def _digest(path: str) -> str:
 
 
 def silk_available() -> bool:
-    """两个依赖是否都在（缺任一个都做不了 silk 转码）。"""
+    """**编码器**（pilk）是否可用 —— 这是硬前提。
+
+    ★ 为什么把 ffmpeg 拆出去（对照 `KiraAI_video_comprehension_plugin` 的做法）：
+      那个插件「优先用系统已有的 ffmpeg，没有才自己下」，**不把 ffmpeg 当硬依赖**。
+      我们这里同理：系统可能本来就装了 ffmpeg（很多服务器都有），
+      pip 装 `imageio-ffmpeg` 只是**兜底**。
+      ⇒ 只要有 pilk + **任一** ffmpeg（系统的或 imageio 自带的）就能转。
+    """
     try:
         import pilk  # noqa: F401
     except Exception:
         return False
-    try:
-        import imageio_ffmpeg  # noqa: F401
-    except Exception:
-        return False
-    return True
+    return _ffmpeg_exe() is not None
+
+
+#: 找过的结果缓存（`None` = 还没找过；找到后固定不变）
+_FFMPEG_CACHE: Any = None
+_FFMPEG_TRIED = False
 
 
 def _ffmpeg_exe() -> Optional[str]:
-    """拿一个可用的 ffmpeg：先用 imageio-ffmpeg 自带的，再退回系统 PATH 上的。"""
+    """拿一个可用的 ffmpeg。
+
+    **顺序（先便宜后昂贵，与视频插件一致）**：
+
+    1. `IMAGEIO_FFMPEG_EXE` 环境变量（用户显式指定，最高优先，不校验存在性）；
+    2. **系统 PATH** 上的 `ffmpeg` —— 不下载、不依赖 pip 包，最快；
+    3. `imageio-ffmpeg` 自带的静态二进制（pip 装好就有，兜底）。
+
+    ★ 结果缓存：这是**每次发语音都会问一次**的路径，不缓存的话每轮都要
+      `shutil.which` 扫 PATH。缓存后固定不变（进程生命周期内 ffmpeg 不会挪窝）。
+    """
+    global _FFMPEG_CACHE, _FFMPEG_TRIED
+    if _FFMPEG_TRIED:
+        return _FFMPEG_CACHE
+    _FFMPEG_TRIED = True
+
+    # ① 用户显式指定
+    env = os.environ.get("IMAGEIO_FFMPEG_EXE")
+    if env and os.path.exists(env):
+        _FFMPEG_CACHE = env
+        return env
+    # ② 系统 PATH（最省事，无需任何下载）
+    sys_exe = shutil.which("ffmpeg")
+    if sys_exe:
+        _FFMPEG_CACHE = sys_exe
+        return sys_exe
+    # ③ imageio-ffmpeg 自带的静态二进制
     try:
         import imageio_ffmpeg
         exe = imageio_ffmpeg.get_ffmpeg_exe()
         if exe and os.path.exists(exe):
+            _FFMPEG_CACHE = exe
             return exe
     except Exception:
         pass
-    return shutil.which("ffmpeg")
+    _FFMPEG_CACHE = None
+    return None
 
 
 def _is_silk_file(path: str) -> bool:
@@ -211,9 +247,9 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
         out_dir = tempfile.mkdtemp(prefix="qqbot_silk_")
         silk = await asyncio.to_thread(_convert_sync, path, out_dir)
         if not silk:
+            _rm_tree(out_dir)              # ★ 失败也要清，否则临时目录越积越多
             return None
-        if len(_CACHE) >= _CACHE_MAX:
-            _CACHE.clear()
+        _prune_cache()                     # ★ 淘汰前先把旧产物删掉（不只清 dict）
         _CACHE[key] = (silk,) + (out_dir,)
         if logger_ is not None:
             logger_.info(
@@ -223,11 +259,54 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
             )
         return silk
     except Exception as exc:
+        if out_dir:
+            _rm_tree(out_dir)
         if logger_ is not None:
             logger_.warning("[QQBOT-BRIDGE] silk 转码异常：%s: %s", type(exc).__name__, exc)
         return None
 
 
+def _rm_tree(path: Any) -> None:
+    """删掉一个临时目录（best-effort，绝不抛）。"""
+    try:
+        if path and os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _prune_cache() -> None:
+    """缓存满时淘汰一半 —— **同时删掉它们的临时目录**。
+
+    ★ 为什么不是 `_CACHE.clear()` 了事（原来的写法）：
+      dict 清了但磁盘上的 `qqbot_silk_xxx/` 目录还在 ⇒ 长期运行的 bot
+      会攒下一堆临时文件。这里按写入顺序淘汰（dict 保持插入序）。
+    """
+    if len(_CACHE) < _CACHE_MAX:
+        return
+    keys = list(_CACHE.keys())
+    for k in keys[: max(1, len(keys) // 2)]:
+        entry = _CACHE.pop(k, None)
+        if entry and len(entry) > 1:
+            _rm_tree(entry[1])
+
+
+def reset_ffmpeg_cache() -> None:
+    """清掉 ffmpeg 查找缓存（配置变更 / 测试用）。
+
+    ★ 为什么要有这个公开入口：缓存是**进程级**的，装了新 ffmpeg 或
+      改了 `IMAGEIO_FFMPEG_EXE` 之后需要能重找一次；
+      测试也需要它来隔离每个用例（直接改内部变量太脆）。
+    """
+    global _FFMPEG_CACHE, _FFMPEG_TRIED
+    _FFMPEG_CACHE, _FFMPEG_TRIED = None, False
+
+
 def clear_cache() -> None:
-    """清空转码缓存（测试 / 还原用）。"""
+    """清空转码缓存**并删除临时产物**（测试 / 还原用）。"""
+    global _FFMPEG_CACHE, _FFMPEG_TRIED
+    for entry in list(_CACHE.values()):
+        if entry and len(entry) > 1:
+            _rm_tree(entry[1])
     _CACHE.clear()
+    reset_ffmpeg_cache()
