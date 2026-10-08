@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.3
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -450,7 +450,55 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
-<summary><b>v1.6.3</b> — ★★ 分片上传重试（官方策略）+ 新能力「私聊流式消息」</summary>
+<summary><b>v1.6.4</b> — ★★★ 修正 v1.6.3 流式的两处问题 + **真正的提速：token 实时上屏**</summary>
+
+### 0. 先说清楚：QQ 的 `stream_messages` **本身不产生速度**
+
+它是"把文字写进哪一条消息"的**显示通道**。让用户"早看到字"的永远是 **token 级增量**。
+KiraAI 核心的回复路径是**非流式**的（`await model.chat(request)`），
+真正的流式来自**提速器插件**（它 patch LLM 客户端、改用 `chat_stream()` 收 SSE，
+把一段段已成型的 `<msg>` 抢发出去）。
+
+⇒ 本版把两者接起来：**在提速器用的那个 `chat_stream` 上旁听**
+（提速器的 proxy 明确写着"chat_stream 原样透传，不包一层"，所以我们是唯一的包装者）：
+
+    LLMClientProxy.chat_stream  →  self._wrapped.chat_stream(request, **kwargs)
+                                    ^^^^^^^^^^^^^^^^^^^ 我们包的就是这一层
+
+一次 LLM 调用还是**一次**（不重复请求、不额外烧 token），我们只是把每个 chunk 的
+增量文本顺手投到 QQ 的流式消息上 ⇒ **用户 ~0.5s 就能看到字**，
+不必等整段生成完（这是相对"提速器抢发整段"的进一步提前）。
+
+三条铁律：**纯透传**（chunk 逐个原样、异常照抛）、**身份匹配**（只对登记过的那一个
+`LLMRequest` 生效 ⇒ 人设生成器之类别的 `chat_stream` 调用绝不会被误投到用户会话）、
+**出错只写日志**（观察失败绝不影响模型调用）。
+
+### 1. ★★ 修正 v1.6.3 的两处真问题
+
+| 问题 | 后果 | 现在 |
+|---|---|---|
+| 权威分段写成 `sess.text = 本段`（**覆盖**而不是累积） | 多段回复会把前一段**顶掉**；且违反平台 replace 契约（"新正文须以上级已下发内容为前缀"），可能被拒 | 拆成 `base`（权威累积）+ `preview`（当前段预览），发出去的永远是 `base + preview` |
+| 节流用 `await sleep(500ms)` | 提速器抢发得**越快我们反而越慢**（本末倒置） | 节流**只"跳过本次更新"，绝不 sleep**；紧挨着来的下一段立即发 |
+
+### 2. 预览与权威内容怎么不打架
+
+* **预览**（token）：只从最后一个 `<msg>` 的 `<text>`/`<markdown>` 开标签之后取文字，
+  遇到**未闭合的 `<`** 直接截断（半截标签绝不外传），**工具调用轮一条都不投**；
+* **权威段**（框架真正发的文本）到达时：预览作废、以权威内容为准（同一条消息 replace），
+  ⇒ 最终显示的文字与框架语义**完全一致**，既不重复也不丢字。
+
+### 3. 测试
+
+* 新增 `tests/audit_llm_stream_bridge.py` —— 纯透传 / 只调一次真实 LLM / 身份匹配
+  （未登记的 request 一条预览都不发）/ 工具轮不投递 / 观察出错不影响模型 / 关掉即不装。
+* `tests/audit_c2c_stream.py` 扩充 —— **多段必须累积**（不是顶掉）、
+  **紧挨的下一段必须立即发（不 sleep）**、预览从原始 XML 安全抽取（半截标签/工具调用）、
+  预览被权威内容覆盖。
+
+</details>
+
+<details>
+<summary><b>v1.6.3</b> — ★★ 分片上传重试（官方策略）+ 私聊流式消息（**已被 v1.6.4 修正：累积语义 + token 实时上屏**）</summary>
 
 ### 1. ★★ 分片上传重试：网络抖一下不再整条失败
 

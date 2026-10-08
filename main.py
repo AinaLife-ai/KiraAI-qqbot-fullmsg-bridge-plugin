@@ -110,6 +110,7 @@ from core_profiles import (
     message_types_of,
 )
 from c2c_stream import C2CStreamManager
+from llm_stream_bridge import LLMStreamBridge
 from group_names import GroupInfoCache
 from rich_content import (
     KEYBOARD_TAG_DESCRIPTION,
@@ -396,6 +397,9 @@ class QQOfficialGroupBridge(BasePlugin):
         #: 私聊流式消息管理器（官方能力；关掉后行为与从前完全一致）
         self.c2c_stream = C2CStreamManager(
             self, logger, enabled=self.c2c_stream_enabled)
+        #: 旁听提速器的 chat_stream，把 token 实时投到流式消息上（只观察、不改行为）
+        self.llm_stream = LLMStreamBridge(
+            self, logger, enabled=self.c2c_stream_enabled)
         #: api 层发送补丁（markdown / keyboard / 引用）
         self.api_send = ApiSendPatcher(self, logger)
         #: 3.0 增量增强（群名 + 引用唤醒补丁）
@@ -515,6 +519,11 @@ class QQOfficialGroupBridge(BasePlugin):
         # 流式消息：给还没收尾的补一个结束帧（best-effort，绝不抛）
         try:
             await self.c2c_stream.close_all()
+        except Exception:
+            pass
+        # 撤掉 LLM 流式通道的旁听包装（还原成原方法）
+        try:
+            self.llm_stream.restore()
         except Exception:
             pass
         await self._flush_identities(force=True)
@@ -701,6 +710,12 @@ class QQOfficialGroupBridge(BasePlugin):
             # 3.0 增量
             if self.v3.restore(name):
                 changed.append(f"{name}.v3")
+        # LLM 流式通道的旁听包装
+        try:
+            if self.llm_stream.restore():
+                changed.append("llm_stream")
+        except Exception:
+            pass
         # intent 扩展
         self._revert_extra_intents()
         if changed and not self._restore_reported:
@@ -785,6 +800,7 @@ class QQOfficialGroupBridge(BasePlugin):
             target = self._c2c_target_of(event)
             if target:
                 self.c2c_stream.note_turn_start(target)
+                self._register_c2c_turn(event, request, target)
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 流式消息收尾调度异常（忽略）: %s", exc)
 
@@ -1900,6 +1916,39 @@ class QQOfficialGroupBridge(BasePlugin):
             return str(getattr(sender, "user_id", "") or "")
         except Exception:
             return ""
+
+    def _register_c2c_turn(self, event, request, target: str) -> None:
+        """把"这一轮属于哪个私聊会话"登记给流式观察者（token 预览要用）。
+
+        只有登记过的那个 **LLMRequest 对象**才会被投递 —— 人设生成器等其它
+        `chat_stream` 调用不会被误投到用户会话里（按对象身份判等）。
+        """
+        if not self.c2c_stream_enabled:
+            return
+        adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+        adapter = None
+        try:
+            adapter = self.ctx.adapter_mgr.get_adapter(adapter_name) if adapter_name else None
+        except Exception:
+            adapter = None
+        if adapter is None:
+            return
+        msg_id = ""
+        try:
+            reply_ids = self._adapter_attr(adapter, "_direct_reply_ids")
+            if isinstance(reply_ids, dict):
+                msg_id = str(reply_ids.get(target) or "")
+        except Exception:
+            msg_id = ""
+        if not msg_id:
+            return
+        client = None
+        try:
+            getter = getattr(self.ctx, "get_default_llm_client", None)
+            client = getter() if callable(getter) else None
+        except Exception:
+            client = None
+        self.llm_stream.begin_turn(request, adapter, target, msg_id, client)
 
     def _maybe_send_typing(self, event) -> bool:
         """模型开始思考时，给**私聊**会话发一个「输入中」状态。返回是否已排队。

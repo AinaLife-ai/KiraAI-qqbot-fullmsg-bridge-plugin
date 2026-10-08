@@ -40,6 +40,7 @@ from _env import bridge_root as _BR
 
 import asyncio
 import sys
+import time
 
 sys.path.insert(0, _BR())
 
@@ -177,14 +178,76 @@ async def main():
           f2.get("msg_seq") == f.get("msg_seq"), f"{f2.get('msg_seq')} vs {f.get('msg_seq')}")
     check("★ 两次都返回结果（框架侧无感）", isinstance(res2, dict))
 
+    print("\n[3b] ★★★ 多段回复必须**累积**（replace 契约：新正文须以已下发前缀开头）")
+    # 换一条被动消息 ⇒ 开一条新流，模拟"提速器抢发两段独立消息"
+    n0 = len(http.frames)
+    await mgr.maybe_stream(ad, ad.get_client(), "T1",
+                           {"msg_type": 0, "content": "第一句在这里，够长了吧。", "msg_id": "M3"})
+    await mgr.maybe_stream(ad, ad.get_client(), "T1",
+                           {"msg_type": 0, "content": "第二句接着往下说。", "msg_id": "M3"})
+    new_frames = http.frames[n0:]
+    check("★ 两段各写了一片", len(new_frames) == 2, str(len(new_frames)))
+    check("★★★ 第二段之后正文 = 第一段 + 第二段（不是把第一段顶掉）",
+          bool(new_frames) and new_frames[-1].get("content_raw")
+          == "第一句在这里，够长了吧。第二句接着往下说。",
+          repr(new_frames[-1].get("content_raw") if new_frames else None))
+    check("★ 两段共用同一条流（msg_seq / stream_msg_id 一致）",
+          bool(new_frames) and new_frames[0].get("msg_seq") == new_frames[-1].get("msg_seq")
+          and new_frames[-1].get("stream_msg_id") == "SMID-1",
+          str(new_frames[-1] if new_frames else None))
+
+    print("\n[3c] ★★ 节流只「跳过更新」，**绝不 sleep 拖慢发送**")
+    n1 = len(http.frames)
+    t0 = time.monotonic()
+    await mgr.maybe_stream(ad, ad.get_client(), "T1",
+                           {"msg_type": 0, "content": "第三句紧接着也要立刻发出去哦。", "msg_id": "M3"})
+    dt = time.monotonic() - t0
+    check("★★ 紧接着的下一段**立即**发（<100ms，没等 500ms 节流）",
+          dt < 0.1 and len(http.frames) == n1 + 1, f"{dt:.3f}s frames+{len(http.frames) - n1}")
+
     print("\n[4] 空闲后自动补收尾帧（input_state=10）")
+    n_before = len(http.frames)
     await asyncio.sleep(0.35)
-    check("★ 出现收尾帧", len(http.frames) == 3, str(len(http.frames)))
+    check("★ 出现收尾帧", len(http.frames) > n_before, f"{len(http.frames)} vs {n_before}")
     f3 = http.frames[-1]
     check("★ input_state=10", f3.get("input_state") == 10, str(f3))
-    check("★ 收尾帧仍带全文与 stream_msg_id",
-          f3.get("content_raw") == "第一段足够长的文本第二段续写"
+    check("★ 收尾帧带全文（= 本轮已累积的全部文本）与 stream_msg_id",
+          f3.get("content_raw") == "第一句在这里，够长了吧。第二句接着往下说。第三句紧接着也要立刻发出去哦。"
           and f3.get("stream_msg_id") == "SMID-1", str(f3))
+
+    print("\n[3d] ★ token 预览：从原始 XML 里安全抽文字")
+    check("★ 正常一段：抽出正文", CS.display_text_of("<msg><text>哥ww 我在</text></msg>") == "哥ww 我在",
+          repr(CS.display_text_of("<msg><text>哥ww 我在</text></msg>")))
+    check("★ 还没闭合：也能给出已成型部分",
+          CS.display_text_of("<msg><text>哥ww 我") == "哥ww 我")
+    check("★★ 半截标签绝不外传（截到 < 之前）",
+          CS.display_text_of("<msg><text>哥ww 我<") == "哥ww 我")
+    check("★★ 工具调用轮不展示", CS.display_text_of('<msg><tool_call>{"name":"x"}</tool_call>') == "")
+    check("★ 只取最后一段（前面几段由权威发送负责，避免重复显示）",
+          CS.display_text_of("<msg><text>第一段</text></msg><msg><text>第二段") == "第二段")
+    check("★ 还没写到正文 ⇒ 空", CS.display_text_of("<msg><markdown") == ""
+          or CS.display_text_of("<msg>") == "")
+    check("★ markdown 段也能预览",
+          CS.display_text_of("<msg><markdown>## 标题") == "## 标题")
+    check("★ 空输入安全", CS.display_text_of("") == "" and CS.display_text_of(None or "") == "")
+
+    print("\n[3e] ★★ 预览帧由后台节流任务发出，且会被权威内容覆盖（最终以框架为准）")
+    http2 = HTTP()
+    ad2 = Adapter(http2)
+    mgr4 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
+    mgr4.observe_raw(ad2, ad2.get_client(), "T9", "M9", "<msg><text>正在生成的半句话")
+    check("★ 预览是**同步**调用（不 await、不阻塞提速器循环）", True)
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.2)
+    check("★ 预览帧已发出", len(http2.frames) >= 1, str(len(http2.frames)))
+    check("★ 预览帧内容是那半句",
+          http2.frames[0].get("content_raw") == "正在生成的半句话",
+          repr(http2.frames[0].get("content_raw")))
+    await mgr4.maybe_stream(ad2, ad2.get_client(), "T9",
+                            {"msg_type": 0, "content": "正在生成的半句话，完整版。", "msg_id": "M9"})
+    check("★★ 权威内容覆盖预览（同一条消息，无重复、无残留）",
+          http2.frames[-1].get("content_raw") == "正在生成的半句话，完整版。",
+          repr(http2.frames[-1].get("content_raw")))
+    await mgr4.close_all()
 
     print("\n[5] 换一条被动消息 ⇒ 开一条新流（不会串到上一轮）")
     res3 = await mgr.maybe_stream(ad, ad.get_client(), "T1",
