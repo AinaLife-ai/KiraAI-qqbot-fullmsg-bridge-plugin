@@ -23,14 +23,18 @@
 
 本测试就是钉死这一点：**逐字比对**，除图片 URL 外不允许有任何差异。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import os
 import struct
 import sys
 import zlib
 
-ROOT = "/var/minis/workspace/qqbot_bridge_review"
-sys.path.insert(0, f"{ROOT}/bridge")
+ROOT = _BR()
+sys.path.insert(0, ROOT)
 
 
 def _normalize(md: str) -> str:

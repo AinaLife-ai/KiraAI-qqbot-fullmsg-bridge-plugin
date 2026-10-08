@@ -3,11 +3,15 @@
 这个脚本的价值是防止"说了没做"——本次复审已经抓到一条：
   「intent 会尝试自动回退」曾经只写了日志、没有逻辑（现已补上）。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import re
 import pathlib
 import sys
 
-ROOT = pathlib.Path("/var/minis/workspace/qqbot_bridge_review/bridge")
+ROOT = pathlib.Path(_BR())
 main_src = (ROOT / "main.py").read_text(encoding="utf-8")
 api_src = (ROOT / "api_send.py").read_text(encoding="utf-8")
 gn_src = (ROOT / "group_names.py").read_text(encoding="utf-8")

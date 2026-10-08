@@ -9,6 +9,11 @@
 所以这里必须**按框架的方式**加载插件、注册钩子、再调用 —— 见 [A]。
 [B] 用假 client 驱动新工具，核对报文与文案。
 """
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import importlib.util
 import inspect
@@ -20,11 +25,11 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORE = pathlib.Path(os.environ.get(
-    "KIRA_CORE", "/var/minis/workspace/qqbot_bridge_review/kira-core"))
+    "KIRA_CORE", _CORE_ROOT("2")))
 sys.path.insert(0, str(CORE))
 sys.path.insert(0, str(ROOT))
 # botpy（工具层用它的 Route 直发官方接口）
-_BOTPY = os.environ.get("BOTPY_PATH", "/tmp/botpy_src/botpy-master")
+_BOTPY = os.environ.get("BOTPY_PATH", _BOTPY_DIR())
 if os.path.isdir(_BOTPY):
     sys.path.insert(0, _BOTPY)
 (ROOT / "data").mkdir(exist_ok=True)

@@ -12,12 +12,17 @@
 
 判定维度：平台门禁 / 工具名 / 钩子 / 补丁 / 传输层。
 """
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR, ref_dir as _REF, peers_dir as _PEERS2, peer_plugin as _PEER
+
 import pathlib
 import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-REF = pathlib.Path("/tmp/ref_repos")
+REF = _REF()
 
 PASS = FAIL = 0
 
@@ -111,7 +116,10 @@ def main():
                      ("xml_tag_fixer", "compat_xml_tag_fixer"),
                      ("session_merger", "compat_session_merger"),
                      ("sustained_chat", "compat_sustained_chat")):
-        f = ROOT.parent / sub / "main.py"
+        f = _PEER(sub)
+        if f is None:
+            print(f"  skip  {key} 对照源码不在（跳过）")
+            continue
         check(f"{key} 源码在位", f.is_file(), str(f))
 
     # 本次新增/改动的文件**没有**碰适配器或发送链

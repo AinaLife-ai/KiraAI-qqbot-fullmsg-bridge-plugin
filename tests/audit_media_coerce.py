@@ -17,15 +17,19 @@
 发完**还原**（绝不改用户的消息链）；同时用 `_kira_bridge_orig_kind` 标记
 让 `_upload_file` 包装按**原始类型**给对 `file_type`（视频→2 / 语音→3）。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import os
 import sys
 
-ROOT = "/var/minis/workspace/qqbot_bridge_review"
+ROOT = _BR()
 GEN = os.environ.get("KIRA_CORE_GEN", "3")
-sys.path.insert(0, f"{ROOT}/kira-v3" if GEN == "3" else f"{ROOT}/kira-core")
-sys.path.insert(0, f"{ROOT}/bridge")
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
+sys.path.insert(0, str(_CORE_ROOT("3")) if GEN == "3" else str(_CORE_ROOT("2")))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, _BOTPY_DIR())
 
 os.makedirs(f"{ROOT}/data", exist_ok=True)
 open(f"{ROOT}/data/log.log", "a").close()

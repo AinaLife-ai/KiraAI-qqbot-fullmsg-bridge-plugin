@@ -8,12 +8,16 @@
 做法：真 aiohttp，只把 `ClientSession.put` 换成**记录调用**的版本
 （不发真网络），其余（Route / 排序 / 累加偏移 / 完整性自检 / 合并请求）全部真跑。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import os
 import sys
 
-sys.path.insert(0, "/var/minis/workspace/qqbot_bridge_review/bridge")
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
+sys.path.insert(0, _BR())
+sys.path.insert(0, _BOTPY_DIR())
 
 import aiohttp as _ah
 

@@ -2,7 +2,7 @@ import os
 """验证多后端：pysilk / pilk / silk_v3_encoder 都能被选中并正确调用。"""
 import asyncio, os, sys, types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0,'/tmp/botpy_src/botpy-master')
+sys.path.insert(0,'_BOTPY()')
 P=F=0
 def ck(n,c,e=""):
     global P,F
