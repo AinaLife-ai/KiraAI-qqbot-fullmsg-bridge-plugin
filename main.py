@@ -109,6 +109,9 @@ from core_profiles import (
     is_allowed as profile_is_allowed,
     message_types_of,
 )
+from c2c_stream import C2CStreamManager
+from llm_stream_bridge import LLMStreamBridge
+import sticker_support
 from group_names import GroupInfoCache
 from rich_content import (
     KEYBOARD_TAG_DESCRIPTION,
@@ -237,6 +240,22 @@ def _group_names_path():
             return None
 
 
+def _split_keywords(value) -> tuple:
+    """把配置里的"逗号/空格/顿号分隔"关键词串切成去重小写元组。"""
+    import re as _re
+
+    if isinstance(value, (list, tuple)):
+        items = [str(v) for v in value]
+    else:
+        items = _re.split(r"[,，、\s]+", str(value or ""))
+    out = []
+    for item in items:
+        kw = item.strip().lower()
+        if kw and kw not in out:
+            out.append(kw)
+    return tuple(out) or ("sticker",)
+
+
 def _identity_path():
     """Where to persist the auto-learned nickname directory."""
     try:
@@ -286,6 +305,13 @@ class QQOfficialGroupBridge(BasePlugin):
         self.markdown_enabled = bool(basic.get("markdown_enabled", True))
         self.keyboard_enabled = bool(basic.get("keyboard_enabled", True))
         self.interaction_enabled = bool(basic.get("interaction_enabled", True))
+        #: 私聊「输入中…」状态（官方能力，核心没有；见 _maybe_send_typing）
+        self.typing_enabled = bool(basic.get("typing_enabled", True))
+        #: 私聊流式消息（官方 stream_messages；见 c2c_stream.py）
+        self.c2c_stream_enabled = bool(basic.get("c2c_stream_enabled", True))
+        #: 表情包标签关键词（逗号分隔；默认 sticker —— 它同时覆盖内置表情包插件
+        #: 与第三方「增强表情包」sticker-plus，两家都是看这个词才注册标签）
+        self.sticker_tags = _split_keywords(basic.get("sticker_tags", "sticker"))
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -336,11 +362,18 @@ class QQOfficialGroupBridge(BasePlugin):
         self._capability_cache: dict = {}
         #: 装过媒体类型修正的宿主对象（还原时要用）
         self._media_types_holders: dict = {}
+        #: 声明过 sticker 支持的宿主对象（还原时要用）
+        self._sticker_holders: dict = {}
         #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
         self._group_prefetch_task = None
         #: ★ 本实例发起的「请重连」任务 —— terminate 时必须全部取消，
         #   否则每次重载都漏一个在跑（会让连接反复重连 ⇒ 消息重复）。
         self._reconnect_tasks: list = []
+        #: 私聊「输入中」状态：target -> 上次发送时间（防抖，见 _maybe_send_typing）
+        self._typing_sent_at: dict = {}
+        self._typing_tasks: list = []
+        self._typing_logged = False
+        self._typing_seq = 1000
         #: 会话名回填：已处理过的适配器（只做一次）
         self._backfilled: set = set()
         self._backfill_tasks: list = []
@@ -383,6 +416,12 @@ class QQOfficialGroupBridge(BasePlugin):
         self.group_names = GroupInfoCache(
             path=_group_names_path() if self.group_name_enabled else None
         )
+        #: 私聊流式消息管理器（官方能力；关掉后行为与从前完全一致）
+        self.c2c_stream = C2CStreamManager(
+            self, logger, enabled=self.c2c_stream_enabled)
+        #: 旁听提速器的 chat_stream，把 token 实时投到流式消息上（只观察、不改行为）
+        self.llm_stream = LLMStreamBridge(
+            self, logger, enabled=self.c2c_stream_enabled)
         #: api 层发送补丁（markdown / keyboard / 引用）
         self.api_send = ApiSendPatcher(self, logger)
         #: 3.0 增量增强（群名 + 引用唤醒补丁）
@@ -495,6 +534,20 @@ class QQOfficialGroupBridge(BasePlugin):
         for t in getattr(self, "_backfill_tasks", []):
             if not t.done():
                 t.cancel()
+        # 「输入中」状态是 fire-and-forget 的小任务，顺手收干净（不留 pending）
+        for t in getattr(self, "_typing_tasks", []):
+            if not t.done():
+                t.cancel()
+        # 流式消息：给还没收尾的补一个结束帧（best-effort，绝不抛）
+        try:
+            await self.c2c_stream.close_all()
+        except Exception:
+            pass
+        # 撤掉 LLM 流式通道的旁听包装（还原成原方法）
+        try:
+            self.llm_stream.restore()
+        except Exception:
+            pass
         await self._flush_identities(force=True)
         await self._flush_group_names(force=True)
         logger.info(
@@ -660,6 +713,14 @@ class QQOfficialGroupBridge(BasePlugin):
                 changed.append(f"{name}.api_send")
             # 发送入口包装
             self._unpatch_send_entry(adapter, name)
+            # 表情包支持（sticker）
+            _sh = self._sticker_holders.pop(name, None)
+            if _sh is not None:
+                try:
+                    if sticker_support.restore(_sh, self.sticker_tags):
+                        changed.append(f"{name}.sticker")
+                except Exception:
+                    pass
             # 媒体类型修正
             _mh = self._media_types_holders.pop(name, None)
             if _mh is not None:
@@ -679,6 +740,12 @@ class QQOfficialGroupBridge(BasePlugin):
             # 3.0 增量
             if self.v3.restore(name):
                 changed.append(f"{name}.v3")
+        # LLM 流式通道的旁听包装
+        try:
+            if self.llm_stream.restore():
+                changed.append("llm_stream")
+        except Exception:
+            pass
         # intent 扩展
         self._revert_extra_intents()
         if changed and not self._restore_reported:
@@ -752,6 +819,20 @@ class QQOfficialGroupBridge(BasePlugin):
                 tag_set.register(cls(self.ctx, desc))
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 注册标签 %s 失败: %s", cls.__name__, exc)
+
+        # ---- 私聊「输入中…」（官方能力，核心没有；非阻塞、失败无副作用）----
+        try:
+            self._maybe_send_typing(event)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
+        # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
+        try:
+            target = self._c2c_target_of(event)
+            if target:
+                self.c2c_stream.note_turn_start(target)
+                self._register_c2c_turn(event, request, target)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 流式消息收尾调度异常（忽略）: %s", exc)
 
         # ---- 3.0 增量（群名 / 引用唤醒补洞），幂等 ----
         profile = self._profile_for(event)
@@ -988,6 +1069,18 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._media_types_holders[name] = holder
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 安装媒体类型修正失败（不影响其它功能）: %s", exc)
+
+        # ---- L3-C：表情包（`<sticker>` 标签）—— 同样世代无关 ----
+        #
+        #   内置表情包插件只在 `"sticker" in event.supported_elements` 时才注册
+        #   `<sticker>` 标签；而 QQ 官方适配器声明的类型清单里没有 sticker
+        #   ⇒ 标签压根不注册（模型看不到、写了也不解析）。
+        #   这里把 sticker 补进清单（**只在真的装了表情包时才加**），
+        #   发送侧由 media_coerce 把 Sticker 换成等价 Image（file_type=1）。
+        try:
+            self._ensure_sticker_support(adapter, name)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 表情包支持安装失败（不影响其它功能）: %s", exc)
 
         if profile.generation == GEN_UNKNOWN:
             if name not in self._broken_adapters:
@@ -1464,7 +1557,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 #   Record / Video ⇒ 语音/视频进不了发送链。这里临时换壳成 File
                 #   让核心收下（发完还原），不动核心。
                 from media_coerce import coerce_media_chain, restore_media_chain
-                chain, _swapped = coerce_media_chain(chain)
+                chain, _swapped = coerce_media_chain(chain, self.sticker_tags)
                 try:
                     return await _orig(target_id, chain)
                 finally:
@@ -1843,6 +1936,150 @@ class QQOfficialGroupBridge(BasePlugin):
         self._capability_cache[id(adapter)] = cap if cap is not None else _MISS
         return cap
 
+    # ------------------------------------------------------------------ #
+    # 私聊「输入中…」状态（官方能力，KiraAI 核心两代都没有）
+    # ------------------------------------------------------------------ #
+    #: 官方限制：`input_second` 最大 60 秒（腾讯 Node SDK 默认 30，Hermes 用 60）
+    _TYPING_SECONDS = 60
+    #: 刷新防抖：官方 SDK 建议在到期前刷新；Hermes 实测用 50 秒
+    _TYPING_DEBOUNCE = 50.0
+
+    @staticmethod
+    def _c2c_target_of(event) -> str:
+        """这个事件是不是**单聊**？是就返回对方 openid，否则返回空串。
+
+        「输入中…」与「流式消息」都只对单聊生效（官方限制），共用这一个判据。
+        """
+        try:
+            message = getattr(event, "message", None)
+            if message is None or getattr(message, "group", None) is not None:
+                return ""
+            sender = getattr(message, "sender", None)
+            return str(getattr(sender, "user_id", "") or "")
+        except Exception:
+            return ""
+
+    def _register_c2c_turn(self, event, request, target: str) -> None:
+        """把"这一轮属于哪个私聊会话"登记给流式观察者（token 预览要用）。
+
+        只有登记过的那个 **LLMRequest 对象**才会被投递 —— 人设生成器等其它
+        `chat_stream` 调用不会被误投到用户会话里（按对象身份判等）。
+        """
+        if not self.c2c_stream_enabled:
+            return
+        adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+        adapter = None
+        try:
+            adapter = self.ctx.adapter_mgr.get_adapter(adapter_name) if adapter_name else None
+        except Exception:
+            adapter = None
+        if adapter is None:
+            return
+        msg_id = ""
+        try:
+            reply_ids = self._adapter_attr(adapter, "_direct_reply_ids")
+            if isinstance(reply_ids, dict):
+                msg_id = str(reply_ids.get(target) or "")
+        except Exception:
+            msg_id = ""
+        if not msg_id:
+            return
+        client = None
+        try:
+            getter = getattr(self.ctx, "get_default_llm_client", None)
+            client = getter() if callable(getter) else None
+        except Exception:
+            client = None
+        self.llm_stream.begin_turn(request, adapter, target, msg_id, client)
+
+    def _maybe_send_typing(self, event) -> bool:
+        """模型开始思考时，给**私聊**会话发一个「输入中」状态。返回是否已排队。
+
+        ## 为什么加这个（核心没有，官方两家都有）
+
+        * 腾讯官方 Node SDK：`bot.sendTyping(target, 30)`
+          —— 注释写明「**仅在 `target.scope === "c2c"` 时可用**」，载荷
+          `{msg_type: 6, msg_id, input_notify: {input_type: 1, input_second: N}}`；
+        * QQ 官方推荐的 Hermes（`gateway/platforms/qqbot/adapter.py`）：
+          `send_typing()` —— C2C-only、60 秒时长、50 秒防抖、必须有入站 `msg_id`。
+
+        对聊天机器人来说这是**最直观的体验提升**：模型跑 10~20 秒时，
+        用户看到的是「对方正在输入…」，而不是发呆。
+
+        ## 三条自我约束
+
+        1. **只做单聊**（官方明确只支持 C2C；群里发会被拒）；
+        2. **必须有入站 msg_id**（被动窗口内才有效）；
+        3. **发失败绝不影响这一轮**：整个调用丢进 create_task，异常只写 debug。
+
+        挂点选在 `ON_LLM_REQUEST`（= "这一轮开始跑模型"的那一瞬间），
+        用同一个会话 50 秒防抖，避免多步 agent 循环每个 step 都发一次。
+        """
+        if not self.typing_enabled or not self.enabled:
+            return False
+        try:
+            target = self._c2c_target_of(event)
+            adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+            if not target or not adapter_name:
+                return False
+            now = time.time()
+            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
+                return False
+            adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
+            if adapter is None:
+                return False
+            client = adapter.get_client()
+            if client is None:
+                return False
+            reply_ids = self._adapter_attr(adapter, "_direct_reply_ids") or {}
+            msg_id = str(reply_ids.get(target) or "")
+            if not msg_id:
+                return False                      # 没有新鲜的入站 msg_id ⇒ 发了也没用
+            self._typing_sent_at[target] = now    # 先占位（并发时不会重复排）
+            task = asyncio.ensure_future(
+                self._send_typing(adapter, client, target, msg_id)
+            )
+            self._typing_tasks.append(task)
+            self._typing_tasks = [t for t in self._typing_tasks if not t.done()][-8:]
+            return True
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中状态：调度失败（忽略）: %s", exc)
+            return False
+
+    async def _send_typing(self, adapter, client, target: str, msg_id: str) -> None:
+        """真正发出「输入中」状态。
+
+        ⚠ **不能走 botpy 的 `post_c2c_message`**：它用 `payload = locals()` 组装请求体，
+        只包含它自己声明的参数 —— 多传的 `input_notify=` 会被**静默丢掉**
+        （消息照发，但不是输入中状态）。所以直接走底层 Route。
+        """
+        try:
+            from botpy.http import Route
+
+            api = getattr(client, "api", None)
+            http = getattr(api, "_http", None)
+            if http is None:
+                return
+            # msg_seq：与核心的 1..N 序号**刻意错开**（官方 SDK 用递增计数，
+            # Hermes 用随机数），避免和真正的回复撞 "同一 msg_id+msg_seq 重复"。
+            seq = self._typing_seq = (getattr(self, "_typing_seq", 1000) + 1) % 60000
+            route = Route("POST", "/v2/users/{openid}/messages", openid=target)
+            await http.request(route, json={
+                "msg_type": 6,
+                "msg_id": msg_id,
+                "msg_seq": seq,
+                "input_notify": {"input_type": 1, "input_second": self._TYPING_SECONDS},
+            })
+            if not self._typing_logged:
+                self._typing_logged = True
+                logger.info(
+                    "[QQBOT-BRIDGE] 已在私聊里发「输入中…」状态（msg_type=6，%d 秒）——"
+                    "官方能力，KiraAI 核心没有；只在单聊生效，发失败不影响回复",
+                    self._TYPING_SECONDS,
+                )
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中状态发送失败（忽略）: %s", exc)
+
     def _adapter_attr(self, adapter, attr: str, default=None):
         """取适配器上的方法/属性 —— **两处都找**（2.x 在实例上，3.0 在能力对象上）。
 
@@ -2067,6 +2304,43 @@ class QQOfficialGroupBridge(BasePlugin):
             client = None
         return self._group_name_for(name, adapter, group_id, client)
 
+    def _sticker_count(self) -> int:
+        """框架装了几个表情包（没装/没管理器就返回 0）。"""
+        try:
+            mgr = getattr(self.ctx, "sticker_manager", None)
+            if mgr is None:
+                return 0
+            data = getattr(mgr, "sticker_dict", None)
+            if callable(data):                 # 3.0 是 property，2.x 是普通方法
+                data = data()
+            return len(data) if isinstance(data, dict) else 0
+        except Exception:
+            return 0
+
+    def _ensure_sticker_support(self, adapter, name: str) -> bool:
+        """让本适配器声明支持 `sticker`（幂等、可还原）。
+
+        ⚠ **只在真的装了表情包时才加**：内置插件不检查清单是否为空，
+          清单为空时那段标签说明就是一份空列表，反而会诱导模型去发不存在的 id。
+        """
+        holders = self._sticker_holders
+        holder = holders.get(name)
+        if holder is not None:
+            return False                       # 已经装过（数量变化不影响"已声明"这件事）
+        # 「确实有人在管表情包」才声明：内置管理器里有图，**或者**装了第三方表情包插件
+        # （如 kira-ai-plugin-sticker-plus —— 它有自己的图库，内置管理器可能是空的）
+        if self._sticker_count() <= 0 and not sticker_support.plugin_present(
+                getattr(self.ctx, "plugin_mgr", None), self.sticker_tags):
+            return False
+        # 落点：3.0 在能力对象（`_supported_elements`），2.x 在适配器（`message_types`）
+        target = self._capability_of(adapter)
+        if sticker_support.supported_list(target) is None:
+            target = adapter
+        if sticker_support.install(target, logger, self.sticker_tags):
+            holders[name] = target
+            return True
+        return False
+
     def _patch_send_path(self, adapter, name: str, client) -> None:
         """把「发送增强」挂到**框架真正走的那个发送入口**上。
 
@@ -2132,7 +2406,8 @@ class QQOfficialGroupBridge(BasePlugin):
             #   发送链，还会被 `_text_content` 填成 `[Unsupported message element]`。
             #   这里临时"换壳"成 File 让核心收下（发完还原），不动核心。
             from media_coerce import coerce_media_chain, restore_media_chain
-            send_message_obj, _swapped = coerce_media_chain(send_message_obj)
+            send_message_obj, _swapped = coerce_media_chain(
+                send_message_obj, self.sticker_tags)
             try:
                 return await _send_message_inner(target_id, send_message_obj, is_group)
             finally:

@@ -365,6 +365,133 @@ async def _route_request(api: Any, route: Any, **kwargs: Any) -> Any:
     return await api._http.request(route, **kwargs)
 
 
+# --------------------------------------------------------------------------- #
+# 分片上传的重试策略（**逐条对齐官方实现**，2026-10-09）
+# --------------------------------------------------------------------------- #
+#: 官方 `@tencent-connect/qqbot-nodejs` 的 `retry.ts`：
+#:   * `UPLOAD_RETRY_POLICY`          = maxRetries 2 / base 1000ms / 指数退避（prepare、合并）
+#:   * `COMPLETE_UPLOAD_RETRY_POLICY` = maxRetries 2 / base **2000ms** / 指数退避（合并那一步）
+#:   * `PART_FINISH_RETRY_POLICY`     = maxRetries 2 / base 1000ms / 指数退避
+#:   * `buildPartFinishPersistentPolicy`：命中 **40093001** 时进入**持久重试**，
+#:     间隔 1s，时限 = prepare 下发的 `retry_timeout`（默认 120s，上限 **600s**）
+#:   * `UPLOAD_PREPARE_FALLBACK_CODE = 40093002`（日额度）⇒ **不重试**
+#: Hermes 的 `gateway/platforms/qqbot/chunked_upload.py` 是同一套数字（Python 版），
+#: 两边逐项一致 ⇒ 这里照抄，不自创参数。
+_UPLOAD_RETRIES = 2              # 共 3 次尝试
+_UPLOAD_BASE_DELAY = 1.0
+_COMPLETE_BASE_DELAY = 2.0
+_PART_FINISH_INTERVAL = 1.0
+_PART_FINISH_DEFAULT_TIMEOUT = 120.0
+_PART_FINISH_MAX_TIMEOUT = 600.0
+_PART_PUT_TIMEOUT = 300.0        # 单个分片 PUT 的超时（官方 300s）
+_DAILY_LIMIT_CODE = "40093002"   # 日额度：不重试，直接如实上报
+_PART_RETRYABLE_CODE = "40093001"  # 分片确认的可重试码：进持久重试
+
+#: **整个上传（含全部重试）的软预算**，必须小于图片处理的总预算
+#: （`_IMAGE_BUDGET_SECONDS = 45`）——否则重试会把整条消息拖死。
+#: 到点了就不再重试，按"转存失败"处理（消息照发，图退化成原地址）。
+_UPLOAD_SOFT_BUDGET = 35.0
+
+#: 参数类错误重试没有意义（官方 `UPLOAD_RETRY_POLICY.shouldRetry` 里就是按
+#: "400 / 401 / Invalid / timeout" 这几个关键字**排除**的）。
+_NO_RETRY_MARKERS = ("401", "403", "invalid", "timeout", "timed out", "超时")
+
+
+def _api_retryable(exc: BaseException, *, allow_code: str = "") -> bool:
+    """这次 API 失败值不值得重试（对齐官方 `shouldRetry` 的语义）。"""
+    text = str(exc)
+    low = text.lower()
+    if _DAILY_LIMIT_CODE in text:
+        return False                   # 日额度：重试只会浪费额度
+    if allow_code and allow_code in text:
+        return True                    # 显式允许的码（40093001）
+    if "400" in text:
+        return False                   # 参数类 400（含 850019/850026/850031…）
+    if any(m in low for m in _NO_RETRY_MARKERS):
+        return False
+    return True                        # 5xx / 网络抖动 / 未知 ⇒ 重试一次看看
+
+
+async def _with_retry(fn: Any, *, label: str, max_retries: int = _UPLOAD_RETRIES,
+                      base_delay: float = _UPLOAD_BASE_DELAY, deadline: Any = None,
+                      should_retry: Any = None, logger: Any = None,
+                      retry_any: bool = False) -> Any:
+    """按官方策略重试一个异步调用（指数退避 + **预算感知**）。
+
+    :param deadline: `loop.time()` 语义的绝对时间；到点就不再重试（宁可失败也不拖死）。
+    :param retry_any: True 时任何异常都重试（官方分片 PUT 就是这种：不带分类）。
+    """
+    last: BaseException | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn()
+        except Exception as exc:
+            last = exc
+            if attempt >= max_retries:
+                raise
+            if not retry_any and should_retry is not None and not should_retry(exc):
+                raise
+            delay = base_delay * (2 ** attempt)
+            if deadline is not None:
+                remain = deadline - asyncio.get_running_loop().time()
+                if remain <= 0:
+                    raise
+                delay = min(delay, max(0.0, remain))
+            if logger is not None:
+                logger.warning(
+                    "[QQBOT-BRIDGE] %s 第 %d 次失败（%.1fs 后重试，共 %d 次机会）：%s",
+                    label, attempt + 1, delay, max_retries + 1, str(exc)[:120],
+                )
+            await asyncio.sleep(delay)
+    raise last if last is not None else RuntimeError(label)   # pragma: no cover
+
+
+async def _call_part_finish(api: Any, route: Any, body: dict, *, label: str,
+                            retry_timeout: float, deadline: Any = None,
+                            logger: Any = None) -> Any:
+    """`upload_part_finish`：**先按官方快策略重试，命中 40093001 再进持久重试**。
+
+    持久重试的时限取 prepare 下发的 `retry_timeout`（默认 120s、上限 600s），
+    同时不得越过我们自己的软预算 —— 这是官方策略 + 我们的"不拖死消息"约束的折中。
+    """
+    try:
+        return await _with_retry(
+            lambda: _route_request(api, route, json=body),
+            label=label, max_retries=_UPLOAD_RETRIES, base_delay=_UPLOAD_BASE_DELAY,
+            deadline=deadline, logger=logger,
+            should_retry=lambda e: _api_retryable(e, allow_code=_PART_RETRYABLE_CODE),
+        )
+    except Exception as exc:
+        if _PART_RETRYABLE_CODE not in str(exc):
+            raise
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        limit = min(float(retry_timeout or _PART_FINISH_DEFAULT_TIMEOUT),
+                    _PART_FINISH_MAX_TIMEOUT)
+        if deadline is not None:
+            limit = min(limit, max(0.0, deadline - start))
+        attempt = 0
+        while True:
+            elapsed = loop.time() - start
+            if elapsed >= limit:
+                raise
+            attempt += 1
+            delay = min(_PART_FINISH_INTERVAL, max(0.0, limit - elapsed))
+            if logger is not None:
+                logger.warning(
+                    "[QQBOT-BRIDGE] %s 命中可重试错误（%s），进入持久重试 #%d"
+                    "（已 %.0fs / 上限 %.0fs）：%s",
+                    label, _PART_RETRYABLE_CODE, attempt, elapsed, limit, str(exc)[:100],
+                )
+            await asyncio.sleep(delay)
+            try:
+                return await _route_request(api, route, json=body)
+            except Exception as exc2:
+                if _PART_RETRYABLE_CODE not in str(exc2):
+                    raise
+                exc = exc2
+
+
 async def _upload_bytes_to_qq(
     client: Any, target_id: str, is_group: bool, data: bytes, name: str,
     logger: Any = None, file_type: int = 1,
@@ -406,6 +533,8 @@ async def _upload_bytes_to_qq(
     #   而 QQ 自己转存出来的对象是 `application/octet-stream`（用户日志实证）。
     mime = sniff_image_mime(data, name)
     part_headers = {"Content-Type": mime}
+    #: 整个上传（含全部重试）的软预算 —— 到点就不再重试，避免把消息拖死
+    deadline = asyncio.get_running_loop().time() + _UPLOAD_SOFT_BUDGET
 
     try:
         if is_group:
@@ -422,14 +551,25 @@ async def _upload_bytes_to_qq(
                                  user_id=target_id)
             files_route = Route("POST", "/v2/users/{openid}/files", openid=target_id)
 
-        prep = await _route_request(api, prep_route, json={
-            "file_type": int(file_type),   # 1=图片 2=视频 3=语音 4=文件
-            "file_size": str(size),
-            "file_name": name,
-            "md5": md5,
-            "sha1": sha1,
-            "md5_10m": md5_10m,
-        })
+        # ★ prepare 也重试（官方 UPLOAD_RETRY_POLICY：2 次 / 1s 指数退避）
+        prep = await _with_retry(
+            lambda: _route_request(api, prep_route, json={
+                "file_type": int(file_type),   # 1=图片 2=视频 3=语音 4=文件
+                "file_size": str(size),
+                "file_name": name,
+                "md5": md5,
+                "sha1": sha1,
+                "md5_10m": md5_10m,
+            }),
+            label="upload_prepare", deadline=deadline, logger=logger,
+            should_retry=_api_retryable,
+        )
+        # prepare 会下发分片确认的持久重试时限（官方：默认 120s、上限 600s）
+        _cfg = _get(prep, "upload_config") or {}
+        try:
+            retry_timeout = float(_get(_cfg, "retry_timeout") or _PART_FINISH_DEFAULT_TIMEOUT)
+        except Exception:
+            retry_timeout = _PART_FINISH_DEFAULT_TIMEOUT
         upload_id = _get(prep, "upload_id")
         parts = _get(prep, "parts") or []
         if not upload_id or not parts:
@@ -457,8 +597,10 @@ async def _upload_bytes_to_qq(
         #   来算偏移，说明平台不保证从 0 起）。按基准值算偏移更稳。
         base = int(_get(ordered[0], "index")) if ordered else 0
         offset = 0
+        # 单次请求超时对齐官方（PART_UPLOAD_TIMEOUT_MS = 300s）；
+        # 真正兜底的是上面的 deadline（35s 软预算），所以不会真的等 300s
         async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=120)) as sess:
+                timeout=aiohttp.ClientTimeout(total=_PART_PUT_TIMEOUT)) as sess:
             for part in ordered:
                 idx = int(_get(part, "index"))
                 purl = _get(part, "presigned_url")
@@ -472,20 +614,28 @@ async def _upload_bytes_to_qq(
                 offset += len(chunk)
                 # ★ 带上 Content-Type：预签名 URL 只签了 host，
                 #   多带一个头不会破签，但它**决定平台存下来是什么类型**。
-                async with sess.put(purl, data=chunk, headers=part_headers) as r:
-                    if r.status >= 300:
-                        if logger is not None:
-                            logger.warning(
-                                "[QQBOT-BRIDGE] 图片分片 %s 上传失败：HTTP %s",
-                                idx, r.status,
-                            )
-                        return None
-                await _route_request(api, finish_route, json={
-                    "upload_id": upload_id,
-                    "part_index": idx,
-                    "block_size": str(len(chunk)),
-                    "md5": hashlib.md5(chunk).hexdigest(),
-                })
+                #
+                # ★★ 每个分片 PUT 都要重试（官方 PART_UPLOAD_MAX_RETRIES=2 × 1s 指数退避，
+                #    单次超时 300s；Hermes 同款）。原来**一个都没重试** ——
+                #    网络抖一下整条转存就失败，用户只看到"图又发不出来"。
+                async def _put_once(_purl=purl, _chunk=chunk):
+                    async with sess.put(_purl, data=_chunk, headers=part_headers) as r:
+                        if r.status >= 300:
+                            raise RuntimeError(f"COS PUT returned HTTP {r.status}")
+
+                await _with_retry(_put_once, label=f"分片 {idx} PUT",
+                                  deadline=deadline, logger=logger, retry_any=True)
+                # 分片确认：先快重试，命中 40093001 进持久重试
+                await _call_part_finish(
+                    api, finish_route, {
+                        "upload_id": upload_id,
+                        "part_index": idx,
+                        "block_size": str(len(chunk)),
+                        "md5": hashlib.md5(chunk).hexdigest(),
+                    },
+                    label=f"upload_part_finish#{idx}",
+                    retry_timeout=retry_timeout, deadline=deadline, logger=logger,
+                )
 
         # ★ 完整性自检：拼出来的必须和原文件一字不差，否则**宁可不传**
         #   （传个坏文件上去只会换来一个看不懂的平台错误）。
@@ -497,13 +647,18 @@ async def _upload_bytes_to_qq(
                 )
             return None
 
-        merged = await _route_request(api, files_route, json={
-            "file_type": int(file_type),
-            "srv_send_msg": False,
-            "file_name": name,
-            "url": "",              # 分片合并路径可留空，但字段要带上
-            "upload_id": upload_id,
-        })
+        merged = await _with_retry(
+            lambda: _route_request(api, files_route, json={
+                "file_type": int(file_type),
+                "srv_send_msg": False,
+                "file_name": name,
+                "url": "",              # 分片合并路径可留空，但字段要带上
+                "upload_id": upload_id,
+            }),
+            label="合并分片（/files）", max_retries=_UPLOAD_RETRIES,
+            base_delay=_COMPLETE_BASE_DELAY, deadline=deadline, logger=logger,
+            should_retry=_api_retryable,
+        )
         raw = _get(merged, "raw_url")
         if raw:
             if logger is not None:
@@ -523,10 +678,17 @@ async def _upload_bytes_to_qq(
         #   然后来问"为什么"——而日志里什么都没有。线上就被这个坑过一次
         #   （`400 / 850019 富媒体文件格式不支持`，因为分片拼装错了）。
         if logger is not None:
+            try:
+                from media_types import humanize_upload_error
+
+                _hint = humanize_upload_error(exc)
+            except Exception:
+                _hint = ""
             logger.warning(
-                "[QQBOT-BRIDGE] 图片转存到 QQ 失败（%s: %s）—— 本条图片按原地址发送，"
+                "[QQBOT-BRIDGE] 图片转存到 QQ 失败（%s: %s）%s —— 本条图片按原地址发送，"
                 "QQ 可能仍显示成 alt 文字；若持续如此请把本条连同日志反馈",
                 type(exc).__name__, str(exc)[:160],
+                ("\n    → " + _hint) if _hint else "",
             )
         return None
 

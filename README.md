@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.1
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.7
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -45,6 +45,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | **内联按钮** | `<keyboard>` 标签 → 消息下方挂按钮；带完整 JSON 校验（行/列/长度），非法直接拒绝并告知模型 |
 | **按钮点击回调** | 用户点按钮 → **3 秒内回执**（官方硬要求，否则客户端一直转圈）→ 转成一条消息给模型 |
 | **工具** | 共 12 个，按「是否需要群管理权限」分两组：**无需权限的默认开**（撤回自己消息 / 群信息含人数 / 按名字找人 / 读文件 / 发文件 / 机器人群内状态），**需权限的默认关**（禁言 / 禁言查询 / 加群审批 / 撤回他人 / 名册 / 踢人 / 黑名单）。**直接调官方接口，不依赖框架内部结构，跨版本可用** |
+| **表情包（sticker）** | 框架内置表情包插件的 `<sticker>` 标签在官 bot 上**本来发不出来**（两个卡点：① 适配器没声明支持 sticker ⇒ 插件不给 QQ 会话注册这个标签；② 就算解析成 `Sticker` 元素，适配器的富媒体白名单只认 File/Image ⇒ 被丢掉）。本插件把 sticker 补进声明（**只在真的装了表情包时**），发送时再把 `Sticker` 换成等价图片（`file_type=1`）⇒ **QQ 里就是一整张图** |
 | **成员事件** | 有人进群/退群/申请加群 → 作为 System 消息告诉模型（需打开 `extra_intents`，默认关） |
 | **3.0 引用唤醒补洞** | 3.0 判断"这条引用是不是在叫机器人"用的是**内存里自己发过的消息**，**重启后失效**。桥接改读平台下发的 `author.bot`，重启后依然成立 |
 
@@ -126,6 +127,9 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `markdown_enabled` | 开 | 注册 `<markdown>` 标签，让模型能发富文本（官方 2026-04-23 起自定义 markdown 对所有机器人开放，无需申请模板） |
 | `keyboard_enabled` | 开 | 注册 `<keyboard>` 标签，让模型能在消息下挂内联按钮 |
 | `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
+| `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
+| `c2c_stream_enabled` | 开 | **私聊流式消息**（官方 `stream_messages`）：把模型**正在生成的文字**实时写到那条消息上（约 0.5s 就能看到字，来源是提速器的 token 流）。**一条消息就是一条**：多段回复仍然是多条，绝不合并；没有预览就不接管（报文与从前完全一致）。只对单聊纯文本生效，失败一律回退普通发送 |
+| `sticker_tags` | **sticker** | **表情包标签关键词**（逗号分隔）：填进来的词会被补进适配器声明的类型清单（框架里的表情包插件正是看到这个词才注册自己的标签），且这些词对应的元素发送时按**图片**发出（`file_type=1`）。内置表情包用 `sticker`；第三方「增强表情包」是 `<sticker_plus>` 标签，填 `sticker` 即可覆盖。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效 |
 | `extra_intents` | **开** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；插件会在连接时自动补上订阅位并请一次重连，**需重启 KiraAI** 生效。个别环境被平台拒绝订阅时会自动回退 |
 
 ### 关于「发文件」——本插件**不做**（框架原生已支持）
@@ -448,6 +452,257 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.7</b> — ★★★ 让官 bot 能发**表情包**（框架内置插件的 `<sticker>` 标签）</summary>
+
+### 现象（用户日志）
+
+```
+模型输出：<msg><text>这个呢</text><sticker>1</sticker></msg>
+结果：表情包发不出来
+```
+
+### 根因：**两个叠加的卡点**
+
+**① `<sticker>` 标签根本没被注册。** 内置表情包插件是这样注册的
+（`core/plugin/builtin_plugins/sticker/main.py`）：
+
+```python
+supported_elements = event.supported_elements
+if "sticker" in supported_elements:          # ← 门槛
+    tag_set.register(build_sticker_tag(sticker_dict=...))
+```
+
+而 **QQ 官方适配器声明的类型清单里没有 `sticker`**：
+3.0 是 `_SUPPORTED_ELEMENTS = [... "emoji"]`、2.x 是 `message_types = [... "emoji"]`。
+⇒ 表情包插件**不会**给 QQ 会话注册这个标签 ⇒ 模型看不到它、写了也不解析。
+
+**② 就算解析成 `Sticker` 元素也发不出去。** 适配器的富媒体白名单只认 `File` / `Image`：
+
+```python
+media_elements = [e for e in chain if isinstance(e, (File, Image))]
+```
+
+`Sticker`（`BaseMediaElement`，本质就是一张图：`sticker_id` + `file`）不在里面 ⇒ 不会被上传，
+`_text_content` 还会把它写成 `[Unsupported message element]`。
+
+### 修法（纯插件侧，两步都在本插件里）
+
+1. **把 `sticker` 补进该适配器声明的类型清单**（实例级、可还原、幂等）
+   ⇒ 内置插件随即注册 `<sticker>`，模型在提示词里就能看到它和表情包清单；
+   ⚠ **只在真的装了表情包时才加** —— 内置插件不检查清单是否为空，空清单反而会诱导模型去发不存在的 id。
+   新装的插件/新加的表情包会被 15 秒巡检自动补上，不用重启。
+2. **发送时把 `Sticker` 换成等价的 `Image`**（复用已有的"媒体换壳"机制）
+   ⇒ 走 `file_type=1` 上传，`msg_type=7` 发出 —— **QQ 里就是一整张图**（表情包本体）。
+   发完**立刻还原**成 `Sticker`，绝不改用户的消息链。
+
+### 第三方表情包插件（`sticker-plus` 等）一并覆盖
+
+第三方「**增强表情包**」（`skyzhishui/kira-ai-plugin-sticker-plus`）**门槛和内置插件一模一样**：
+
+```python
+# kira-ai-plugin-sticker-plus/main.py:240
+if "sticker" not in event.message_types:
+    return                       # ← 同一个开关
+```
+
+而且它发送时用的**也是 `Sticker` 元素**（`MessageChain([Sticker(...)])` → `ctx.send_message_chain`）
+⇒ 声明 + 换壳两步都照常生效，**它一行都不用改**。
+
+> ⚠ **别把"门槛词"和"标签名"搞混**（这是最容易看错的一处）：
+>
+> | | 谁定义 | 值 |
+> |---|---|---|
+> | **门槛词**（要进 `supported_elements` 的那个） | 插件注册前自己检查 | 内置与第三方**都查 `sticker`** |
+> | **标签名**（模型实际写的那个） | 插件注册时命名 | 内置 `<sticker>` ／ 第三方 `<sticker_plus>` |
+>
+> 所以**只要声明 `sticker`**，内置与第三方两家的标签**都会注册**，模型两个都能用；
+> 默认值就是它，不用再加 `sticker_plus`（真加了也无害）。
+
+两点额外处理：
+
+* **判据不能只看内置图库**：第三方插件有自己的图库，内置表情包管理器可能是空的
+  ⇒ 判据改成「内置有图 **或** 加载了名字含关键词的插件」（如 `kira-ai-plugin-sticker-plus`）；
+* **关键词可配**（配置项 `sticker_tags`，逗号分隔，默认 `sticker`）：填进来的词都会被声明，
+  并且**类名里含该词的元素**都会按图片发出。以后遇到别的表情包插件（标签关键词不同），
+  把它填进来即可，不用改代码。
+
+### 边界
+
+* 只影响**发送侧**；入站方向 QQ 官方事件本来就不会带 sticker，行为不变；
+* 没装表情包（也没有名字含关键词的插件）⇒ 一个字节都不动（不声明、不换壳、不改提示词）；
+* 关掉插件 ⇒ 类型清单恢复原样（有测试断言其它类型一个没丢）。
+
+### 测试（新增 `tests/audit_sticker.py`，25 条；2.x / 3.0 各跑一遍都过）
+
+* 装了表情包 ⇒ 清单里有 `sticker`；**没装 ⇒ 不加**；
+* `<text>+<sticker>` 一条消息 ⇒ **msg_type=7 + media + file_type=1**，上传字节就是那张表情包，
+  正文保留文字且**不含** `[Unsupported message element]`；
+* 只发表情包（无文字）也能发出去（不是空消息）；
+* 发送后消息链**还原**成 `Sticker`；关掉插件后清单恢复；
+* **第三方**：关键词可配（`sticker,sticker_plus` 都进清单）、只摘我们加的词、
+  「内置图库为空 + 装了 `kira-ai-plugin-sticker-plus`」也照常声明、
+  **自定义元素类（`StickerPlus` 之类）同样被换成图片发出**（file_type=1）。
+
+</details>
+
+<details>
+<summary><b>v1.6.6</b> — 流式做到"零延迟开销"：收尾帧后台发 + 抽取改用 rfind（附实测数据）</summary>
+
+用户追问"这会不会让生成更卡 / 堵住看门狗"，于是逐条量了一遍并把两处开销抠掉：
+
+* **收尾帧改为后台发送**：那条消息的内容用户**早就看到了**（预览帧已上屏），框架只需要 message id
+  ⇒ 发送路径**不再多等一个来回**（实测：把收尾帧故意拖慢 0.3s，发送路径仍在 <50ms 内返回）；
+* **`display_text_of` 改用 `rfind`（C 层扫描）+ 纯子串判工具调用**：它每个 token chunk 都会跑，
+  原来是正则逐匹配遍历（O(n²) 且有 Python 循环开销）——实测 3000 字/1021 chunk 从 11.7ms 降到 **6ms**
+  （平均 5.9µs、最慢 23µs；2 万字极端情况 118ms，分摊在模型生成的几十秒里）；
+* **限流重试总等待封顶 3s**（官方退避是 1+2+4=7s）——我们在**消息发送路径**上重试，
+  宁可这一片交回上层，也不拖住发送路径；
+* 新增断言（`audit_c2c_stream.py`）：`observe_raw` 必须是**同步函数**、发送路径**不等收尾帧**
+  （<50ms）、每 chunk 抽取 <1ms、群聊**零动作**（不登记轮次/不开会话/不发状态/不发请求）。
+
+</details>
+
+<details>
+<summary><b>v1.6.5</b> — ★★★ 分片上传重试（官方策略）+ 私聊流式消息（**一条 `<msg>` 一条消息**）</summary>
+
+### 1. ★★ 分片上传重试：网络抖一下不再整条失败
+
+md 图片走的是官方分片上传（prepare → 逐片 PUT → part_finish → 合并），**此前一步都不重试**。
+现在逐条对齐官方（腾讯 Node SDK `retry.ts` ⇄ Hermes `chunked_upload.py`，两边数字完全一致）：
+
+| 步骤 | 重试 | 退避 | 依据 |
+|---|---|---|---|
+| 预上传（upload_prepare） | 2 次（共 3 次） | 1s 指数 | UPLOAD_RETRY_POLICY |
+| 逐片 PUT（COS） | 2 次（共 3 次） | 1s 指数，单次超时 300s | PART_UPLOAD_MAX_RETRIES |
+| 分片确认（upload_part_finish） | 2 次；命中 **40093001** 进**持久重试**（间隔 1s，时限取 prepare 下发的 retry_timeout，默认 120s、上限 600s） | 1s | PART_FINISH_RETRY_POLICY + buildPartFinishPersistentPolicy |
+| 合并（/files） | 2 次 | **2s** 指数 | COMPLETE_UPLOAD_RETRY_POLICY |
+| **日额度 40093002** | **不重试** | — | 重试只会浪费额度，直接如实上报 |
+
+自我保护：整条上传有 **35s 软预算**（小于图片处理总预算 45s），超了立刻放手（这张图退回原地址），
+绝不把整条消息拖死。
+
+### 2. ★★★ 私聊流式消息（官方 `stream_messages`）
+
+#### 契约：**一条 `<msg>` = 一条消息 = 一条流，绝不合并**
+
+KiraAI 核心是**逐条发送**的（`core/message_manager.py`）：
+
+```python
+for action in actions:                 # 每个 <msg> 段
+    result = await self.send_message_chain(event.sid, action, ...)
+    for handler in sent_handlers: ...  # 每发一条广播一次 ON_MESSAGE_SENT
+    await asyncio.sleep(random.uniform(min_message_delay, max_message_delay))
+```
+
+**分段是模型/框架的意图**（框架甚至刻意在两条之间留随机间隔）。所以本插件只做一件事：
+
+> 把**已经预览出来的那半句**，用框架真正要发的内容**补全并补上 `input_state=10` 收尾**；
+> 下一段的文字 → **下一条消息**（新的流）。两段永远不并进同一条消息。
+
+| 情况 | 行为 |
+|---|---|
+| **没有预览**（这条消息还没在用户那里出现过） | **不接管** —— 走流式与普通发送观感一样（都是一次到位），却多吃一次 API 调用 ⇒ **交给普通发送，报文与从前完全一致** |
+| **有预览**（用户已看到半句） | 接管：用权威内容补全这条消息并收尾（否则它会永远停在「生成中」） |
+| 预览与要发的内容对不上（极少见） | 预览**如实收尾**，本条交给普通发送 —— 绝不显示错的文字 |
+
+#### 提速来自哪：**token 实时上屏**（不是 `stream_messages` 本身）
+
+QQ 的 `stream_messages` **只是"把文字写进哪条消息"的显示通道，本身不产生速度**。
+让用户早看到字的永远是 **token 级增量**；KiraAI 核心回复路径非流式（`await model.chat()`），
+真正的流式来自**提速器插件**（patch LLM 客户端 → `chat_stream()` 收 SSE）。本插件：
+
+```
+LLMClientProxy.chat_stream → self._wrapped.chat_stream(request, **kwargs)
+                              ^^^^^^^^^^^^^^^^^^^ 我们包的就是这一层（旁听）
+```
+
+⇒ 一次 LLM 调用还是**一次**（不重复请求、不额外烧 token），只是把每个 chunk 的增量
+顺手投到 QQ 的流式消息上 ⇒ **用户约 0.5s 就能看到字**，而不必等整段生成完。
+**没有装提速器时这条通道自然静默**（核心回复路径不调 `chat_stream`），行为完全正常。
+
+三条铁律：**纯透传**（chunk 逐个原样、异常照抛）、**身份匹配**（只对登记过的那一个
+`LLMRequest` 生效 ⇒ 人设生成器之类别的 `chat_stream` 调用绝不会被误投到用户会话）、
+**观察出错只写日志**（绝不影响模型调用）。
+
+#### 边界与安全
+
+* 只碰 `msg_type=0` 的**私聊纯文本**；群聊 / markdown / 键盘 / 媒体 / 引用一律原路返回；
+* 返回值与普通发送**同形**（`{"id", "ext_info"}`）⇒ 框架的展示态 id、引用索引、
+  `_sent_message_ids`（引用机器人 = 被唤醒）全部照旧，**核心一行都不用改**；
+* 任何失败 ⇒ **返回 None，调用方照常发行**（消息绝不丢）；连续失败 2 次对该会话冷却
+  10 分钟；平台明确无权限时全局停用；
+* 预览文本只从最后一个 `<msg>` 的 `<text>`/`<markdown>` 开标签之后取，
+  遇**未闭合的 `<`** 直接截断（半截标签绝不外传），**工具调用轮一条都不投**；
+* 片数上限 30、最小间隔 500ms（**只跳过更新，绝不 sleep**）、限流（429/50002）指数退避
+  并推进 index（官方做法）；空闲 8s 兜底收尾（正常由"权威内容/下一轮"收尾）。
+
+#### 它**不会**让生成变慢、也不会堵住任何东西（可以拿这几条去核对）
+
+| 路径 | 我们做的事 | 会不会加延迟 |
+|---|---|---|
+| 提速器的 `chat_stream` 循环（每个 token） | 只在内存里累积文本 + 抽"当前可见文字"（**同步、零 I/O**，实测平均 **~6µs/次**、最慢 ~25µs；3000 字回复全程合计 **~6ms**） | **不会**（没有任何 await） |
+| 发预览帧 | 丢进**后台任务**，每 ≥500ms 最多一片 | **不会**（不占用模型循环） |
+| 框架的发送路径（把权威内容接到那条消息上） | 只写内存 + 返回 message id；**收尾帧丢后台发** | **不会**（实测：收尾帧故意慢 0.3s，发送路径仍在 **<50ms** 内返回） |
+| 群聊 | `is_group` 直接跳过：不登记轮次、不开会话、不发状态 | **不涉及**（报文与从前逐字一致） |
+
+限流重试的总等待还额外封了顶（≤3s，官方是整个 1+2+4=7s）—— 因为我们在**消息发送路径**上重试，
+宁可这一片不重试交回上层，也不让发送路径被拖住。看门狗/超时类机制碰不到我们：**没有任何
+会被它们等的长 await**；插件停止时只做一次 ≤2s 的收尾等待（把后台收尾帧发完）。
+
+</details>
+
+<details>
+<summary><b>v1.6.2</b> — ★★★ 语音变成文件卡片的根因（`file_name`）+ 新能力「输入中…」</summary>
+
+### 1. ★★★ 语音为什么仍是文件卡片：我们给语音带了 `file_name`
+
+三家官方/官方推荐实现**完全一致：`file_name` 只对 `file_type=4`（文件）发**：
+
+| 实现 | 源码 | 判据 |
+|---|---|---|
+| 腾讯官方 Node SDK `@tencent-connect/qqbot-nodejs` | `src/protocol/api/media.ts` | `if (fileType === MediaFileType.FILE && opts.fileName) { body.file_name = … }`，且 `USAGE.md` 写「`fileName` … **仅 FILE 类型有效**」 |
+| 官方 openclaw-qqbot | 走同一个 SDK | 语音上传体里**没有** `file_name` |
+| QQ 官方推荐的 Hermes | `gateway/platforms/qqbot/adapter.py` | `body = {"file_type":…, "srv_send_msg":…}`，`if file_type == MEDIA_TYPE_FILE and file_name:` 才加名字 |
+
+而我们一直给语音带上了文件名 —— 你截图里文件卡片上显示的名字
+（`jbf_v2.silk` / `jbf_voice60s.ogg`）**正是我们传过去的那个 `file_name`**。
+
+本版严格对齐：**非 FILE 一律不带 `file_name`**（图片/视频同理），文件仍然带。
+另外每次发媒体会记一条**上传体形状**日志（不含内容），下次万一还有问题，
+一眼就能和官方实现逐字段对齐 —— 前几轮排查最缺的就是这一行。
+
+### 2. ★★ 新能力：私聊「输入中…」（`msg_type=6`）
+
+模型开始思考时，在**单聊**里显示「对方正在输入…」，而不是让对方发呆 10~20 秒。
+KiraAI 核心两代都没有这个能力，官方两家都有：
+
+* 腾讯官方 Node SDK：`bot.sendTyping(target, 30)` —— 注释写明「**仅在 C2C 可用**」；
+* 官方推荐的 Hermes：`send_typing()` —— C2C-only、60 秒时长、**50 秒防抖**、必须有入站 `msg_id`。
+
+三个自我约束：**只做单聊**（官方限制）、**发失败绝不影响回复**（fire-and-forget）、
+**同会话 50 秒只发一次**（防 agent 多步循环刷屏）。
+配置项 `typing_enabled`，默认开。
+
+> 实现细节：**不能走 botpy 的 `post_c2c_message`** —— 它用 `payload = locals()`
+> 组装请求体，多传的 `input_notify` 会被**静默丢掉**（消息照发，但不是输入中状态）。
+> 所以直接走底层 `Route`。
+
+### 3. ★ 上传类错误「人话化」
+
+官方错误码表里的这几类根本不该让用户猜（`40093002` 是**今天的分片上传日额度用完了**，
+`850019` 是格式不支持，`850026` 是平台下载不到 URL…）。现在日志里会直接跟一句
+「→ 怎么办」，图片转存与媒体上传两条路径都覆盖。
+
+### 4. 测试
+
+* 新增 `tests/audit_upload_payload_shape.py` —— 真跑上传路径，断言
+  **`file_name` 只出现在 `file_type=4`**（含反向验证：旧形状会被抓到）+ 错误码人话化。
+* 新增 `tests/audit_typing_indicator.py` —— 输入中状态：只发单聊 / 需要入站 msg_id /
+  50 秒防抖 / 失败不影响调用方 / 走底层 Route。
+
+</details>
+
+<details>
 <summary><b>v1.6.1</b> — ★★★ 三个问题的真根因：md 图片缺 Content-Type / 语音「只信 silk」/ 私聊昵称记了没人读</summary>
 
 ### 0. 结论先摆出来（每个都有证据，不是"再试一次"）

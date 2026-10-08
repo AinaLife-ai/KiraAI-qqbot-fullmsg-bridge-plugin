@@ -89,6 +89,16 @@
   audit_md_img_content_type.py ★★★ md 图片「加载失败」的根因：
                        分片 PUT 必须带**按字节嗅探的图片 Content-Type**
                        （不带 ⇒ 平台存成 octet-stream ⇒ QQ 判"不是图片"）。
+  audit_upload_payload_shape.py ★★★ 语音成文件卡片的根因：`file_name` 只对
+                       file_type=4 发（腾讯 Node SDK / openclaw-qqbot / Hermes 三家一致）。
+  audit_stream_retry.py ★★ 分片上传重试（逐条对齐官方 retry 策略）：
+                       该重试的重试、日额度不重试、持久重试、预算到点放手。
+  audit_sticker.py      ★★★ 表情包（<sticker> 标签）：补齐"适配器声明 sticker"\n                       + 发送时 Sticker→Image（file_type=1），两步都不动核心。\n  audit_llm_stream_bridge.py ★★★ 提速来源：在提速器的 chat_stream 上**旁听**
+                       （纯透传、身份匹配、工具轮不投递、关掉即不装）。
+  audit_c2c_stream.py   ★★ 私聊流式消息（官方 stream_messages）：判据保守 /
+                       分段累积 / 空闲收尾 / 失败回退 / 限流重试 / api 层集成。
+  audit_typing_indicator.py ★ 新能力「输入中…」（msg_type=6）：只发单聊 /
+                       需要入站 msg_id / 50 秒防抖 / 失败不影响调用方。
   audit_v3_nickname_fallback.py ★★★ 私聊仍显示 hex 的根因：
                        3.0 显示昵称走核心 `QQOfficialMessageParser.nickname()`，
                        通讯录里的名字**没人读** ⇒ 包一层 parser 补来源。
@@ -109,7 +119,10 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "audit_edge.py", "audit_promises.py", "audit_e2e.py",
           "audit_hooks.py",
           "audit_chat_compat.py", "audit_hint_render.py", "audit_identity.py", "audit_recall_intent.py", "audit_intent_timing.py", "audit_tools_v133.py", "audit_tools_v133b.py", "audit_peers_v133.py", "audit_core_files.py", "audit_framework_peers.py", "audit_peer_misuse.py", "audit_join_request_flow.py", "audit_join_request_injection.py", "audit_recall_alias.py", "audit_hot_install.py", "audit_all_on.py", "audit_hot_install_live.py", "audit_msgid_source.py", "audit_msgid_own_bug.py", "audit_task_leak.py", "audit_session_backfill.py", "audit_md_regression.py", "audit_attach_wiring.py", "audit_ref_no_false_alarm.py", "audit_md_img_publish.py", "audit_md_tag_repair.py", "audit_media_types.py", "audit_chunk_assembly.py", "audit_media_coerce.py", "audit_upload_live.py", "audit_silk_codec.py", "audit_silk_voice.py", "audit_ffmpeg_deps.py", "audit_silk_tmpfiles.py", "audit_md_img_parallel.py", "audit_md_img_budget.py", "audit_md_img_size.py", "audit_silk_backends.py", "audit_md_img_real_size.py", "audit_silk_tencent_header.py", "audit_silk_already.py",
-          "audit_md_img_content_type.py", "audit_v3_nickname_fallback.py"]
+          "audit_md_img_content_type.py", "audit_v3_nickname_fallback.py",
+          "audit_upload_payload_shape.py", "audit_typing_indicator.py",
+          "audit_stream_retry.py", "audit_c2c_stream.py",
+          "audit_llm_stream_bridge.py", "audit_sticker.py"]
 
 rc = 0
 for suite in SUITES:

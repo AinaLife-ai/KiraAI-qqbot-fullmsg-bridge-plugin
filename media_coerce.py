@@ -56,17 +56,26 @@ from typing import Any, List, Tuple
 
 __all__ = ["coerce_media_chain", "restore_media_chain", "MEDIA_TYPES"]
 
-#: 需要「伪装成 File」才能被核心发送链认出来的元素类型
-#: （核心白名单只有 File / Image；这两个是它漏掉的）
-MEDIA_TYPES = ("Record", "Video")
+#: 核心发送链**认不出来**的媒体元素（白名单只有 File / Image）。
+#:
+#: * `Record` / `Video` ⇒ 换成等价的 `File`（我们包装过的 `_upload_file` 会按原始类型
+#:   给 `file_type=3/2`）；
+#: * `Sticker`（框架内置表情包插件的 `<sticker>` 产出，本质也是一张图）
+#:   ⇒ 换成等价的 **`Image`**（`file_type=1`，QQ 直接当图片展示）。
+MEDIA_TYPES = ("Record", "Video", "Sticker")
 
 
 def _type_name(obj: Any) -> str:
     return type(obj).__name__
 
 
-def coerce_media_chain(chain: Any) -> Tuple[Any, List[Tuple[int, Any]]]:
-    """把链里核心不认识的媒体元素**临时换成 `File`**，让核心愿意发送它。
+#: 默认的"表情包类"关键词（可被插件配置覆盖）：类名里含它就当图片发
+DEFAULT_IMAGE_KEYWORDS = ("sticker",)
+
+
+def coerce_media_chain(chain: Any, image_keywords: Any = DEFAULT_IMAGE_KEYWORDS
+                       ) -> Tuple[Any, List[Tuple[int, Any]]]:
+    """把链里核心不认识的媒体元素**临时换成 `File` / `Image`**，让核心愿意发送它。
 
     返回 ``(可能被改动过的 chain, [(下标, 原元素), ...])``；
     发完**务必**调用 `restore_media_chain` 换回去（我们不改用户的消息链）。
@@ -80,7 +89,7 @@ def coerce_media_chain(chain: Any) -> Tuple[Any, List[Tuple[int, Any]]]:
     if chain is None:
         return chain, []
     try:
-        from core.chat.message_elements import File
+        from core.chat.message_elements import File, Image
     except Exception:
         return chain, []
 
@@ -88,20 +97,32 @@ def coerce_media_chain(chain: Any) -> Tuple[Any, List[Tuple[int, Any]]]:
     if not isinstance(items, list):
         return chain, []
 
+    kws = tuple(str(k).lower() for k in (image_keywords or ()) if str(k).strip())
+
+    def _is_image_like(name: str) -> bool:
+        """类名里含配置的"表情包关键词" ⇒ 当图片发（默认包含 sticker）。"""
+        low = name.lower()
+        return any(k in low for k in kws)
+
     swapped: List[Tuple[int, Any]] = []
     for i, ele in enumerate(items):
-        if _type_name(ele) not in MEDIA_TYPES:
+        name = _type_name(ele)
+        if name not in MEDIA_TYPES and not _is_image_like(name):
             continue
-        # File(file, name, size, mime) —— 从原元素上把信息搬过去
+        # 把信息从原元素搬过去（两个类的构造签名不同，统一用关键字参数）
+        kind = _type_name(ele)
+        raw = (getattr(ele, "file", None) or getattr(ele, "record", None)
+               or getattr(ele, "sticker", None))
         try:
-            f = File(
-                getattr(ele, "file", None) or getattr(ele, "record", None),
-                getattr(ele, "name", None),
-                getattr(ele, "size", None),
-                getattr(ele, "mime", None),
-            )
+            if kind != "Record" and kind != "Video":
+                # Image(image, mime, name, caption) —— 注意第 2 个位置参数是 mime！
+                f = Image(image=raw, mime=getattr(ele, "mime", None),
+                          name=getattr(ele, "name", None))
+            else:
+                f = File(raw, getattr(ele, "name", None),
+                         getattr(ele, "size", None), getattr(ele, "mime", None))
             # ★ 记下原始类型，供我们的 `_upload_file` 包装定 file_type
-            f._kira_bridge_orig_kind = _type_name(ele)
+            f._kira_bridge_orig_kind = kind
             items[i] = f
             swapped.append((i, ele))
         except Exception:

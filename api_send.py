@@ -251,6 +251,23 @@ class ApiSendPatcher:
                 flags["kb_logged"] = True
                 self.logger.info("[QQBOT-BRIDGE] 首次发送内联键盘（<keyboard> 标签生效）")
 
+        # ③.5 ★ C2C 流式消息（官方 stream_messages）
+        #
+        #     把**同一轮私聊回复的多个分段**写成同一条会生长的消息（见 c2c_stream.py）。
+        #     只在"纯文本私聊 + 有被动 msg_id"时接管；**返回 None 就照常发送** ——
+        #     所以任何不确定/失败都不会丢消息，也不会改变群聊和富媒体的既有行为。
+        if not is_group and not keyboard and not kwargs.get("markdown") \
+                and int(kwargs.get("msg_type") or 0) == 0:
+            try:
+                manager = getattr(self.plugin, "c2c_stream", None)
+                if manager is not None:
+                    streamed = await manager.maybe_stream(
+                        adapter, _client, self._target_of(args, kwargs, is_group), kwargs)
+                    if streamed is not None:
+                        return streamed
+            except Exception as exc:
+                self.logger.debug("[QQBOT-BRIDGE] 流式消息接管失败（回退普通发送）: %s", exc)
+
         # ④ 发送（markdown 失败 → 退纯文本）
         if not target_md:
             result = await orig(*args, **kwargs)
@@ -290,8 +307,12 @@ class ApiSendPatcher:
 
 
 def _extract_ref_idx(result: Any) -> Optional[str]:
-    from qqbot_bridge import extract_sent_ref_idx
-
+    # 容错：`qqbot_bridge` 会 import 核心，拿不到就当"这条响应没有 ref_idx"
+    # （只影响"以后能不能引用这条消息"这一项增强，绝不影响发送本身）。
+    try:
+        from qqbot_bridge import extract_sent_ref_idx
+    except Exception:
+        return None
     return extract_sent_ref_idx(result)
 
 
