@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.2
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,132 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.4</b> — ★ 语音条（自动转 silk）＋ 音频文件，**两条路同时可用**</summary>
+
+### 官方限制（查证结果）
+
+「文件类型与限制」表：
+
+```
+file_type=3  语音  silk  软限制 20MB
+```
+
+第三方项目实测印证（`hermes-weixin-voice-bubble`）：
+
+> QQ 官方 API 的 `file_type=3` **只认 SILK**，**MP3 直接上传会降级成文件**。
+> 在发送前用 pilk 转 SILK 后，**语音全部以气泡形式送达**。
+
+⇒ 想发**语音条**就必须先转 silk。
+
+### ★ 为什么不能只装 ffmpeg（重要）
+
+**ffmpeg 只能解码 silk，不能编码。** 实测：
+
+```
+ffmpeg -encoders | grep silk   →  空
+ffmpeg -decoders | grep silk   →  空
+ffmpeg ... -c:a silk out.silk  →  Unable to choose an output format
+```
+
+Silk 是 Skype 的专有编解码器，编码必须用专门实现 ⇒ 用 **`pilk`**。
+而 pilk 只吃 **PCM**，所以链路是：
+
+```
+mp3/wav/ogg ──imageio-ffmpeg(自带静态 ffmpeg)──> PCM ──pilk──> silk
+```
+
+两个包都由 **`requirements.txt` 交给 KiraAI 插件加载器自动 `pip install`**
+（框架原生支持），**不需要你手动装 ffmpeg、不需要管理员权限**。
+两个包都有 Windows 预编译 wheel（pilk 覆盖 cp36–cp311）。
+
+### ★★ 你的两个要求：都满足（双世代实测）
+
+| 模型写法 | 结果 | `file_type` |
+|---------|------|------------|
+| `<file type="record">` + mp3 | **自动转 silk ⇒ 真语音条** | 3 |
+| `<file type="record">` + 已是 silk | 不重复转码，直接发 | 3 |
+| **`<file type="file">` + mp3** | **原样发送 ⇒ 音频文件**（可下载可播） | 4 |
+| `<file type="video">` + mp4 | 视频 | 2 |
+
+⇒ **「发语音条」和「发文件」两条路并存**，互不影响。
+模型想发语音条就写 `type="record"`，想发文件就写 `type="file"`。
+
+### 降级：转不了也绝不丢消息
+
+缺依赖 / 解码失败 / 文件过大 ⇒ **自动退回 `file_type=4` 按文件发送**，
+并打一条日志说明原因。**不会因为转码失败而丢掉消息。**
+
+### 测试
+
+| 文件 | 断言 | 覆盖 |
+|------|-----|------|
+`tests/audit_silk_codec.py` | 7 | 真跑 ffmpeg 解码 + pilk 编码调用参数、silk 魔数、缓存、异常安全 |
+`tests/audit_silk_voice.py` | 10 | **两条路并存**（record→3 / file→4）、已 silk 不重复转、**缺依赖退回 4**、video→2 |
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
+<summary><b>v1.5.3</b> — ★ 修掉「图片转存全线失败」的致命回归（sess 未定义）+ 分片基准值健壮性</summary>
+
+### 1. 图片转存**整条链路全废** —— 名字写错了
+
+你日志里这一行是决定性的：
+
+```
+WARNING 图片转存到 QQ 失败（NameError: name 'sess' is not defined）
+```
+
+**根因**：v1.5.1 我修分片偏移 bug 时，改动了那段循环的缩进 ——
+把 `async with aiohttp.ClientSession(...) as sess:` 这一行**连带删掉了**，
+却没补回来。循环里还在用 `sess.put(...)`。
+
+⇒ **语法检查通不出问题**（AST 完全合法），要**真跑一遍**才炸
+⇒ 所有图片转存 100% 失败 ⇒ md 里的图**全部**退化成 alt 文字。
+
+**修**：补回 `async with aiohttp.ClientSession(...) as sess:`，循环体正确缩进。
+
+**新增测试 `tests/audit_upload_live.py`（5 断言）**：**真跑** `_upload_bytes_to_qq`
+（用真 `Route`、真排序、真累加偏移、真完整性自检，只把 `sess.put` 换成记录调用），
+断言「不抛异常 + 拿到 raw_url + 分片总字节 == 原文件 + 乱序也对」。
+
+> **教训**：`NameError` 这类错误**语法检查抓不到** ——
+> 凡是「改缩进 / 搬代码块」的改动，光看 AST 通过没用，**必须真跑一次**。
+
+### 2. 分片 index 的基准值
+
+对照成熟实现（AstrBot）发现它用 `part_index_base = min(index)` 来算偏移，
+说明**平台不保证分片 index 从 0 开始**。已按基准值算偏移（更稳）。
+
+### 3. 语音条：`file_type=3` 是对的，卡在**格式**
+
+已确认我们的链路完全正确（双世代实测）：
+
+```
+Record(mp3)  → 上传 file_type=[3]
+Video(mp4)   → 上传 file_type=[2]
+```
+
+但官方「文件类型与限制」表写的是 **`3 语音 silk`** ——
+**只认 silk**，而 `Just Be Friends….mp3`（4.6 MB）是 **mp3**。
+平台收下后按"不认识的语音格式"处理 ⇒ 落成**文件卡片**。
+
+你的机器上 `where ffmpeg` **失败**（没有 ffmpeg），所以插件侧做不了
+mp3→silk 转码。**这是目前唯一没解决的**，需要你决定：
+
+* 装 ffmpeg（或让框架带一个），我们就能转；或
+* 接受"语音按文件发"的现状（其它平台/格式不受影响）。
+
+### 测试
+
+`tests/audit_upload_live.py`（5）—— 真跑上传全链路，专抓这类运行时错误。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.2</b> — ★ 语音/视频终于发得出去 + 图片下载器带上真 UA 与说人话的失败日志</summary>
 
 ### 1. `<file type="record">` 发出去变成 `[Unsupported message element]`
