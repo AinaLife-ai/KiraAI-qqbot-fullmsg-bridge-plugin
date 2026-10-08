@@ -49,7 +49,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
+__all__ = ["reset_encoder_cache", "reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
 
 #: silk 文件以这个魔数开头（`#!SILK_V3`）
 SILK_MAGIC = b"#!SILK_V3"
@@ -85,14 +85,14 @@ def silk_available() -> bool:
       pip 装 `imageio-ffmpeg` 只是**兜底**。
       ⇒ 只要有 pilk + **任一** ffmpeg（系统的或 imageio 自带的）就能转。
     """
-    try:
-        import pilk  # noqa: F401
-    except Exception:
-        return False
-    return _ffmpeg_exe() is not None
+    return _silk_encoder() is not None and _ffmpeg_exe() is not None
 
 
-#: 找过的结果缓存（`None` = 还没找过；找到后固定不变）
+#: silk 编码器探测缓存（'pysilk' / 'pilk' / 'silk_v3_encoder' / None）
+_ENCODER_CACHE: Any = None
+_ENCODER_TRIED = False
+
+#: ffmpeg 查找结果缓存（`None` = 还没找过；找到后固定不变）
 _FFMPEG_CACHE: Any = None
 _FFMPEG_TRIED = False
 
@@ -148,15 +148,101 @@ def _is_silk_file(path: str) -> bool:
         return False
 
 
+def _silk_encoder() -> Optional[str]:
+    """挑一个**能用的** silk 编码器，返回它的名字；一个都没有时返回 None。
+
+    ## 为什么要有多个后端（2026-10-08 踩坑）
+
+    原来只用 `pilk`，但它的 **Windows wheel 只到 cp311** ——
+    用 Python 3.12+（KiraAI 自带 3.13）的机器 pip 会去**编译源码**，
+    Windows 上编译需要 MSVC ⇒ 直接失败：
+
+        error: Microsoft Visual C++ 14.0 or greater is required.
+
+    ⇒ 现在按顺序找：
+
+    1. **`pysilk`（PyPI 包名 `silk-python`）** —— wheel 覆盖 **cp38–cp314**，
+       py3.12/3.13 上装**预编译包即可，无需编译器**。首选。
+    2. `pilk` —— 老牌，cp311 及以下可用。
+    3. 外部 `silk_v3_encoder` 可执行文件（用户自己装了的话）。
+
+    结果缓存（这是每次发语音都会问的路径）。
+    """
+    global _ENCODER_CACHE, _ENCODER_TRIED
+    if _ENCODER_TRIED:
+        return _ENCODER_CACHE
+    _ENCODER_TRIED = True
+
+    for mod in ("pysilk", "pilk"):
+        try:
+            __import__(mod)
+            _ENCODER_CACHE = mod
+            return mod
+        except Exception:
+            continue
+    if shutil.which("silk_v3_encoder"):
+        _ENCODER_CACHE = "silk_v3_encoder"
+        return _ENCODER_CACHE
+    _ENCODER_CACHE = None
+    return None
+
+
+def reset_encoder_cache() -> None:
+    """清掉编码器探测缓存（测试 / 装完依赖后重试用）。"""
+    global _ENCODER_CACHE, _ENCODER_TRIED
+    _ENCODER_CACHE, _ENCODER_TRIED = None, False
+
+
+def _encode_silk(encoder: str, pcm_path: str, silk_path: str, rate: int) -> bool:
+    """用指定后端把 PCM 编成 silk。成功返回 True。
+
+    三个后端的 API 形态不同，这里统一收口：
+
+    * `pysilk`（silk-python）：`encode(pcm_fp, silk_fp, pcm_rate, bit_rate)`
+      —— 接受 **file-like object**；
+    * `pilk`：`encode(pcm路径, silk路径, pcm_rate=…, tencent=True)`
+      —— 接受**路径字符串**，且要 `tencent=True` 才是腾讯系变体；
+    * `silk_v3_encoder`：外部可执行文件，`-tencent` 参数。
+    """
+    if encoder == "pysilk":
+        import pysilk
+        with open(pcm_path, "rb") as fin, open(silk_path, "wb") as fout:
+            pysilk.encode(fin, fout, rate, rate)
+        return os.path.exists(silk_path) and os.path.getsize(silk_path) > 0
+
+    if encoder == "pilk":
+        import pilk
+        pilk.encode(pcm_path, silk_path, pcm_rate=rate, tencent=True)
+        return os.path.exists(silk_path) and os.path.getsize(silk_path) > 0
+
+    if encoder == "silk_v3_encoder":
+        exe = shutil.which("silk_v3_encoder")
+        if not exe:
+            return False
+        proc = subprocess.run(
+            [exe, pcm_path, silk_path, "-Fs_API", str(rate), "-tencent"],
+            capture_output=True, timeout=300,
+        )
+        return proc.returncode == 0 and os.path.exists(silk_path)
+
+    return False
+
+
 def _convert_sync(src: str, out_dir: str) -> Optional[str]:
     """同步转码：`src`（任意音频）→ silk 文件路径；失败返回 None。
 
-    链路：ffmpeg 解码成 PCM → pilk 编码成 silk。
+    链路：**ffmpeg 解码成 PCM → silk 编码器编成 silk**。
+
+    ★ 注意：**ffmpeg 压不出 silk**（它没有 silk 编码器），
+      只负责第一步的 PCM 解码 —— 这一点已被实测确认。
     """
-    try:
-        import pilk
-    except Exception as exc:
-        logger.warning("[QQBOT-BRIDGE] 缺少 pilk，无法把音频转成语音条 silk：%s", exc)
+    encoder = _silk_encoder()
+    if not encoder:
+        logger.warning(
+            "[QQBOT-BRIDGE] 没有可用的 silk 编码器（pysilk / pilk / silk_v3_encoder 都没有），"
+            "无法把音频转成语音条 silk —— 本条会按「文件」发送。"
+            "装依赖后即可自动转（插件已在 requirements.txt 声明 silk-python）"
+        )
         return None
 
     ffmpeg = _ffmpeg_exe()
@@ -186,15 +272,19 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
         )
         return None
 
-    # ② PCM → silk（pilk 的 pcm_rate 必须与上面 -ar 一致）
+    # ② PCM → silk（采样率必须与上面 ffmpeg 的 -ar 一致）
     #
-    #   ★ pilk 的 API 是 `encode(pcm路径, silk路径, pcm_rate=…, tencent=True)`
-    #     —— **接受路径字符串**，不是文件对象。
-    #   ★ tencent=True：输出腾讯系（QQ/微信）认的 silk 变体。
+    #   后端形态不同，统一交给 `_encode_silk`：
+    #     * pysilk —— 接受 file-like；直接用，无需 tencent 参数
+    #     * pilk   —— 接受路径 + `tencent=True`（腾讯系变体）
+    #     * silk_v3_encoder —— 外部二进制，带 `-tencent`
     try:
-        pilk.encode(pcm_path, silk_path, pcm_rate=rate, tencent=True)
+        ok = _encode_silk(encoder, pcm_path, silk_path, rate)
     except Exception as exc:
-        logger.warning("[QQBOT-BRIDGE] pilk 编码 silk 失败：%s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "[QQBOT-BRIDGE] silk 编码失败（后端=%s）：%s: %s",
+            encoder, type(exc).__name__, exc,
+        )
         return None
     finally:
         try:
@@ -202,8 +292,8 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
         except Exception:
             pass
 
-    if not os.path.exists(silk_path) or os.path.getsize(silk_path) == 0:
-        logger.warning("[QQBOT-BRIDGE] silk 转码产物为空")
+    if not ok or not os.path.exists(silk_path) or os.path.getsize(silk_path) == 0:
+        logger.warning("[QQBOT-BRIDGE] silk 转码产物为空（后端=%s）", encoder)
         return None
     return silk_path
 
@@ -310,3 +400,4 @@ def clear_cache() -> None:
             _rm_tree(entry[1])
     _CACHE.clear()
     reset_ffmpeg_cache()
+    reset_encoder_cache()

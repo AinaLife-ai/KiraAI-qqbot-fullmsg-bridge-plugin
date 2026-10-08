@@ -32,6 +32,17 @@ import zlib
 ROOT = "/var/minis/workspace/qqbot_bridge_review"
 sys.path.insert(0, f"{ROOT}/bridge")
 
+
+def _normalize(md: str) -> str:
+    """把图片的**尺寸后缀**去掉，便于断言"除图片 URL 与尺寸外逐字相同"。
+
+    ★ v1.5.6 起我们会给图片补 `#0 #0`（QQ 的 md 图片需要尺寸后缀才渲染），
+      所以"逐字相同"的断言要允许这两个已知差异：URL 与尺寸。
+    """
+    import re as _re
+    return _re.sub(r"(!\[[^\]]*?)\s*#[^#\]]*\s*#[^#\]]*\s*(\]\()", r"\1\2", md)
+
+
 PASS = FAIL = 0
 
 
@@ -109,8 +120,8 @@ async def main():
 
     check("★ 图片 URL 已换成公网地址", "https://cos.example.com/real.png?sign=zzz" in out)
     check("本地路径已消失", "data/temp/" not in out)
-    check("★★ 除图片 URL 外**逐字相同**（md 格式零改动）",
-          out.replace("https://cos.example.com/real.png?sign=zzz",
+    check("★★ 除图片 URL 与尺寸外**逐字相同**（md 正文零改动）",
+          _normalize(out).replace("https://cos.example.com/real.png?sign=zzz",
                       "data/temp/compressed_abc.jpg") == MD_FULL)
     check("★★ 行数不变", len(MD_FULL.splitlines()) == len(out.splitlines()))
     for name, frag in [
@@ -120,7 +131,7 @@ async def main():
         ("有序列表", "1. 有序1\n2. 有序2"), ("链接", "[链接](https://www.qq.com)"),
         ("代码块", '```python\nprint("code block")\n```'),
         ("表格", "| 表头A | 表头B |"),
-        ("图片 alt 文字保留", "![本地图]"),
+        ("图片 alt 文字保留", "![本地图"),      # 后面会跟尺寸后缀，故不写闭括号
     ]:
         check(f"格式保留：{name}", frag in out)
 
@@ -139,8 +150,8 @@ async def main():
     md_remote = "![香香](https://zh.wikipedia.org/wiki/Special:FilePath/Luka.png)\n"
     out2 = await M.fix_markdown_images(md_remote, client=None, target_id="G1",
                                        is_group=True)
-    check("★ 验不出来的 URL **原样保留**（不静默改动用户内容）",
-          out2 == md_remote, repr(out2))
+    check("★ 验不出来的 URL **原样保留**（不静默改动用户内容；只补尺寸）",
+          _normalize(out2) == md_remote and "zh.wikipedia.org" in out2, repr(out2))
 
     async def fake_resolve_ok(client, url, logger=None, timeout=12.0):
         return "https://upload.wikimedia.org/real.png"    # 模拟"跟随跳转后的真地址"
@@ -150,8 +161,8 @@ async def main():
                                        is_group=True)
     check("★ 能跟随跳转到真图 ⇒ 替换成真地址",
           "upload.wikimedia.org/real.png" in out3, repr(out3))
-    check("结构仍未被破坏",
-          out3.replace("https://upload.wikimedia.org/real.png",
+    check("结构仍未被破坏（除图片 URL/尺寸外逐字相同）",
+          _normalize(out3).replace("https://upload.wikimedia.org/real.png",
                        "https://zh.wikipedia.org/wiki/Special:FilePath/Luka.png") == md_remote)
 
     print("\n[3b] ★ 远程图也转存到 QQ 的 COS（不再只验真）")
@@ -168,8 +179,8 @@ async def main():
     check("★★ 远程图被转存成 QQ 自己的 COS 地址",
           "https://cos.example.com/converted.png?sign=qqq" in out_r, repr(out_r))
     check("原站地址已不在 md 里", "moegirl" not in out_r)
-    check("结构仍未被破坏",
-          out_r.replace("https://cos.example.com/converted.png?sign=qqq",
+    check("结构仍未被破坏（除图片 URL/尺寸外逐字相同）",
+          _normalize(out_r).replace("https://cos.example.com/converted.png?sign=qqq",
                         "https://storage.moegirl.org.cn/moegirl/commons/3/39/Luka_v4x_final.png") == md_r)
 
     print("\n[3c] 转存失败 ⇒ 退回验真，仍然不许丢内容")
@@ -184,7 +195,7 @@ async def main():
     M.resolve_image_url = ok_resolve
     out_r2 = await M.fix_markdown_images(md_r, client=None, target_id="G1", is_group=True)
     check("★ 转存失败但地址确是真图 ⇒ 保留原地址（不丢内容）",
-          out_r2 == md_r, repr(out_r2))
+          _normalize(out_r2) == md_r, repr(out_r2))
 
     print("\n[4] 没有图片的 md：一个字都不许动")
     plain = "# 只有文字\n\n- 列表\n"
@@ -198,7 +209,7 @@ async def main():
     M.upload_local_to_public_url = boom
     M.clear_caches()
     out5 = await M.fix_markdown_images(MD_FULL, client=None, target_id="G1", is_group=True)
-    check("★ 转存失败 ⇒ 原样返回（不抛异常、不删内容）", out5 == MD_FULL)
+    check("★ 转存失败 ⇒ 原样返回（不抛异常、不删内容）", _normalize(out5) == MD_FULL)
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
