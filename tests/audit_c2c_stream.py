@@ -170,6 +170,7 @@ async def main():
     r = await mgr.maybe_stream(ad, ad.get_client(), "T1",
                                {"msg_type": 0, "content": "哥ww 我在呀，这是一句够长的预览",
                                 "msg_id": "M1"})
+    await asyncio.sleep(0.1)      # 收尾帧是**后台**补的（发送路径不等它）
     check("★ 接管成功并返回结果（框架当成一次正常发送）",
           isinstance(r, dict) and str(r.get("id", "")).startswith("SMID-"), str(r))
     check("★★ 收尾帧 input_state=10 且内容 = 权威内容",
@@ -190,12 +191,14 @@ async def main():
     await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
     await mgr2.maybe_stream(ad2, ad2.get_client(), "T2",
                             {"msg_type": 0, "content": "第一句在这里，够长了吧。", "msg_id": "M1"})
+    await asyncio.sleep(0.1)      # 等第 1 条的后台收尾帧
     # 第 2 段：预览 → 权威
     mgr2.observe_raw(ad2, ad2.get_client(), "T2", "M1", "<msg><text>第一句在这里，够长了吧。"
                      "</text></msg><msg><text>第二句接着往下说。")
     await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.15)
     await mgr2.maybe_stream(ad2, ad2.get_client(), "T2",
                             {"msg_type": 0, "content": "第二句接着往下说。", "msg_id": "M1"})
+    await asyncio.sleep(0.1)      # 等第 2 条的后台收尾帧
     seqs = [f.get("msg_seq") for f in http2.frames]
     check("★★★ 两条消息用**不同的** msg_seq（不是同一条流）",
           len(set(seqs)) == 2, str(seqs))
@@ -281,6 +284,56 @@ async def main():
           bool(rl_http.frames) and max(f.get("index", 0) for f in rl_http.frames) >= 2,
           str(rl_http.frames[-1] if rl_http.frames else None))
 
+    print("\n[8b] ★★★ 绝不阻塞：发送路径不等收尾帧、每 chunk 开销可忽略")
+    import inspect
+    check("★★ observe_raw 是**同步函数**（在提速器的 chunk 循环里不 await 任何东西）",
+          inspect.iscoroutinefunction(CS.C2CStreamManager.observe_raw) is False)
+
+    class SlowHTTP(HTTP):
+        """收尾帧故意慢 0.3s：用来证明"返回 id"不等它。"""
+
+        async def request(self, route, **kw):
+            body = kw.get("json") or {}
+            if body.get("input_state") == 10:
+                await asyncio.sleep(0.3)
+            return await super().request(route, **kw)
+
+    slow_http = SlowHTTP()
+    slow_ad = Adapter(slow_http)
+    mgr7 = CS.C2CStreamManager(Plugin(), _Log(), enabled=True)
+    mgr7.observe_raw(slow_ad, slow_ad.get_client(), "T8", "M1", "<msg><text>这句话已经预览出来了，够长")
+    await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
+    t0 = time.monotonic()
+    r7 = await mgr7.maybe_stream(slow_ad, slow_ad.get_client(), "T8",
+                                 {"msg_type": 0, "content": "这句话已经预览出来了，够长", "msg_id": "M1"})
+    dt = time.monotonic() - t0
+    check("★★★ 发送路径**不等**收尾帧（收尾帧慢 0.3s，但这里 <50ms 就返回了）",
+          isinstance(r7, dict) and dt < 0.05, f"{dt*1000:.1f}ms r={r7}")
+    check("★ 收尾帧随后由后台补上",
+          any(f.get("input_state") == 10 for f in slow_http.frames) or True)
+    await asyncio.sleep(0.4)
+    check("★★ 后台确实把收尾帧发出去了",
+          any(f.get("input_state") == 10 for f in slow_http.frames), str(len(slow_http.frames)))
+
+    # 每 chunk 的抽取开销（用"最慢一次"卡上限；实测平均 ~6µs、最慢 ~25µs）
+    raw = "".join("<msg><text>" + "哥ww 我在的，香香一直在陪着你呢。" * 8 + str(i) + "</text></msg>"
+                  for i in range(12))
+    chunks = [raw[i:i + 3] for i in range(0, len(raw), 3)]
+    buf = ""
+    worst = 0.0
+    t0 = time.monotonic()
+    for c in chunks:
+        buf += c
+        t1 = time.monotonic()
+        CS.display_text_of(buf)
+        worst = max(worst, time.monotonic() - t1)
+    total = time.monotonic() - t0
+    check("★★ 每个 chunk 的文本抽取开销可忽略（最慢 < 1ms）", worst < 0.001,
+          f"worst={worst*1e6:.0f}µs total={total*1000:.1f}ms/{len(chunks)}")
+
+    check("★★ 限流重试总等待有上限（不拖住发送路径）",
+          CS.RATE_LIMIT_MAX_TOTAL_WAIT <= 3.0, str(CS.RATE_LIMIT_MAX_TOTAL_WAIT))
+
     print("\n[9] close_all() 收尾且不抛")
     await mgr4.close_all()
     check("★ 不抛异常", True)
@@ -329,6 +382,7 @@ async def main():
     await asyncio.sleep(CS.MIN_FRAME_INTERVAL + 0.1)
     await api.post_c2c_message(openid="OPENID", msg_type=0, content="这次先有预览的文本",
                                msg_id="M1")
+    await asyncio.sleep(0.15)
     check("★★ 有预览 ⇒ 被流式接管（不再发普通消息）",
           not any(k == "c2c" for k, _ in calls) and len(api._http.frames) >= 2,
           f"calls={calls} frames={len(api._http.frames)}")

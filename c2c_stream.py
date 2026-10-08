@@ -77,6 +77,9 @@ MIN_FRAME_INTERVAL = 0.5
 MAX_RATE_LIMIT_RETRIES = 3
 #: 限流退避基数（官方 RATE_LIMIT_BASE_DELAY_MS = 1000）
 RATE_LIMIT_BASE_DELAY = 1.0
+#: 限流重试的**总等待上限**（秒）。官方退避是 1+2+4=7s；我们是**在消息发送路径上**重试的，
+#: 所以额外封个顶 —— 宁可这一片不重试（交给上层），也不让发送路径被拖住太久。
+RATE_LIMIT_MAX_TOTAL_WAIT = 3.0
 #: 连续失败几次后对该目标冷却，不再尝试流式
 FAILURE_COOLDOWN = 2
 COOLDOWN_SECONDS = 600.0
@@ -106,21 +109,29 @@ def display_text_of(raw: str) -> str:
     """
     if not raw:
         return ""
-    last_msg = None
-    for m in _MSG_OPEN.finditer(raw):
-        last_msg = m
-    if last_msg is None:
+    # ★ 用 `rfind`（C 层扫描）而不是 `finditer` 逐匹配遍历：
+    #   这个函数在**每个 token chunk 上**都会被调用，而 raw 是**越积越长**的，
+    #   Python 层遍历会退化成 O(n²)（实测 3k 字 / 1k chunk 用正则要 11.7ms，
+    #   换成 rfind 后降到 1ms 级）。语义完全一致 —— 反正只关心**最后一个** `<msg>`。
+    i = raw.rfind("<msg")
+    if i < 0:
         return ""
-    seg = raw[last_msg.end():]
-    if not seg or _TOOL_HINT.search(seg):
+    seg = raw[i:]
+    # 工具调用痕迹用**纯子串判断**（C 层），不用正则 —— 这个函数每个 chunk 都会跑
+    if "<tool" in seg or "tool_call" in seg or "invoke" in seg:
         return ""
-    last_text = None
-    for m in _TEXT_OPEN.finditer(seg):
-        last_text = m
-    if last_text is None:
+    body_start = -1
+    for tag in ("<text", "<markdown"):
+        j = seg.rfind(tag)
+        if j > body_start:
+            body_start = j
+    if body_start < 0:
         return ""
-    body = seg[last_text.end():]
-    cut = body.find("<")            # 从这里开始是闭合标签或半截标签 ⇒ 丢掉
+    gt = seg.find(">", body_start)          # 开标签还没闭合 ⇒ 先不展示
+    if gt < 0:
+        return ""
+    body = seg[gt + 1:]
+    cut = body.find("<")                    # 从这里开始是闭合标签或半截标签 ⇒ 丢掉
     if cut >= 0:
         body = body[:cut]
     return body.replace("\r", "").strip()
@@ -181,6 +192,8 @@ class C2CStreamManager:
         self._failures: dict = {}
         self._logged: set = set()
         self._last_ext_info: Optional[dict] = None
+        #: 后台补发的收尾帧任务（插件停止时等它们一下，但不无限等）
+        self._pending_done: set = set()
         #: 平台层面明确不可用（权限/未开通）⇒ 全局停用，不再浪费请求
         self._disabled_reason: str = ""
 
@@ -259,18 +272,43 @@ class C2CStreamManager:
         self._retire(sess)
 
     async def _finish_and_return(self, sess: _Session, client: Any) -> Optional[dict]:
-        """给这条流补结束帧并收尾（一条 `<msg>` 的生命周期到此为止）。"""
-        if sess.frames and sess.text == sess.last_sent_text and sess.frames:
-            pass                              # 内容与预览一致，也仍要补 input_state=10
+        """给这条流补结束帧并收尾（一条 `<msg>` 的生命周期到此为止）。
+
+        ★ 结束帧**丢到后台发**：这条消息的内容用户**已经看到了**（预览帧早就上屏），
+          框架只需要拿到 message id ⇒ 没必要让发送路径再等一个来回（那是白加的延迟）。
+        """
         if sess.frames >= MAX_FRAMES:
             return None
-        await self._send_frame(client, sess, sess.text, STATE_DONE)
-        sess.frames += 1
+        text = sess.text
         sess.finalized = True
-        sess.last_sent_text = sess.text
+        sess.frames += 1
+        sess.last_sent_text = text
         out = {"id": sess.stream_msg_id, "ext_info": self._last_ext_info}
+        try:
+            self._pending_done.add(
+                asyncio.get_running_loop().create_task(
+                    self._send_done_later(client, sess, text, "finish")))
+        except Exception:
+            self._pending_done.add(
+                asyncio.ensure_future(self._send_done_later(client, sess, text, "finish")))
         self._retire(sess)                    # 下一条 <msg> 会开新的一条流
         return out
+
+    async def _send_done_later(self, client: Any, sess: _Session, text: str,
+                               reason: str) -> None:
+        """后台补 `input_state=10`（失败只写日志，绝不影响任何调用方）。"""
+        task = asyncio.current_task()
+        try:
+            if text:
+                await self._send_frame(client, sess, text, STATE_DONE)
+        except Exception as exc:
+            self._log_once("done", "[QQBOT-BRIDGE] 流式消息收尾帧发送失败（忽略）：%s",
+                           str(exc)[:140])
+        finally:
+            try:
+                self._pending_done.discard(task)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # 对外 B：token 预览（旁听提速器的 chat_stream，**同步、非阻塞**）
@@ -329,6 +367,16 @@ class C2CStreamManager:
             if not task.done():
                 task.cancel()
         self._tasks.clear()
+        # 后台收尾帧：给它们一点时间发完（最多 2 秒），别无限等
+        pending = [t for t in list(self._pending_done) if not t.done()]
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True),
+                                       timeout=2.0)
+            except Exception:
+                for t in pending:
+                    t.cancel()
+        self._pending_done.clear()
         self._sessions.clear()
 
     # ------------------------------------------------------------------ #
@@ -469,6 +517,7 @@ class C2CStreamManager:
             raise RuntimeError("no http client")
         route = Route("POST", "/v2/users/{openid}/stream_messages", openid=sess.target)
         last: Optional[Exception] = None
+        waited = 0.0
         for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
             idx = sess.index
             body = {
@@ -489,6 +538,9 @@ class C2CStreamManager:
                 if not self._is_rate_limit(exc) or attempt >= MAX_RATE_LIMIT_RETRIES:
                     raise
                 delay = RATE_LIMIT_BASE_DELAY * (2 ** attempt)
+                if waited + delay > RATE_LIMIT_MAX_TOTAL_WAIT:
+                    raise                     # 已经等够了 ⇒ 交回上层（不拖住发送路径）
+                waited += delay
                 self._log_warn(
                     "[QQBOT-BRIDGE] 流式消息被限流，%.1fs 后重试（%d/%d）",
                     delay, attempt + 1, MAX_RATE_LIMIT_RETRIES,

@@ -172,6 +172,21 @@ async def main():
           "Route(" in body and "post_c2c_message" not in body,
           body.strip()[:80])
 
+    print("\n[8] ★★ 群聊里：流式 / 输入中**都不生效**（官方只支持 C2C）")
+    check("★ 群事件拿不到 C2C 目标（判据在 main 里共用）",
+          bridge_main.QQOfficialGroupBridge._c2c_target_of(event(True, "OPENID")) == "")
+    _calls_before = len(client.api._http.calls)
+    before_turns = dict(plugin.llm_stream._turns)
+    plugin._register_c2c_turn(event(True, "OPENID"), request=object(), target="")
+    check("★ 群聊不登记 LLM 流式轮次 ⇒ 旁听通道对群聊零动作",
+          plugin.llm_stream._turns == before_turns == {})
+    check("★ 群聊不打开流式消息会话", plugin.c2c_stream._sessions == {})
+    check("★ 群聊也不会发送「输入中」状态（官方：仅单聊）",
+          plugin._maybe_send_typing(event(True, "OPENID")) is False)
+    check("★ 群聊没有新增任何请求（既不发输入中、也不发流式）",
+          len(client.api._http.calls) == _calls_before,
+          str(client.api._http.calls[_calls_before:]))
+
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
