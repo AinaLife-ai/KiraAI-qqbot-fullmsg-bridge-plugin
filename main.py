@@ -349,6 +349,9 @@ class QQOfficialGroupBridge(BasePlugin):
         #: 表情包标签关键词（逗号分隔；默认 sticker —— 它同时覆盖内置表情包插件
         #: 与第三方「增强表情包」sticker-plus，两家都是看这个词才注册标签）
         self.sticker_tags = _split_keywords(basic.get("sticker_tags", "sticker"))
+        #: GIF/动图的发送方式：auto（默认：尽量内嵌显示，被平台拒就按文件发）/
+        #: image（只按图片发）/ file（原样按文件发，保留动图）
+        self.gif_sticker_mode = str(basic.get("gif_sticker_mode", "auto") or "auto").strip().lower()
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -1103,7 +1106,7 @@ class QQOfficialGroupBridge(BasePlugin):
             holder = self._capability_of(adapter)
             if not hasattr(holder, "_upload_file"):
                 holder = adapter            # 2.x：在适配器实例上
-            if _install_media_types(holder, client, logger):
+            if _install_media_types(holder, client, logger, self):
                 self._media_types_holders[name] = holder
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 安装媒体类型修正失败（不影响其它功能）: %s", exc)

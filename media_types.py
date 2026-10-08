@@ -172,42 +172,73 @@ def sniff_image_format(data: bytes) -> str:
     return ""
 
 
-def normalize_image_data(data: bytes, name: str = "", logger_: Any = None):
-    """把平台不认的图片格式转成 PNG。返回 ``(data, name, note)``。
+def normalize_image_data(data: bytes, name: str = "", logger_: Any = None, *,
+                         allow_anim: bool = True,
+                         anim_max_bytes: int = 4 * 1024 * 1024):
+    """把平台不认的图片格式转成 **PNG**。返回 ``(data, name, note)``。
 
     * 已经是 png/jpeg ⇒ **原样返回**（零开销，绝不动用户内容）；
-    * gif / webp / bmp / 其它 ⇒ 用 Pillow 转 PNG（**动图只取第一帧** —— QQ 的上传接口
-      根本不收 GIF，这是平台限制，不是我们偷懒）；转不了就原样返回，上层照旧会失败但日志会说明。
+    * **动图（GIF 多帧）** ⇒ 先试 **APNG**（动图版 PNG：魔数还是 `\x89PNG`，
+      平台按 png 收 ✓，客户端支持就能继续动）；APNG 太大（> `anim_max_bytes`）或失败
+      ⇒ 退回**静态 PNG（第一帧）**；
+    * 其它（webp/bmp/…） ⇒ 静态 PNG。
+
+    ⚠ 全过程都在 `asyncio.to_thread` 里跑（调用方负责），**不阻塞事件循环**；
+      失败一律**原样返回**，上层照旧会失败但在日志里说清楚。
     """
     fmt = sniff_image_format(data)
     if fmt in _QQ_OK_FORMATS:
         return data, name, ""
     if not data:
         return data, name, ""
+    base = (os.path.splitext(name or "image")[0] or "image") + ".png"
     try:
         import io
 
         from PIL import Image as _PILImage
 
         with _PILImage.open(io.BytesIO(data)) as im:
-            frames = getattr(im, "n_frames", 1)
-            if frames > 1:
-                im.seek(0)                     # 动图取第一帧
-            if im.mode in ("RGBA", "LA", "P"):
-                im = im.convert("RGBA")
-            buf = io.BytesIO()
-            im.save(buf, "PNG", optimize=True)
-            out = buf.getvalue()
-        new_name = (os.path.splitext(name or "image")[0] or "image") + ".png"
-        note = (f"{fmt or '未知'} → png"
-                + ("（动图只发第一帧：QQ 上传接口不收 GIF）" if frames > 1 else ""))
+            frames = int(getattr(im, "n_frames", 1) or 1)
+            duration = 0
+            try:
+                duration = int((im.info or {}).get("duration") or 0)
+            except Exception:
+                duration = 0
+            if frames > 1 and allow_anim:
+                try:
+                    im.seek(0)
+                    ims = []
+                    for idx in range(frames):
+                        im.seek(idx)
+                        ims.append(im.convert("RGBA").copy())
+                    buf = io.BytesIO()
+                    ims[0].save(buf, "PNG", save_all=True, append_images=ims[1:],
+                                duration=duration or 100, loop=0, optimize=True)
+                    apng = buf.getvalue()
+                    if 0 < len(apng) <= anim_max_bytes:
+                        if logger_ is not None:
+                            logger_.info(
+                                "[QQBOT-BRIDGE] 动图已转成 APNG（%s，%d 帧，%d 字节 → %d 字节）"
+                                "—— 魔数仍是 PNG，平台按图片收；客户端支持就继续动",
+                                fmt, frames, len(data), len(apng),
+                            )
+                        return apng, base, f"{fmt} → apng（{frames} 帧保动画）"
+                except Exception as exc:
+                    if logger_ is not None:
+                        logger_.debug("[QQBOT-BRIDGE] APNG 转换失败，退回静态图: %s", exc)
+            im.seek(0)
+            still = im.convert("RGBA") if im.mode in ("RGBA", "LA", "P") else im
+            buf2 = io.BytesIO()
+            still.save(buf2, "PNG", optimize=True)
+            out = buf2.getvalue()
+        note = f"{fmt or '未知'} → png" + ("（动图只发第一帧）" if frames > 1 else "")
         if logger_ is not None:
             logger_.info(
                 "[QQBOT-BRIDGE] 图片格式已规范化：%s（%s，%d 字节 → %d 字节）"
                 "—— 平台的上传接口只接受 png/jpg，GIF/WEBP 直传会被拒（850019）",
                 note, os.path.basename(name or "?"), len(data), len(out),
             )
-        return out, new_name, note
+        return out, base, note
     except Exception as exc:
         if logger_ is not None:
             logger_.warning(
@@ -215,6 +246,15 @@ def normalize_image_data(data: bytes, name: str = "", logger_: Any = None):
                 fmt or "未知", type(exc).__name__, str(exc)[:100],
             )
         return data, name, ""
+
+
+#: 平台"文件格式不支持"类错误（图片被拒时可据此改成按文件发）
+_FORMAT_ERROR_CODES = ("850019", "850031")
+
+
+def is_format_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(code in text for code in _FORMAT_ERROR_CODES)
 
 
 #: 只提示一次：模型把音频用 `<file>`（而非 `<file type="record">`）发出来
@@ -383,7 +423,7 @@ async def _retry_as_silk(api, target_id, media_element, is_group, exc, logger_):
         return None
 
 
-def install(holder: Any, client: Any, logger: Any = None) -> bool:
+def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) -> bool:
     """把 `holder._upload_file` 换成「类型更准」的版本。幂等。
 
     :param holder: 真正带 `_upload_file` 的对象
@@ -405,6 +445,8 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         from botpy.http import Route                      # noqa: F401
     except Exception:
         return False
+    #: 运行时读配置（gif_sticker_mode 等），热改配置立即生效
+    plugin = plugin
 
     async def _upload_file(target_id, media_element, is_group, _orig=current):
         want = classify(media_element)
@@ -506,12 +548,46 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
         file_path = silk_path or await media_element.to_path()
         data = await asyncio.to_thread(Path(file_path).read_bytes)
         _up_name = os.path.basename(silk_path) if silk_path else _guess_name(media_element)
+        #: 图片被平台以格式为由拒绝时，用来"按文件再发一次"的**原始字节**
+        _file_fallback = None
+        _img_mode = "auto"
         if file_type == FT_IMAGE:
-            # ★ GIF/WEBP 直传会被平台拒（850019）⇒ 先规范化成 PNG
-            data, _new_name, _note = await asyncio.to_thread(
-                normalize_image_data, data, _up_name, logger)
-            if _note:
-                _up_name = _new_name
+            _img_mode = str(getattr(plugin, "gif_sticker_mode", "auto") or "auto").lower()
+            if _img_mode not in ("auto", "image", "file"):
+                _img_mode = "auto"
+            _fmt = sniff_image_format(data)
+            if _fmt not in _QQ_OK_FORMATS:
+                # 平台的上传接口只收 png/jpg（实测 GIF 直传 = 850019）
+                if _img_mode == "file":
+                    # 用户明确要求：这类图**原样按文件发**（动图下载后还能动）
+                    file_type = FT_FILE
+                    if not os.path.splitext(_up_name or "")[1]:
+                        # base64 进来的元素常常没有文件名 ⇒ 按魔数补一个（不然 QQ 显示"未命名"）
+                        _up_name = "sticker." + (_fmt or "bin")
+                    if logger is not None:
+                        logger.info(
+                            "[QQBOT-BRIDGE] %s 不在平台图片白名单（png/jpg）里 ⇒ 按配置"
+                            "（gif_sticker_mode=file）**原样按文件发送**（保留动图）",
+                            _fmt or "该格式",
+                        )
+                else:
+                    _orig_bytes, _orig_name = data, _up_name
+                    data, _new_name, _note = await asyncio.to_thread(
+                        normalize_image_data, data, _up_name, logger,
+                        allow_anim=(_img_mode == "auto"))
+                    if _note:
+                        _up_name = _new_name
+                    if data is not _orig_bytes:
+                        _file_fallback = (_orig_bytes, _orig_name)
+                    # 规范化后仍超过图片软限制（20MB）⇒ 平台也会降级成文件，直接按文件发
+                    if len(data) > 20 * 1024 * 1024:
+                        file_type = FT_FILE
+                        data, _up_name = _orig_bytes, _orig_name
+                        _file_fallback = None
+                        if logger is not None:
+                            logger.info(
+                                "[QQBOT-BRIDGE] 该图片超过平台图片软限制（20MB）⇒ 直接按文件发送")
+        _ = _img_mode
         payload: dict = {
             "file_type": file_type,
             "file_data": base64.b64encode(data).decode("ascii"),
@@ -571,6 +647,38 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
                     api, target_id, media_element, is_group, exc, logger)
                 if retried is not None:
                     return retried
+            # ★★ 图片被平台以"格式不支持"拒（850019/850031）⇒ **按文件再发一次**（只一次）。
+            #    折中：内嵌显示做不到，至少让表情包/图片**发得出去**（用户点开可看原图，
+            #    动图也还是动的）。仅对"图片且确实转换过"的情形生效 —— **不误伤别的类型**。
+            if _file_fallback is not None and is_format_error(exc):
+                _fb_data, _fb_name = _file_fallback
+                if not os.path.splitext(_fb_name or "")[1]:
+                    _fb_name = "sticker." + (sniff_image_format(_fb_data) or "bin")
+                payload_fb: dict = {
+                    "file_type": FT_FILE,
+                    "file_data": base64.b64encode(_fb_data).decode("ascii"),
+                    "srv_send_msg": False,
+                    "file_name": _fb_name,
+                }
+                if is_group:
+                    payload_fb["group_openid"] = target_id
+                else:
+                    payload_fb["openid"] = target_id
+                try:
+                    if logger is not None:
+                        logger.warning(
+                            "[QQBOT-BRIDGE] 平台拒收该图片格式（%s）⇒ 已自动**改按文件发送**"
+                            "（原图/动图都在，点开可看）；想强制内嵌可把 gif_sticker_mode 设为 image",
+                            str(exc)[:80],
+                        )
+                    return await api._http.request(route, json=payload_fb)
+                except Exception as exc2:
+                    if logger is not None:
+                        logger.warning(
+                            "[QQBOT-BRIDGE] 按文件发送也失败：%s —— 交回核心逻辑",
+                            str(exc2)[:120],
+                        )
+                    raise
             raise
         if logger is not None and file_type not in _HEAD_LOGGED:
             _HEAD_LOGGED.add(file_type)
