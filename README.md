@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.0
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,89 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.1</b> — ★★★ 三个问题的真根因：md 图片缺 Content-Type / 语音「只信 silk」/ 私聊昵称记了没人读</summary>
+
+### 0. 结论先摆出来（每个都有证据，不是"再试一次"）
+
+| 问题 | 根因 | 修法 |
+|---|---|---|
+| **私聊还是 hex** | v1.6.0 只把昵称**记进**通讯录；而 3.0 显示昵称的**唯一路径**是核心的 `QQOfficialMessageParser.nickname()`，它只读事件自带的 `author.username`（单聊该字段**恒为空**）⇒ **记了没人读** | 包一层 parser 的 `nickname`：事件没带名字时，才去通讯录里按 openid 找（**群里认识过的同一个人**），借核心自己的实现写回它的缓存 |
+| **md 图片「加载失败」** | 分片上传的 **PUT 没带 `Content-Type`** ⇒ 平台把对象存成 `application/octet-stream` ⇒ QQ 判定"这不是图片" | 按**字节魔数**嗅探 MIME 并带在分片 PUT 上（预签名只签 host，多带这个头**不破签**）；上传后回抓一次直链写进日志 |
+| **语音成文件卡片 / m4a 整条消息消失** | ① ogg 直传被平台**降级**（官方文档写支持，实测不是）② m4a 不在语音格式白名单里，直传被拒 → 转码又不可用 ⇒ **整条消息发不出去** | 改成 **"只信 silk"**：内容不是 silk 就转；转不了时白名单内直传、白名单外**直接按文件发**（至少用户看得见） |
+
+### 1. ★★★ md 图片：分片 PUT 必须带图片 `Content-Type`
+
+官方「分片上传」四步：`upload_prepare` → **逐片 PUT 到预签名 URL** →
+`upload_part_finish` → 带 `upload_id` 合并拿 `file_info` / `raw_url`。
+
+**分片 PUT 的 `Content-Type` 决定平台把对象存成什么类型**；不带就是
+`application/octet-stream` ⇒ 手机 QQ 里那张图渲染成 **「加载失败」**（你的截图）。
+
+三条独立证据：
+
+1. 你自己的日志里，QQ 转存出来的对象头就是 `application/octet-stream`；
+   而官方文档那条**能正常渲染**的示例图是 `image/png`；
+2. 参考实现 `KasumiYuku/Aurorix`（Go）在分片 PUT 上显式带 `Content-Type`，
+   注释原文：「预签名 URL 只签了 host，多带一个 Content-Type 不会破签，
+   但它**决定平台存下来是什么类型** —— 官方直链要被 QQ 当图片渲染，就靠这个头」；
+3. 同项目在没有 MIME 时**按字节嗅探**（`images.ProbeMime`）—— 本版照做，
+   所以**文件名骗人也没用**（`.jpg` 里装 PNG ⇒ 照样发 `image/png`）。
+
+另外加了一层**观测**：上传完回抓一次 `raw_url`（GET + `Range: bytes=0-1`，
+不用 HEAD —— 预签名签了方法，HEAD 必然 403，那是探测方式自己的错），
+把 **HTTP 码 / Content-Type / 大小**写进日志。下次万一还失败，
+一眼就能看出"是链接坏了"还是"平台没当图片"。
+
+### 2. ★★★ 语音：「只信 silk」，并且**绝不发不出去**
+
+官方插件 `tencent-connect/openclaw-qqbot` 的做法是旁证：它的
+`voiceDirectUploadFormats` **默认只有 `['.wav','.mp3','.silk']`**，
+其余（ogg / m4a / amr …）**全部先转 SILK 再上传**。和你的实测一致。
+
+新的判定（`media_types.maybe_convert_to_silk` + `audio_silk.silk_magic_ok`）：
+
+| 源文件 | 行为 |
+|---|---|
+| 内容**确实是** silk | 校验/补腾讯系头 ⇒ 直发 `file_type=3` |
+| **后缀是 `.silk`、内容不是**（只是改了名） | **当普通音频转 silk** —— 旧行为是原样发 ⇒ QQ 静默降级成**文件卡片** |
+| 其它音频 + 编码器可用 | **转 silk** ⇒ `file_type=3` |
+| 其它音频 + 没编码器 + 在白名单（silk/mp3/wav/ogg） | 直传 `file_type=3` 试一次 |
+| 其它音频 + 没编码器 + **不在白名单**（m4a/amr/aac/flac…） | `file_type=4`（**至少收得到**；旧行为可能整条发不出去） |
+
+> 判据从"看扩展名"换成**看魔数**（`#!SILK_V3` / `\x02#!SILK_V3`）——
+> 这是本轮挖到的第二个真 bug：**改个名就当 silk 发**，QQ 只会给文件卡片。
+
+**顺带**：如果模型是用 `<file>`（type 缺省 = file）而不是
+`<file type="record">` 发的音频，日志里会**明确写出这一条** ——
+这轮排查卡住两轮，就是因为日志里根本看不出"到底按什么类型发的"。
+
+### 3. ★★ 私聊昵称：学到的名字终于有人读了
+
+3.0 上桥接不接管事件 ⇒ 显示昵称走的是核心那条路：
+`author.username` 取不到就 `return user_id`（那串 hex）。
+单聊事件**永远**取不到（官方 API 就没有这个字段），所以只能是 hex。
+
+修法只有一条：**在核心取不到时，把通讯录里的名字喂回去**——
+用同一个 openid（群里的 `member_openid` 与单聊的 `user_openid` 同值，
+你的日志里两个 id 完全一样）在群里学到的真名。
+
+顺带把学习面加厚：除了 `author.username`，还从
+`mentions[]`（@ 列表）和 `msg_elements[].author`（引用消息）学 ——
+都是事件里本来就有的字段，零额外请求。
+
+### 4. 新增/更新的测试（都会进 `tests/run_tests.py`）
+
+* `audit_md_img_content_type.py` ★★★ 真跑分片上传，断言**每片都带按字节嗅探的
+  `Content-Type`**（含反向验证：旧行为会被抓到）
+* `audit_v3_nickname_fallback.py` ★★★ 用**真实核心的 parser** 断言
+  "学到 ⇒ 用上 ⇒ 可还原"，并反向验证"没补丁就是 hex"
+* `audit_silk_voice.py` 按新策略重写（+ 改名 silk / m4a 两个新场景）
+* 全套件路径解析改成 `tests/_env.py`（**不再写死开发机的 workspace**：
+  那个目录会被系统清理，之前会整套 `ModuleNotFoundError` 全红）
+
+</details>
+
+<details>
 <summary><b>v1.6.0</b> — ★★ 修掉「已 silk 不走校验」的真 bug / mp3·wav·ogg 先原样发 / 3.0 私聊昵称</summary>
 
 ### 1. ★★ 语音条的真 bug：**已经是 silk 的文件绕过了腾讯系头校验**

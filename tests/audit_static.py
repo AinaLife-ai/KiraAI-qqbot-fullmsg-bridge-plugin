@@ -5,13 +5,17 @@
   4. 无功能丢失：v1.2.0 的每一项能力都能在新代码里找到对应实现；
   5. 冲突检查：同一文件是否出现重复定义 / 同名方法覆盖。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import ast
 import json
 import pathlib
 import re
 import sys
 
-ROOT = pathlib.Path("/var/minis/workspace/qqbot_bridge_review/bridge")
+ROOT = pathlib.Path(_BR())
 FAILS = []
 OKS = []
 

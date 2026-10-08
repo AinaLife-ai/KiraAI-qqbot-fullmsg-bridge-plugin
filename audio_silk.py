@@ -49,7 +49,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["convert_to_silk_forced", "is_silk_path", "reset_encoder_cache", "reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
+__all__ = ["convert_to_silk_forced", "is_silk_path", "silk_magic_ok", "reset_encoder_cache", "reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
 
 #: silk 文件以这个魔数开头（`#!SILK_V3`）
 SILK_MAGIC = b"#!SILK_V3"
@@ -138,22 +138,41 @@ def _ffmpeg_exe() -> Optional[str]:
 
 
 def is_silk_path(path: str) -> bool:
-    """这个路径是不是 silk（按扩展名或魔数）。给 media_types 用。"""
+    """这个路径**看起来**是不是 silk（按扩展名或魔数）。给 media_types 用。
+
+    ⚠ 注意：扩展名是 `.silk` 就返回 True —— **不代表内容真的是 silk**。
+      只看扩展名会被"改个名就当 silk 发"的模型骗过（2026-10-08 线上踩到：
+      用户那条 `jbf_v2.silk` 浏览器里下下来是文件卡片）。
+      要"内容确实是 silk"的判据请用 :func:`silk_magic_ok`。
+    """
     try:
         return bool(path) and _is_silk_file(path)
     except Exception:
         return False
 
 
+def silk_magic_ok(path: str) -> bool:
+    """**内容确实是 silk**（按魔数，不看扩展名）。
+
+    腾讯系 = ``\\x02`` + ``#!SILK_V3``；标准系 = ``#!SILK_V3``。两者都算 silk。
+
+    为什么单独开一个函数：`is_silk_path` 只看扩展名，
+    而"模型把 ogg 改名成 .silk"这种事太常见了 —— 那种文件我们必须
+    **当普通音频去转码**，而不是原样发给 QQ（QQ 会降级成文件卡片）。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except Exception:
+        return False
+    return head[:1] == b"\x02" and head[1:10] == SILK_MAGIC or head[:9] == SILK_MAGIC
+
+
 def _is_silk_file(path: str) -> bool:
     """按扩展名或魔数判断是不是 silk。"""
     if path.lower().endswith(_SILK_EXT):
         return True
-    try:
-        with open(path, "rb") as f:
-            return f.read(len(SILK_MAGIC)) == SILK_MAGIC
-    except Exception:
-        return False
+    return silk_magic_ok(path)
 
 
 def _silk_encoder() -> Optional[str]:
@@ -308,7 +327,7 @@ async def convert_to_silk_forced(path: str, logger_: Any = None) -> Optional[str
     """
     if not path or not os.path.isfile(path):
         return None
-    if is_silk_path(path):
+    if silk_magic_ok(path):
         return path if _fix_tencent_header(path, logger_) else None
     if not silk_available():
         return None
@@ -417,8 +436,8 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
     """
     if not path or not os.path.isfile(path):
         return None
-    if path.lower().endswith(_SILK_EXT) or _is_silk_file(path):
-        # ★★★ 已经是 silk，但**仍然要过一遍腾讯系头校验**（2026-10-08 修的真 bug）。
+    if silk_magic_ok(path):
+        # ★★★ 内容确实是 silk，但**仍然要过一遍腾讯系头校验**（2026-10-08 修的真 bug）。
         #
         #   原来这里直接 `return path`，等于**跳过了 _fix_tencent_header**
         #   ⇒ 如果这个 silk 是**标准系**（例如 `silk-wasm` 的 `encode(pcm, rate)`
@@ -433,6 +452,15 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
                 )
             return None
         return path
+    # ★ 扩展名写着 .silk、内容却不是 silk（2026-10-08 线上第三种形态）：
+    #   **多半只是把 ogg/mp3 改了个名**。这种情况绝不能原样发 ——
+    #   QQ 会（不报错地）把它降级成**文件卡片**。下面按普通音频重新编码。
+    if path.lower().endswith(_SILK_EXT) and logger_ is not None:
+        logger_.warning(
+            "[QQBOT-BRIDGE] %s 扩展名是 silk，但内容不是 silk（前几字节不是 "
+            "#!SILK_V3）—— 多半只是改了个名；将按普通音频重新编码成语音条",
+            os.path.basename(path),
+        )
     try:
         if os.path.getsize(path) > _MAX_SOURCE_BYTES:
             if logger_ is not None:

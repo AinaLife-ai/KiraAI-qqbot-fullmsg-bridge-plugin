@@ -30,6 +30,7 @@ from typing import Any
 _PUBLISH_MARK = "_kira_bridge_publish"
 _QUOTE_MARK = "_kira_bridge_selfquote"
 _HANDLE_MARK = "_kira_bridge_handle"
+_NICK_MARK = "_kira_bridge_nickname"
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -52,7 +53,12 @@ class V3Enhancer:
         im = profile.im_capability
         if im is None:
             return False
-        self._adapter_name = name
+        # ★ 通讯录的 key 必须与 **2.x 那条路径**（`str(adapter.info.name)`）完全一致，
+        #   否则"群里学到的名字"和"私聊要读的名字"会落在两个 bucket 里，
+        #   跨场景共享就静默失效了。
+        self._adapter_name = str(
+            getattr(getattr(adapter, "info", None), "name", "") or name
+        )
         state = self._patched.get(name)
         if state is not None and state.get("adapter") is adapter:
             return False
@@ -132,13 +138,67 @@ class V3Enhancer:
         else:
             handle = original_handle
 
+        # ---- ④ parser.nickname：**私聊显示真昵称**（用户反馈「私聊还是 hex」）----
+        #
+        #   ★ 为什么光"学"不够（v1.6.0 的缺口，用户实测没生效）：
+        #     ③ 只是把群里的 `author.username` **记进** `IdentityStore`；
+        #     而 **3.0 显示昵称的唯一路径**是核心的
+        #     `QQOfficialMessageParser.nickname()` —— 它只读事件自带的
+        #     `author.username`，读不到就 `return user_id`（那串 hex）。
+        #     ⇒ 我们写进通讯录的名字，**根本没人读** ⇒ 私聊一直是 hex。
+        #
+        #   ★ 做法：包一层 parser 实例的 `nickname`。规则只有一条 ——
+        #     **事件没带名字时，才去通讯录里按 openid 找**（群里认识过的人）。
+        #     找到就借核心自己的实现把名字写回它的缓存（`_names`），
+        #     这样 `content_elements()` 里渲染 @ 时也能拿到同一个名字。
+        #
+        #   不接管、不造事件、不改任何其它字段 —— 纯"补一个来源"。
+        parser = getattr(im, "_parser", None)
+        original_nick = getattr(parser, "nickname", None) if parser is not None else None
+        nickname_holder = None
+        if (parser is not None and callable(original_nick)
+                and not getattr(original_nick, _NICK_MARK, False)):
+            def nickname(is_group, target_id, author, user_id, _orig=original_nick):
+                try:
+                    raw = _field(author, "username")
+                    if not (isinstance(raw, str) and raw.strip()):
+                        store = getattr(enhancer.plugin, "identities", None)
+                        if store is not None:
+                            learned = store.lookup(enhancer._adapter_name, str(user_id or ""))
+                            if learned and str(learned).strip() != str(user_id):
+                                # ⚠ 用**独立**的日志标记：`nick` 已被"学习"那条占用，
+                                #   共用会导致这条（用户真正关心的）永远打不出来。
+                                if not enhancer._logged.get("nick_display"):
+                                    enhancer._logged["nick_display"] = True
+                                    enhancer.logger.info(
+                                        "[QQBOT-BRIDGE] 私聊昵称已恢复真名（%s）："
+                                        "QQ 单聊事件的 author.username 恒为空，"
+                                        "改用通讯录里同一 openid 在群里学到过的昵称",
+                                        learned,
+                                    )
+                                # 借核心实现写回它自己的缓存（@ 渲染也走这个缓存）
+                                return _orig(is_group, target_id,
+                                             {"username": learned}, user_id)
+                except Exception:
+                    pass                          # 补昵称失败绝不影响消息处理
+                return _orig(is_group, target_id, author, user_id)
+
+            setattr(nickname, _NICK_MARK, True)
+            try:
+                parser.nickname = nickname
+                nickname_holder = nickname
+            except Exception:
+                nickname_holder = None
+
         self._patched[name] = {
             "adapter": adapter, "im": im,
             "publish": publish, "quote": is_self_quote,
-            "handle": handle,
+            "handle": handle, "nick": nickname_holder,
+            "parser": parser,
             "has_publish": publish is not original_publish,
             "has_quote": is_self_quote is not original_quote,
             "has_handle": handle is not original_handle,
+            "has_nick": nickname_holder is not None,
         }
         return True
 
@@ -164,6 +224,12 @@ class V3Enhancer:
         if state.get("has_handle") and im is not None:
             try:
                 del im._handle_message          # 恢复成类上的原方法
+                count += 1
+            except Exception:
+                pass
+        if state.get("has_nick") and state.get("parser") is not None:
+            try:
+                del state["parser"].nickname    # 恢复成类上的原方法
                 count += 1
             except Exception:
                 pass
@@ -213,39 +279,73 @@ class V3Enhancer:
         `author.username` 取，取不到就回退成 `user_id`（那串 hex）。
 
         我们的 `IdentityStore` 就是为这件事写的（群里认识过的人，私聊也认得），
-        但它的学习入口挂在 **2.x 的事件处理**里 ——
+        它的学习入口挂在 **2.x 的事件处理**里 ——
         3.0 上我们**不接管事件**，所以一直学不到。
 
-        ⇒ 这里在 `_handle_message`（群/私聊的统一入口）里**旁听**一次：
-        拿到 `author.username` 就记下来。**不接管、不造事件、不改行为。**
+        ⇒ 这里在 `_handle_message`（群/私聊的统一入口）里**旁听**一次。
+
+        ## 三个免费来源（都是事件里本来就有的字段，零额外请求）
+
+        1. `author.username` —— 群消息里一定有（3.0 的核心 parser 也用这个）；
+        2. `mentions[]` —— @ 消息里的用户列表，每个都带 `username`
+           （⚠ 文档写"不含 @ 机器人自身"，实测**会带**，要跳过 `is_you`）；
+        3. `msg_elements[].author` —— `message_type=103`（引用）时是完整 User 对象。
+
+        **不接管、不造事件、不改行为**：一个字段没有就跳过，绝不影响消息处理。
         """
         store = getattr(self.plugin, "identities", None)
         if store is None:
             return
+        adapter_name = self._adapter_name
+        scope = ""
+        if is_group:
+            scope = str(_field(message, "group_openid", "") or "")
+
+        def _remember(uid: Any, name: Any) -> bool:
+            if not uid or not isinstance(name, str) or not name.strip():
+                return False
+            name = name.strip()
+            if name == str(uid):        # 占位（名字恰好等于 openid）不算学到
+                return False
+            return bool(store.remember(adapter_name, scope, str(uid), name))
+
+        learned = 0
         try:
-            author = message.get("author") if isinstance(message, dict) else None
-            if author is None:
-                return
-            name = author.get("username") if isinstance(author, dict) else None
-            uid = None
-            if isinstance(author, dict):
-                uid = author.get("member_openid") or author.get("user_openid") or author.get("id")
-            if not (isinstance(name, str) and name.strip() and uid):
-                return                       # 私聊本来就没 username ⇒ 安静跳过
-            # 群消息带 group_openid；私聊没有 —— 但 uid 是同一个，跨场景共享
-            scope = ""
-            if is_group and isinstance(message, dict):
-                scope = str(message.get("group_openid") or "")
-            adapter_name = self._adapter_name
-            got = store.remember(adapter_name, scope, str(uid), name.strip())
-            if got and not self._logged.get("nick"):
-                self._logged["nick"] = True
-                self.logger.info(
-                    "[QQBOT-BRIDGE] 已补上跨场景昵称共享：群里的真昵称会带给私聊"
-                    "（KiraAI 3.0 原实现只认 author.username，而私聊该字段恒为空 ⇒ 显示 hex）"
-                )
+            author = _field(message, "author")
+            if author is not None:
+                uid = (_field(author, "member_openid") or _field(author, "user_openid")
+                       or _field(author, "id"))
+                learned += 1 if _remember(uid, _field(author, "username")) else 0
+
+            # ② mentions（@ 列表）—— 群里最常见的动作，通讯录主要的增量来源
+            mentions = _field(message, "mentions", [])
+            if isinstance(mentions, list):
+                for item in mentions:
+                    if _field(item, "is_you") is True:
+                        continue
+                    uid = (_field(item, "member_openid") or _field(item, "user_openid")
+                           or _field(item, "id"))
+                    learned += 1 if _remember(uid, _field(item, "username")) else 0
+
+            # ③ 引用消息里的作者（message_type=103）
+            elements = _field(message, "msg_elements", [])
+            if isinstance(elements, list):
+                for elem in elements:
+                    quoted = _field(elem, "author")
+                    if quoted is None:
+                        continue
+                    uid = (_field(quoted, "member_openid")
+                           or _field(quoted, "user_openid") or _field(quoted, "id"))
+                    learned += 1 if _remember(uid, _field(quoted, "username")) else 0
         except Exception:
             pass                             # 学昵称失败绝不影响消息处理
+
+        if learned and not self._logged.get("nick"):
+            self._logged["nick"] = True
+            self.logger.info(
+                "[QQBOT-BRIDGE] 已补上跨场景昵称共享：群里的真昵称会带给私聊"
+                "（KiraAI 3.0 原实现只认 author.username，而私聊该字段恒为空 ⇒ 显示 hex）"
+            )
 
     def _quoted_is_self(self, message: Any, is_group: bool, target_id: str) -> bool:
         """读**原始 payload** 判断"被引用的是不是机器人自己"。

@@ -1,7 +1,11 @@
 """验证多图是并行处理（不是串行）。"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio, os, sys, time
-ROOT="/var/minis/workspace/qqbot_bridge_review"
-sys.path.insert(0, ROOT+"/kira-v3"); sys.path.insert(0, ROOT+"/bridge")
+ROOT=_BR()
+sys.path.insert(0, ROOT+"/kira-v3"); sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.makedirs(ROOT+"/data",exist_ok=True); open(ROOT+"/data/log.log","a").close()
 import md_media as M

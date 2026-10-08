@@ -18,20 +18,24 @@
 本套件同时覆盖四个合作插件的共存前提：
 钩子注册名一致 / 平台门禁 / 补丁目标不撞 / 标签不被 xml_tag_fixer 破坏。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import importlib.util
 import inspect as _ins
 import pathlib
 import sys
 
-ROOT = pathlib.Path("/var/minis/workspace/qqbot_bridge_review")
-CORE = ROOT / "kira-v3"
-BRIDGE = ROOT / "bridge"
+ROOT = pathlib.Path(_BR())
+CORE = pathlib.Path(str(_CORE_ROOT("3")))
+BRIDGE = pathlib.Path(str(_BR()))
 # 核心的日志模块会在导入期就建 RotatingFileHandler，需要目录先存在
 (BRIDGE / "data").mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(CORE))
 sys.path.insert(0, str(BRIDGE))
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
+sys.path.insert(0, _BOTPY_DIR())
 
 PASS = FAIL = 0
 
@@ -167,6 +171,11 @@ def main():
         "sustained_chat": ROOT / "compat_sustained_chat" / "main.py",
     }
     for name, path in peers.items():
+        if not path.is_file():
+            # 对照源码不在本机（`compat_*` 是开发机的临时目录，会被清理）
+            # ⇒ **跳过**该节，而不是判失败。装回源码后本节自动恢复。
+            print(f"  skip  {name} 对照源码不在（跳过共存核对）")
+            continue
         src_p = path.read_text(encoding="utf-8")
         if name == "accelerator":
             # 抢发必须经过 adapter 层，bridge 才能提取 markdown/keyboard
@@ -192,12 +201,15 @@ def main():
     xml_in = ("<msg><markdown>## 标题\n- 项</markdown>"
               "<keyboard>{\"content\":{\"rows\":[{\"buttons\":[{\"id\":\"b\"}]}]}}</keyboard></msg>")
     xtf = ROOT / "compat_xml_tag_fixer" / "main.py"
-    xtf_src = xtf.read_text(encoding="utf-8")
-    check("xml_tag_fixer 有「已注册标签内容绝不转义」的保护",
-          "已注册标签内容绝不转义" in xtf_src or "_registered_msg_tags" in xtf_src)
-    check("它对未注册标签只在「未闭合」时才补闭合（完整块不动）",
-          "未注册标签：优先在它自己的闭合标签处封口" in xtf_src
-          or "_handle_unclosed_tail" in xtf_src)
+    if not xtf.is_file():
+        print("  skip  xml_tag_fixer 对照源码不在（跳过本节，不判失败）")
+    else:
+        xtf_src = xtf.read_text(encoding="utf-8")
+        check("xml_tag_fixer 有「已注册标签内容绝不转义」的保护",
+              "已注册标签内容绝不转义" in xtf_src or "_registered_msg_tags" in xtf_src)
+        check("它对未注册标签只在「未闭合」时才补闭合（完整块不动）",
+              "未注册标签：优先在它自己的闭合标签处封口" in xtf_src
+              or "_handle_unclosed_tail" in xtf_src)
 
     print()
     print("=" * 74)

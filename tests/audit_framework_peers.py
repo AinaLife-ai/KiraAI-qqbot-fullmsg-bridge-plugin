@@ -18,13 +18,18 @@
 
 **昵称** —— 与 S/Z 无关（它们完全不做昵称/通讯录；grep 无 `IdentityStore`/`username` 写入）
 """
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR, ref_dir as _REF, peers_dir as _PEERS2, peer_plugin as _PEER
+
 import pathlib
 import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-CORE = pathlib.Path("/var/minis/workspace/qqbot_bridge_review/kira-core")
-PEERS = pathlib.Path("/tmp/peers2")
+CORE = pathlib.Path(_CORE_ROOT("2"))
+PEERS = _PEERS2()
 
 PASS = FAIL = 0
 

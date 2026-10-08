@@ -181,6 +181,83 @@ def _guess_mime(path: str) -> str:
     return _MIME_BY_EXT.get(os.path.splitext(path)[1].lower(), "image/jpeg")
 
 
+def sniff_image_mime(data: bytes, name: str = "") -> str:
+    """从**字节魔数**判断图片 MIME（扩展名只作兜底）。
+
+    ## ★★★ 为什么必须按字节嗅探（2026-10-08 定案）
+
+    分片上传时，**每个分片 PUT 的 `Content-Type` 决定平台把文件存成什么类型**。
+    不带头的话 COS / 平台会把对象存成 `application/octet-stream`，
+    于是 QQ 的 markdown 图片链路判定"这不是图片" ⇒ 前端显示 **加载失败**。
+
+    ⇒ 我们按**真实字节**给出 `image/png` / `image/jpeg` / … ，
+    扩展名只在认不出魔数时兜底（比如 IMG 里塞了别的格式）。
+    """
+    head = data[:16] if data else b""
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:2] == b"BM":
+        return "image/bmp"
+    return _guess_mime(name or "image.jpg")
+
+
+def _verify_public_url(url: str, logger: Any = None, timeout: float = 8.0) -> None:
+    """回抓一次刚上传的直链，把 **HTTP 状态 / Content-Type / 大小** 记进日志。
+
+    ## 为什么要多这一趟（2026-10-08 教训）
+
+    用户反馈"图片还是加载失败"时，日志里**只有"已转存为公网地址"这一句正面信息** ——
+    完全看不出那条 `raw_url` 到底是好的、403 了、还是被存成了 `octet-stream`。
+    排查只能靠猜（这已经浪费过两轮）。
+
+    这一步只做**观测**，不改任何行为：
+      * 200/206 + `image/*` ⇒ 打印一次确认；
+      * 其余（403 / octet-stream / 超时）⇒ **WARNING**，把原因写清楚。
+
+    ⚠ 用 **GET + `Range: bytes=0-1`** 而不是 HEAD：
+      预签名 URL 的签名**包含 HTTP 方法**（预签名的是 GET），
+      HEAD 必然 403 —— 那是"我们自己的探测方式"出错，不是链接坏了，
+      反而会把排查方向带偏。
+    """
+    if not url:
+        return
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Range", "bytes=0-1")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            status = getattr(resp, "status", 200)
+            ctype = (resp.headers.get("Content-Type") or "").strip()
+            length = resp.headers.get("Content-Range") or resp.headers.get("Content-Length")
+        if logger is not None:
+            if status in (200, 206) and ctype.lower().startswith("image/"):
+                logger.info(
+                    "[QQBOT-BRIDGE] 直链自检通过：HTTP %s Content-Type=%s（%s）",
+                    status, ctype, length or "?",
+                )
+            else:
+                logger.warning(
+                    "[QQBOT-BRIDGE] 直链自检异常：HTTP %s Content-Type=%s（%s）—— "
+                    "QQ 侧多半会渲染成「加载失败」；若是 octet-stream，"
+                    "说明分片上传没带图片 Content-Type",
+                    status, ctype or "无", length or "?",
+                )
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "[QQBOT-BRIDGE] 直链自检失败（%s: %s）—— 仅作观测，不影响本条发送；"
+                "若 QQ 里显示「加载失败」请把这条一起反馈",
+                type(exc).__name__, str(exc)[:120],
+            )
+
+
 # --------------------------------------------------------------------------- #
 # 结果缓存 —— 避免「每次发 markdown 都重新验真 / 重新上传」
 # --------------------------------------------------------------------------- #
@@ -323,6 +400,13 @@ async def _upload_bytes_to_qq(
     sha1 = hashlib.sha1(data).hexdigest()
     md5_10m = hashlib.md5(data[:10002432]).hexdigest()
 
+    # ★★★ 分片 PUT 必须带**图片 Content-Type**（2026-10-08 定案，见 sniff_image_mime）。
+    #   不带 ⇒ 平台存成 octet-stream ⇒ QQ 认为"不是图片" ⇒ md 里显示「加载失败」。
+    #   实测对照：官方文档那条能正常渲染的示例图是 `image/png`，
+    #   而 QQ 自己转存出来的对象是 `application/octet-stream`（用户日志实证）。
+    mime = sniff_image_mime(data, name)
+    part_headers = {"Content-Type": mime}
+
     try:
         if is_group:
             prep_route = Route("POST", "/v2/groups/{group_id}/upload_prepare",
@@ -386,7 +470,9 @@ async def _upload_bytes_to_qq(
                 if not chunk:
                     break
                 offset += len(chunk)
-                async with sess.put(purl, data=chunk) as r:
+                # ★ 带上 Content-Type：预签名 URL 只签了 host，
+                #   多带一个头不会破签，但它**决定平台存下来是什么类型**。
+                async with sess.put(purl, data=chunk, headers=part_headers) as r:
                     if r.status >= 300:
                         if logger is not None:
                             logger.warning(
@@ -421,7 +507,12 @@ async def _upload_bytes_to_qq(
         raw = _get(merged, "raw_url")
         if raw:
             if logger is not None:
-                logger.info("[QQBOT-BRIDGE] 图片已转存为公网地址，markdown 可直接引用")
+                logger.info(
+                    "[QQBOT-BRIDGE] 图片已转存为公网地址（Content-Type=%s），markdown 可直接引用",
+                    mime,
+                )
+            # 观测（不阻塞事件循环）：回抓一次，把状态/类型写进日志
+            await asyncio.to_thread(_verify_public_url, str(raw), logger)
             return str(raw)
         if logger is not None:
             logger.debug("[QQBOT-BRIDGE] 合并响应没有 raw_url: %s", merged)

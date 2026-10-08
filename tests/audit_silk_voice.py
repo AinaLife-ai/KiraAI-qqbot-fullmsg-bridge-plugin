@@ -1,28 +1,49 @@
-"""★ 语音条 vs 音频文件：**两条路都要能走**（2026-10-08）。
+"""★ 语音条 vs 音频文件：**两条路都要能走**（2026-10-08 二次修订）。
 
-官方限制：`file_type=3` 语音 **只认 silk**（mp3 直接上传会降级成文件）。
-所以「发语音条」必须先把音频转 silk；而「发音频文件」应保持原样。
+官方限制：`file_type=3` 语音 **只认 silk**。
+
+## v1.6.1 的策略修订（用户实测后）
+
+旧策略是"mp3/wav/ogg **先原样按 file_type=3 发**（官方文档说支持）"。
+用户实测（2026-10-08 截图）**ogg 变成了文件卡片** —— 官方文档与平台实际不一致。
+腾讯官方插件 `openclaw-qqbot` 的做法可作旁证：它的
+`voiceDirectUploadFormats` **默认只有 `['.wav','.mp3','.silk']`**，
+其余格式（ogg/m4a/…）**全部先转 SILK 再上传**。
+
+⇒ 现在的策略（只信 silk）：
+
+| 源文件 | 行为 |
+|--------|------|
+| 内容确实是 silk | 校验/补腾讯系头 ⇒ 直发 `file_type=3` |
+| **扩展名是 silk、内容不是**（只是改名） | **当普通音频转 silk**（旧行为：原样发 ⇒ 文件卡片） |
+| 其它音频 + 编码器可用 | **转 silk** ⇒ `file_type=3` |
+| 其它音频 + **没有编码器**，但在文档白名单里 | 直传 `file_type=3` 试一次 |
+| 其它音频 + 没有编码器 + 不在白名单（m4a/amr/…） | `file_type=4`（**至少看得见**；旧行为可能整条发不出去） |
 
 本测试断言：
 
-1. `Record` + 非 silk 音频 ⇒ **会自动转 silk**，且 `file_type=3`；
-2. `Record` + 已是 silk    ⇒ 不转码、路径不变、`file_type=3`；
-3. **转码不可用时 ⇒ 退回 `file_type=4` 按文件发**（绝不丢消息）；
-4. `File` 元素（模型写 `type="file"`）⇒ **一律不碰**，`file_type=4`
-   ⇒ 「想发文件」这条路不被影响；
-5. `Video` ⇒ `file_type=2`（不受本改动影响）。
+1. `Record` + mp3 ⇒ **会转 silk**，且 `file_type=3`；
+2. `Record` + 已是 silk ⇒ 不转码、路径不变、`file_type=3`；
+3. `Record` + **改名 silk**（.silk 后缀但不是 silk 内容）⇒ **必须转码**；
+4. `Record` + m4a + 无编码器 ⇒ **`file_type=4`**（不丢消息，这是线上"啥都看不到"的修复）；
+5. `File` 元素（模型写 `type="file"`）⇒ **一律不碰**，`file_type=4`；
+6. `Video` ⇒ `file_type=2`。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import os
 import subprocess
 import sys
 import types
 
-ROOT = "/var/minis/workspace/qqbot_bridge_review"
+ROOT = _BR()
 GEN = os.environ.get("KIRA_CORE_GEN", "3")
-sys.path.insert(0, f"{ROOT}/kira-v3" if GEN == "3" else f"{ROOT}/kira-core")
-sys.path.insert(0, f"{ROOT}/bridge")
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
+sys.path.insert(0, str(_CORE_ROOT("3")) if GEN == "3" else str(_CORE_ROOT("2")))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, _BOTPY_DIR())
 
 os.makedirs(f"{ROOT}/data", exist_ok=True)
 open(f"{ROOT}/data/log.log", "a").close()
@@ -142,14 +163,15 @@ async def main():
         await ad.send_group_message("G1", MessageChain([Text("t"), ele]))
         return [u for u in UP if isinstance(u, dict) and "file_type" in u]
 
-    print("\n[1] Record + mp3 ⇒ **先原样按 file_type=3 发**（官方说支持 mp3）")
+    print("\n[1] Record + mp3 ⇒ **转 silk 后按 file_type=3 发**（不再原样发 mp3）")
     up = await send(Record(MP3, name="voice.mp3", mime="audio/mpeg"))
     ft = [u.get("file_type") for u in up]
     check("★ file_type=3（语音，不是 4=文件）", ft == [3], f"file_type={ft}")
-    check("★ 原样发 mp3（**不转码**，零依赖最快）",
-          bool(up) and str(up[0].get("file_name", "")).endswith(".mp3"),
+    check("★★ 已经转成 silk 再上传（文件名 .silk）",
+          bool(up) and str(up[0].get("file_name", "")).endswith(".silk"),
           str(up[0].get("file_name")) if up else "")
-    check("★ 这一步没有触发转码", len(SILK_CALLS) == 0, str(SILK_CALLS))
+    check("★ 确实调用了 silk 编码器（腾讯系）",
+          len(SILK_CALLS) == 1 and SILK_CALLS[0]["tencent"] is True, str(SILK_CALLS))
 
     print("\n[1b] ★ mp3 原样发被平台拒 ⇒ **自动转 silk 重试**")
     import media_types as _mt
@@ -189,7 +211,7 @@ async def main():
     ft = [u.get("file_type") for u in up]
     check("★ file_type=2", ft == [2], f"file_type={ft}")
 
-    print("\n[5] ★ 缺依赖时：mp3 仍然**原样按语音发**（先走官方支持的格式）")
+    print("\n[5] ★ 缺依赖时：白名单内的 mp3 仍然**原样按语音发**")
     import audio_silk as _asilk
     _asilk.silk_available = lambda: False        # 模拟"没装 pilk/ffmpeg"
     _asilk.reset_encoder_cache()
@@ -200,11 +222,35 @@ async def main():
         check("★★ 缺依赖 ⇒ 仍按 file_type=3 原样发（官方说 mp3 支持）",
               ft == [3], f"file_type={ft}")
         check("★ 仍然发出去了（没丢消息）", len(up) == 1, f"up={len(up)}")
+
+        print("\n[6] ★★ 缺依赖 + **m4a**（不在白名单）⇒ 按 file_type=4 发，绝不发不出去")
+        M4A = f"{D}/voice.m4a"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=1", "-c:a", "aac", M4A, "-y"],
+                       capture_output=True)
+        up = await send(Record(M4A, name="voice.m4a", mime="audio/mp4"))
+        ft = [u.get("file_type") for u in up]
+        check("★★ m4a 直接降级成 file_type=4（用户线上「啥都看不到」的修复）",
+              ft == [4], f"file_type={ft}")
+        check("★★ 消息确实发出去了（不再静默丢失）", len(up) == 1, f"up={len(up)}")
     finally:
         import importlib
         importlib.reload(_asilk)
         import media_types as _m2
         importlib.reload(_m2)
+
+    print("\n[7] ★★ 改名 silk（.silk 后缀、内容是 ogg/mp3）⇒ **必须转码**")
+    FAKE = f"{D}/fake.silk"
+    with open(MP3, "rb") as f:
+        open(FAKE, "wb").write(f.read())        # 只是把 mp3 改名叫 .silk
+    up = await send(Record(FAKE, name="fake.silk", mime="audio/silk"))
+    ft = [u.get("file_type") for u in up]
+    check("★ file_type=3（当语音条发）", ft == [3], f"file_type={ft}")
+    check("★★ 内容不是 silk ⇒ 走了转码（否则 QQ 会降级成文件卡片）",
+          len(SILK_CALLS) == 1, str(SILK_CALLS))
+    check("★ 上传的是转码产物（不是那个假 silk）",
+          bool(up) and str(up[0].get("file_name", "")).endswith(".silk"),
+          str(up[0].get("file_name")) if up else "")
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

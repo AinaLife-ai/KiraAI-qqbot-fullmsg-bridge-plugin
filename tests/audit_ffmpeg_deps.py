@@ -1,9 +1,13 @@
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
 import os
 """验证依赖可分离：有系统 ffmpeg + pilk 就够（不需要 imageio-ffmpeg）。"""
 import asyncio, os, sys, types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0,'/tmp/botpy_src/botpy-master')
-sys.path.insert(0,'/tmp/botpy_src/botpy-master')
+sys.path.insert(0,_BOTPY_DIR())
+sys.path.insert(0,_BOTPY_DIR())
 P=F=0
 def ck(n,c,e=""):
     global P,F
@@ -41,9 +45,9 @@ ck("★★ 没装 imageio-ffmpeg 也能转出 silk", bool(out) and os.path.exist
 
 print("\n═══ 完全没 ffmpeg ⇒ 优雅返回 None（子进程隔离）═══")
 import subprocess as _sp
-_prog = """
+_prog = f"""
 import sys, types
-sys.path.insert(0, '/var/minis/workspace/qqbot_bridge_review/bridge')
+sys.path.insert(0, {_BR()!r})
 f = types.ModuleType('pilk'); f.encode = lambda *a, **k: 1.0
 sys.modules['pilk'] = f
 sys.modules['imageio_ffmpeg'] = None          # 让 import 直接失败
@@ -56,9 +60,9 @@ _r = _sp.run([sys.executable, "-c", _prog], capture_output=True, text=True, time
 ok_no_ff = "AVAIL False" in (_r.stdout or "")
 ck("★★ 没 ffmpeg 时 silk_available()=False", ok_no_ff, (_r.stdout or _r.stderr or "")[-160:])
 
-_prog2 = """
+_prog2 = f"""
 import asyncio, sys, types, os
-sys.path.insert(0, '/var/minis/workspace/qqbot_bridge_review/bridge')
+sys.path.insert(0, {_BR()!r})
 f = types.ModuleType('pilk'); f.encode = lambda *a, **k: 1.0
 sys.modules['pilk'] = f
 sys.modules['imageio_ffmpeg'] = None

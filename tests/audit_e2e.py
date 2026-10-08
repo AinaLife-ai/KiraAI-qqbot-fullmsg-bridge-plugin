@@ -3,14 +3,18 @@
 与 smoke_v3 的区别：smoke_v3 验"点"（每个断言打一个点），
 本脚本验"链"（一条消息从平台进来到发出去，中间每一步都检查）。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import sys
 
-ROOT = "/var/minis/workspace/qqbot_bridge_review"
-sys.path.insert(0, f"{ROOT}/kira-v3")
-sys.path.insert(0, f"{ROOT}/bridge")
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
-sys.path.insert(0, f"{ROOT}/bridge/tests")
+ROOT = _BR()
+sys.path.insert(0, str(_CORE_ROOT("3")))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, _BOTPY_DIR())
+sys.path.insert(0, f"{ROOT}/tests")
 
 import smoke_v3 as T  # noqa: E402
 

@@ -10,6 +10,10 @@
   7. markdown / keyboard 经发送入口 → 报文正确；
   8. 全员还原可逆。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import json
 import os
@@ -17,11 +21,11 @@ import sys
 import time
 import datetime
 
-ROOT = "/var/minis/workspace/qqbot_bridge_review"
-sys.path.insert(0, f"{ROOT}/kira-v3")
-sys.path.insert(0, f"{ROOT}/bridge")
-if "/tmp/botpy_src/botpy-master" not in sys.path:
-    sys.path.insert(0, "/tmp/botpy_src/botpy-master")
+ROOT = _BR()
+sys.path.insert(0, str(_CORE_ROOT("3")))
+sys.path.insert(0, ROOT)
+if _BOTPY_DIR() not in sys.path:
+    sys.path.insert(0, _BOTPY_DIR())
 
 PASS = FAIL = 0
 

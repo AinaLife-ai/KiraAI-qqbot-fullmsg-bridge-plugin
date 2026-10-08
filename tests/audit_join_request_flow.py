@@ -8,6 +8,11 @@
   ② 模型看到有人申请 → 调 `manage_qq_group_join_request(action="list")`
   ③ 模型拿到 member_id → 调 `action="approve"/"decline"`
 """
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import os
 import pathlib
@@ -15,10 +20,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORE = pathlib.Path(os.environ.get(
-    "KIRA_CORE", "/var/minis/workspace/qqbot_bridge_review/kira-core"))
+    "KIRA_CORE", _CORE_ROOT("2")))
 sys.path.insert(0, str(CORE))
 sys.path.insert(0, str(ROOT))
-_BOTPY = os.environ.get("BOTPY_PATH", "/tmp/botpy_src/botpy-master")
+_BOTPY = os.environ.get("BOTPY_PATH", _BOTPY_DIR())
 if os.path.isdir(_BOTPY):
     sys.path.insert(0, _BOTPY)
 

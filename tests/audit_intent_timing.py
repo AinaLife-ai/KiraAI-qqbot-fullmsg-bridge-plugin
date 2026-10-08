@@ -14,19 +14,23 @@
 
 这就是用户「开关都开了却收不到成员事件」的完整复现 + 修复验证。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import importlib.util
 import pathlib
 import sys
 import types
 
-ROOT = pathlib.Path("/var/minis/workspace/qqbot_bridge_review")
-CORE = ROOT / "kira-core"
-BRIDGE = ROOT / "bridge"
+ROOT = pathlib.Path(_BR())
+CORE = pathlib.Path(str(_CORE_ROOT("2")))
+BRIDGE = pathlib.Path(str(_BR()))
 (BRIDGE / "data").mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(CORE))
 sys.path.insert(0, str(BRIDGE))
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
+sys.path.insert(0, _BOTPY_DIR())
 
 PASS = FAIL = 0
 

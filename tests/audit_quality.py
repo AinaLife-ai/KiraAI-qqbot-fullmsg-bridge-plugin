@@ -2,6 +2,10 @@
 
 这些是用户明确点名的验收项，逐条给硬数字。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import gc
 import os
@@ -9,11 +13,11 @@ import sys
 import time
 import tracemalloc
 
-ROOT = "/var/minis/workspace/qqbot_bridge_review"
-sys.path.insert(0, f"{ROOT}/kira-v3")
-sys.path.insert(0, f"{ROOT}/bridge")
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
-sys.path.insert(0, f"{ROOT}/bridge/tests")
+ROOT = _BR()
+sys.path.insert(0, str(_CORE_ROOT("3")))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, _BOTPY_DIR())
+sys.path.insert(0, f"{ROOT}/tests")
 
 import smoke_v3 as T  # noqa: E402
 
@@ -126,7 +130,7 @@ async def main():
     import ast
     import pathlib
 
-    src = pathlib.Path(f"{ROOT}/bridge/main.py").read_text(encoding="utf-8")
+    src = pathlib.Path(f"{ROOT}/main.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
 
     # 找出"消息路径"上会被调用的同步函数，确认里面没有 await / 网络调用
@@ -142,7 +146,7 @@ async def main():
         check(f"{fn} 不含 await", "Await" not in body)
 
     # 群名拉取必须是后台任务（不能同步请求）
-    g = pathlib.Path(f"{ROOT}/bridge/group_names.py").read_text(encoding="utf-8")
+    g = pathlib.Path(f"{ROOT}/group_names.py").read_text(encoding="utf-8")
     check("群名拉取走 create_task（不阻塞）", "create_task(" in g)
     check("群名落盘走 to_thread", "to_thread" in src)
 

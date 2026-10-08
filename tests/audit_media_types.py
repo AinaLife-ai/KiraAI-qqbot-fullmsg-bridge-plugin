@@ -1,9 +1,13 @@
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
 import os
 import asyncio, os, sys
-ROOT="/var/minis/workspace/qqbot_bridge_review"
+ROOT=_BR()
 GEN=os.environ.get("GEN","3")
-sys.path.insert(0, ROOT+("/kira-v3" if GEN=="3" else "/kira-core"))
-sys.path.insert(0, ROOT+"/bridge"); sys.path.insert(0,"/tmp/botpy_src/botpy-master")
+sys.path.insert(0, str(_CORE_ROOT(GEN)))
+sys.path.insert(0, ROOT); sys.path.insert(0,_BOTPY_DIR())
 os.makedirs(ROOT+"/data",exist_ok=True); open(ROOT+"/data/log.log","a").close()
 import media_types as MT
 P=F=0

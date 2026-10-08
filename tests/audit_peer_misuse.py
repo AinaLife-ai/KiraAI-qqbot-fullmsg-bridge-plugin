@@ -13,14 +13,19 @@
   * 明确的人话错误（模型能读懂、会放弃）—— 可接受
   * 崩溃 / 卡住 / 静默假成功 —— 不可接受
 """
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR, ref_dir as _REF, peers_dir as _PEERS2, peer_plugin as _PEER
+
 import asyncio
 import importlib.util
 import pathlib
 import sys
 import types
 
-REF = pathlib.Path("/tmp/ref_repos")
-CORE = pathlib.Path("/var/minis/workspace/qqbot_bridge_review/kira-core")
+REF = _REF()
+CORE = pathlib.Path(_CORE_ROOT("2"))
 sys.path.insert(0, str(CORE))
 
 PASS = FAIL = 0

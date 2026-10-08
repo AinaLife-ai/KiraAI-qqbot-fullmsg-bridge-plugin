@@ -61,6 +61,11 @@
 > 这也解释了用户说的"之前没有"：以前没装/没开提速器时，
 > 发送与回填用的都是同一份原文，位置天然对齐。
 """
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR, ref_dir as _REF, peers_dir as _PEERS2, peer_plugin as _PEER
+
 import os
 import pathlib
 import re
@@ -69,7 +74,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORE = pathlib.Path(os.environ.get(
-    "KIRA_CORE", "/var/minis/workspace/qqbot_bridge_review/kira-core"))
+    "KIRA_CORE", _CORE_ROOT("2")))
 sys.path.insert(0, str(CORE))
 sys.path.insert(0, str(ROOT))
 
@@ -165,8 +170,8 @@ def main():
 
     # ---------------- ⑤ 加速器确实这么干 ----------------
     print("\n[5] 加速器（提速器）确实在发送层剥离")
-    acc = pathlib.Path("/var/minis/workspace/qqbot_bridge_review/compat_accelerator/main.py")
-    if acc.is_file():
+    acc = _PEER("compat_accelerator")
+    if acc and acc.is_file():
         a = acc.read_text(encoding="utf-8")
         check("★ 它拦的是 send_xml_messages", "send_xml_messages" in a)
         check("★ 它把抢发结果放在返回序列**最前面**",

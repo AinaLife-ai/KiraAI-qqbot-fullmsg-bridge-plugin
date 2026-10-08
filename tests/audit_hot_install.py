@@ -36,6 +36,11 @@
 
 **修法**：合成事件改用非空占位 `"system"`（两处：`main.py` / `qqbot_bridge.py`）。
 """
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import os
 import pathlib
 import re
@@ -43,7 +48,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORE = pathlib.Path(os.environ.get(
-    "KIRA_CORE", "/var/minis/workspace/qqbot_bridge_review/kira-core"))
+    "KIRA_CORE", _CORE_ROOT("2")))
 sys.path.insert(0, str(CORE))
 sys.path.insert(0, str(ROOT))
 

@@ -48,75 +48,89 @@ from typing import Any, Optional
 FT_IMAGE, FT_VIDEO, FT_RECORD, FT_FILE = 1, 2, 3, 4
 
 _VIDEO_EXT = {".mp4"}
-_RECORD_EXT = {".silk", ".mp3", ".wav", ".ogg"}
+_RECORD_EXT = {".silk", ".mp3", ".wav", ".ogg", ".m4a", ".amr", ".aac", ".flac"}
+
+#: 文档里"语音"一节提到的格式 ——**转码不可用时**的兜底直传白名单。
+#:
+#: ⚠ 注意与"官方确证可直传"的差别：腾讯官方插件
+#: `tencent-connect/openclaw-qqbot` 的 `voiceDirectUploadFormats`
+#: （注释：「QQ 平台支持直传的音频格式（出站：跳过 →SILK 转换）」）
+#: **默认只有 `['.wav','.mp3','.silk']`**，其余（ogg / m4a / amr …）它**一律先转 SILK**。
+#: 而官方文档「富媒体概述」写的是 `silk/mp3/wav/ogg`。
+#:
+#: 实测（用户 2026-10-08 日志/截图）：**ogg 直传被平台降级成了文件卡片**。
+#: ⇒ 所以正常路径是"**能转就转**"（只信 silk）；这个白名单**只在编码器不可用时**
+#: 用来决定"要不要再试一次直传"（含 ogg，赌平台版本差异），
+#: 不在白名单里的（m4a/amr/…）**一开始就按文件发**，绝不赌。
+_DOC_AUDIO_EXT = {".silk", ".mp3", ".wav", ".ogg"}
 
 
 #: 哨兵：源文件本来就是 silk，**无需改路径、file_type 保持 3**
 KEEP_AS_IS = "\x00KEEP"
 
 
+def _record_ext(path: str) -> str:
+    return os.path.splitext(str(path or "").split("?")[0])[1].lower()
+
+
 async def maybe_convert_to_silk(media_element: Any, logger_: Any) -> Optional[str]:
-    """决定 `Record` 音频该怎么发（silk 优先，但不强求）。
+    """决定 `Record` 音频该怎么发（**只信 silk**，其余尽量转）。
 
-    ## ★ 官方文档与实测的冲突（2026-10-08）
+    ## 三种线上形态（2026-10-08 用户实测，都必须能变成语音条）
 
-    官方「富媒体消息概述」写：
+    | 源文件 | 旧行为（都失败） | 现在的行为 |
+    |--------|------------------|------------|
+    | `.ogg` 真音频 | 按官方文档"原样发" | **转 silk** 再发 |
+    | `.m4a` 真音频 | 原样发被拒 → 重试 → 可能整条发不出去 | **转 silk** 再发 |
+    | 内容是 silk（腾讯/标准系） | 原样发 | 校验+补腾讯系头后发 |
+    | 扩展名 `.silk` 但内容不是 silk（只是改名） | 原样发 ⇒ **文件卡片** | **当普通音频转 silk** |
 
-    > **语音**：支持 **`silk/mp3/wav/ogg`** 格式，发送后展示语音条
-
-    但同一页的「文件类型与限制」表里，`file_type=3 语音` 的格式只列了 **silk**；
-    第三方项目实测也称「MP3 直接上传会降级成文件」。
-
-    ⇒ **两个说法都可能有适用条件**（可能是平台版本/白名单差异）。
-    所以这里采取**两条路都试**的策略，而不是一刀切：
-
-    * 源文件**已经是 silk** ⇒ 校验腾讯系头后**直接用**（最省事）；
-    * 源文件是 **mp3/wav/ogg** ⇒ **先原样按 `file_type=3` 发**（官方说支持，
-      这样**零转码、零依赖、最快**）；调用方发现被降级再转 silk（见 `media_types`）。
+    ⇒ 判据收敛成一句话：**内容不是真 silk 就转**；
+    只有**编码器不可用**时才退回直传（且只对文档列出的格式）。
 
     返回值语义（调用方必须区分）：
 
     * ``KEEP_AS_IS`` —— 源文件本身就是（合法的）silk，**路径不用改**，类型保持 3；
     * ``<路径>``     —— 已转码成 silk，改用这个路径；
-    * ``None``       —— 源文件不是 silk（mp3/ogg/wav）⇒ **先原样发**，别转。
-      调用方据此保持原路径 + `file_type=3`。
+    * ``None``       —— 转不了（缺依赖 / 解码失败）⇒ 调用方按"能不能直传"决定，
+      见 :func:`direct_upload_ok`。
     """
     try:
         if getattr(media_element, "file_type", None) == "url":
             return None                       # 远程地址：交给平台自己处理
-        from audio_silk import to_silk_if_needed, is_silk_path
+        from audio_silk import silk_magic_ok, to_silk_if_needed
         path = await media_element.to_path()
         if not path or not os.path.isfile(path):
             return None
-        # ★ 只对"本来就是 silk"的做校验+放行；其它格式**先原样发**（不转码）
-        if not is_silk_path(path):
-            return None                       # ⇒ 调用方按原文件 + file_type=3 发
-        silk = await to_silk_if_needed(path, logger_=logger_)
-        if not silk:
-            return None                       # silk 但头不合法 ⇒ 退回按文件发
-        return KEEP_AS_IS                     # 合法 silk ⇒ 原路径、类型保持 3
-    except Exception as exc:
-        if logger_ is not None:
-            logger_.debug("[QQBOT-BRIDGE] silk 判断失败: %s", exc)
-        return None
-    try:
-        if getattr(media_element, "file_type", None) == "url":
-            return None                       # 远程地址：不动
-        from audio_silk import to_silk_if_needed
-        path = await media_element.to_path()
-        if not path or not os.path.isfile(path):
-            return None
+        # ① 内容**确实是** silk ⇒ 只做腾讯系头校验（是则原路径复用）
+        if silk_magic_ok(path):
+            return KEEP_AS_IS if await to_silk_if_needed(path, logger_=logger_) else None
+        # ② 其它一律尝试转 silk（含"改名 silk"与 ogg/m4a/amr…）
         silk = await to_silk_if_needed(path, logger_=logger_)
         if not silk:
             return None
-        # 源文件本身就是 silk ⇒ 保持原路径、file_type=3
         if os.path.realpath(silk) == os.path.realpath(path):
             return KEEP_AS_IS
         return silk
     except Exception as exc:
         if logger_ is not None:
-            logger_.debug("[QQBOT-BRIDGE] silk 转码不可用: %s", exc)
+            logger_.debug("[QQBOT-BRIDGE] silk 判断失败: %s", exc)
         return None
+
+
+def direct_upload_ok(media_element: Any) -> bool:
+    """转码不可用时，这个音频**能不能按 file_type=3 直接上传**？
+
+    * 真 silk ⇒ 能（但真 silk 走不到这里）；
+    * 扩展名在官方文档的语音格式白名单里（silk/mp3/wav/ogg）⇒ 试一次；
+    * 其余（m4a / amr / aac / flac / 无扩展名）⇒ **不行** ——
+      直接发只会换来 850019 / 静默降级，不如一开始就按文件发（至少看得见）。
+    """
+    try:
+        path = getattr(media_element, "file", None) or getattr(media_element, "record", None)
+    except Exception:
+        path = None
+    return _record_ext(str(path or _guess_name(media_element))) in _DOC_AUDIO_EXT
 
 
 def _guess_name(element: Any) -> str:
@@ -127,6 +141,38 @@ def _guess_name(element: Any) -> str:
         except Exception:
             pass
     return str(getattr(element, "file", "") or "")
+
+
+#: 只提示一次：模型把音频用 `<file>`（而非 `<file type="record">`）发出来
+_AUDIO_AS_FILE_LOGGED = False
+
+
+def _maybe_log_audio_as_file(media_element: Any, logger_: Any) -> None:
+    """音频被**当普通文件**发（`<file>` 而不是 `<file type="record">`）时提示一次。
+
+    两种写法都是合法的（框架 `FileTag` 文档写得很清楚：`type=record` ⇒ 语音条，
+    `type=file` ⇒ 音频文件），但**日志里必须能分辨** ——
+    否则用户说"语音条发不出来"时，我们连"是不是模型就没按语音发"都判断不了
+    （2026-10-08 排查卡了整整两轮，就因为缺这一行）。
+    """
+    global _AUDIO_AS_FILE_LOGGED
+    if _AUDIO_AS_FILE_LOGGED or logger_ is None:
+        return
+    try:
+        if type(media_element).__name__ != "File":
+            return
+        ext = _record_ext(_guess_name(media_element))
+        if ext not in _RECORD_EXT:
+            return
+        _AUDIO_AS_FILE_LOGGED = True
+        logger_.info(
+            "[QQBOT-BRIDGE] 本条音频是按「文件」类型发出的（%s）—— 模型写的是 "
+            "<file>（type 缺省=file），不是 <file type=\"record\">；"
+            "所以它在 QQ 里是文件卡片而不是语音条。想发语音条请让模型用 type=\"record\"",
+            ext,
+        )
+    except Exception:
+        pass
 
 
 def classify(element: Any) -> Optional[int]:
@@ -231,6 +277,7 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
     async def _upload_file(target_id, media_element, is_group, _orig=current):
         want = classify(media_element)
         if want is None:
+            _maybe_log_audio_as_file(media_element, logger)
             return await _orig(target_id, media_element, is_group)
         try:
             return await _upload(target_id, media_element, is_group, want)
@@ -272,21 +319,30 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
             if got == KEEP_AS_IS:
                 pass                          # 本来就是（合法腾讯系）silk，全部不动
             elif got:
-                silk_path = got
-            else:
-                # ★ 不是 silk（mp3/wav/ogg）⇒ **先原样按 file_type=3 发**。
-                #
-                #   官方「富媒体概述」明说语音支持 `silk/mp3/wav/ogg`，
-                #   所以先按官方说的试一次 —— **零转码、零依赖、最快**，
-                #   也不用装 pilk/ffmpeg。
-                #
-                #   若平台把它降级成文件（第三方实测称 mp3 会降级），
-                #   下面 `_upload` 的重试逻辑会自动再转成 silk 发一次。
+                silk_path = got               # 已转成 silk（ogg/m4a/改名 silk …）
+            elif direct_upload_ok(media_element):
+                # ★ 转不了（没装编码器 / 解码失败），但格式在官方文档的语音白名单里
+                #   ⇒ 先直传试一次；被平台拒了下面会自动再试一次转码（见 _retry_as_silk）。
                 _pending_silk_retry = True
                 if logger is not None:
                     logger.info(
-                        "[QQBOT-BRIDGE] 该音频不是 silk（%s）—— 先按官方支持的格式"
-                        "直接以「语音」发送；若被平台降级，会自动转 silk 重试",
+                        "[QQBOT-BRIDGE] 没有可用的 silk 编码器 —— 该音频（%s）先按官方"
+                        "支持的格式直传一次；若被平台拒，会再尝试转 silk",
+                        os.path.splitext(_elem_name or "")[1] or "?",
+                    )
+            else:
+                # ★ 既转不了、又不在白名单里（m4a / amr / aac / flac / 无扩展名…）
+                #   ⇒ **一开始就按「文件」发**。
+                #
+                #   踩过的坑（2026-10-08 用户实测）：m4a 直传 file_type=3 被平台拒，
+                #   重试也转不了 ⇒ 最后**整个消息都没发出去**（用户："QQ 聊天里都看不到消息"）。
+                #   宁可降级成文件卡片（用户看得见、可下载），也绝不发不出去。
+                file_type = FT_FILE
+                if logger is not None:
+                    logger.warning(
+                        "[QQBOT-BRIDGE] 该音频（%s）既不是 silk、也转不了 silk，"
+                        "且不在官方语音白名单里 —— 本条按「文件」发送（至少能收到）；"
+                        "装上 silk 依赖后会以语音条发出",
                         os.path.splitext(_elem_name or "")[1] or "?",
                     )
 

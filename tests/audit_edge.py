@@ -7,14 +7,18 @@
   C2. **并发串味** —— 两条消息同时发送时，contextvar 会不会互相污染。
   C3. **脏数据/异常** —— 群名接口返回畸形、互动事件缺字段、键盘 JSON 超长等。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
+
 import asyncio
 import sys
 
-ROOT = "/var/minis/workspace/qqbot_bridge_review"
-sys.path.insert(0, f"{ROOT}/kira-v3")
-sys.path.insert(0, f"{ROOT}/bridge")
-sys.path.insert(0, "/tmp/botpy_src/botpy-master")
-sys.path.insert(0, f"{ROOT}/bridge/tests")
+ROOT = _BR()
+sys.path.insert(0, str(_CORE_ROOT("3")))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, _BOTPY_DIR())
+sys.path.insert(0, f"{ROOT}/tests")
 
 import smoke_v3 as T  # noqa: E402
 

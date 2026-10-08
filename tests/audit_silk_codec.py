@@ -2,7 +2,7 @@ import os
 """验证 audio_silk 的代码路径（用桩 pilk 记录调用参数）。"""
 import os, sys, types, asyncio
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0,'/tmp/botpy_src/botpy-master')
+sys.path.insert(0,'_BOTPY()')
 
 CALLS=[]
 fake=types.ModuleType("pilk")

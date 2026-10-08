@@ -1,8 +1,12 @@
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import bridge_root as _BR, core_root as _CORE_ROOT, botpy_parent as _BOTPY_DIR
 import os
 """验证 silk 转码的临时目录不会泄漏。"""
 import asyncio, glob, os, sys, types, tempfile
-sys.path.insert(0,'/var/minis/workspace/qqbot_bridge_review/bridge')
-sys.path.insert(0,'/tmp/botpy_src/botpy-master')
+sys.path.insert(0,_BR())
+sys.path.insert(0,'_BOTPY()')
 
 fake=types.ModuleType("pilk")
 def encode(pcm,silk,pcm_rate=None,tencent=False):
