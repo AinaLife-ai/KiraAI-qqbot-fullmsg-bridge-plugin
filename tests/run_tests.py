@@ -93,7 +93,7 @@
                        file_type=4 发（腾讯 Node SDK / openclaw-qqbot / Hermes 三家一致）。
   audit_stream_retry.py ★★ 分片上传重试（逐条对齐官方 retry 策略）：
                        该重试的重试、日额度不重试、持久重试、预算到点放手。
-  audit_llm_stream_bridge.py ★★★ 提速来源：在提速器的 chat_stream 上**旁听**
+  audit_sticker.py      ★★★ 表情包（<sticker> 标签）：补齐"适配器声明 sticker"\n                       + 发送时 Sticker→Image（file_type=1），两步都不动核心。\n  audit_llm_stream_bridge.py ★★★ 提速来源：在提速器的 chat_stream 上**旁听**
                        （纯透传、身份匹配、工具轮不投递、关掉即不装）。
   audit_c2c_stream.py   ★★ 私聊流式消息（官方 stream_messages）：判据保守 /
                        分段累积 / 空闲收尾 / 失败回退 / 限流重试 / api 层集成。
@@ -122,7 +122,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "audit_md_img_content_type.py", "audit_v3_nickname_fallback.py",
           "audit_upload_payload_shape.py", "audit_typing_indicator.py",
           "audit_stream_retry.py", "audit_c2c_stream.py",
-          "audit_llm_stream_bridge.py"]
+          "audit_llm_stream_bridge.py", "audit_sticker.py"]
 
 rc = 0
 for suite in SUITES:

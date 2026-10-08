@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.6
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.7
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -45,6 +45,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | **内联按钮** | `<keyboard>` 标签 → 消息下方挂按钮；带完整 JSON 校验（行/列/长度），非法直接拒绝并告知模型 |
 | **按钮点击回调** | 用户点按钮 → **3 秒内回执**（官方硬要求，否则客户端一直转圈）→ 转成一条消息给模型 |
 | **工具** | 共 12 个，按「是否需要群管理权限」分两组：**无需权限的默认开**（撤回自己消息 / 群信息含人数 / 按名字找人 / 读文件 / 发文件 / 机器人群内状态），**需权限的默认关**（禁言 / 禁言查询 / 加群审批 / 撤回他人 / 名册 / 踢人 / 黑名单）。**直接调官方接口，不依赖框架内部结构，跨版本可用** |
+| **表情包（sticker）** | 框架内置表情包插件的 `<sticker>` 标签在官 bot 上**本来发不出来**（两个卡点：① 适配器没声明支持 sticker ⇒ 插件不给 QQ 会话注册这个标签；② 就算解析成 `Sticker` 元素，适配器的富媒体白名单只认 File/Image ⇒ 被丢掉）。本插件把 sticker 补进声明（**只在真的装了表情包时**），发送时再把 `Sticker` 换成等价图片（`file_type=1`）⇒ **QQ 里就是一整张图** |
 | **成员事件** | 有人进群/退群/申请加群 → 作为 System 消息告诉模型（需打开 `extra_intents`，默认关） |
 | **3.0 引用唤醒补洞** | 3.0 判断"这条引用是不是在叫机器人"用的是**内存里自己发过的消息**，**重启后失效**。桥接改读平台下发的 `author.bot`，重启后依然成立 |
 
@@ -128,6 +129,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
 | `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
 | `c2c_stream_enabled` | 开 | **私聊流式消息**（官方 `stream_messages`）：把模型**正在生成的文字**实时写到那条消息上（约 0.5s 就能看到字，来源是提速器的 token 流）。**一条消息就是一条**：多段回复仍然是多条，绝不合并；没有预览就不接管（报文与从前完全一致）。只对单聊纯文本生效，失败一律回退普通发送 |
+| `sticker_tags` | **sticker** | **表情包标签关键词**（逗号分隔）：填进来的词会被补进适配器声明的类型清单（框架里的表情包插件正是看到这个词才注册自己的标签），且这些词对应的元素发送时按**图片**发出（`file_type=1`）。内置表情包用 `sticker`；第三方「增强表情包」是 `<sticker_plus>` 标签，填 `sticker` 即可覆盖。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效 |
 | `extra_intents` | **开** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；插件会在连接时自动补上订阅位并请一次重连，**需重启 KiraAI** 生效。个别环境被平台拒绝订阅时会自动回退 |
 
 ### 关于「发文件」——本插件**不做**（框架原生已支持）
@@ -450,6 +452,100 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.7</b> — ★★★ 让官 bot 能发**表情包**（框架内置插件的 `<sticker>` 标签）</summary>
+
+### 现象（用户日志）
+
+```
+模型输出：<msg><text>这个呢</text><sticker>1</sticker></msg>
+结果：表情包发不出来
+```
+
+### 根因：**两个叠加的卡点**
+
+**① `<sticker>` 标签根本没被注册。** 内置表情包插件是这样注册的
+（`core/plugin/builtin_plugins/sticker/main.py`）：
+
+```python
+supported_elements = event.supported_elements
+if "sticker" in supported_elements:          # ← 门槛
+    tag_set.register(build_sticker_tag(sticker_dict=...))
+```
+
+而 **QQ 官方适配器声明的类型清单里没有 `sticker`**：
+3.0 是 `_SUPPORTED_ELEMENTS = [... "emoji"]`、2.x 是 `message_types = [... "emoji"]`。
+⇒ 表情包插件**不会**给 QQ 会话注册这个标签 ⇒ 模型看不到它、写了也不解析。
+
+**② 就算解析成 `Sticker` 元素也发不出去。** 适配器的富媒体白名单只认 `File` / `Image`：
+
+```python
+media_elements = [e for e in chain if isinstance(e, (File, Image))]
+```
+
+`Sticker`（`BaseMediaElement`，本质就是一张图：`sticker_id` + `file`）不在里面 ⇒ 不会被上传，
+`_text_content` 还会把它写成 `[Unsupported message element]`。
+
+### 修法（纯插件侧，两步都在本插件里）
+
+1. **把 `sticker` 补进该适配器声明的类型清单**（实例级、可还原、幂等）
+   ⇒ 内置插件随即注册 `<sticker>`，模型在提示词里就能看到它和表情包清单；
+   ⚠ **只在真的装了表情包时才加** —— 内置插件不检查清单是否为空，空清单反而会诱导模型去发不存在的 id。
+   新装的插件/新加的表情包会被 15 秒巡检自动补上，不用重启。
+2. **发送时把 `Sticker` 换成等价的 `Image`**（复用已有的"媒体换壳"机制）
+   ⇒ 走 `file_type=1` 上传，`msg_type=7` 发出 —— **QQ 里就是一整张图**（表情包本体）。
+   发完**立刻还原**成 `Sticker`，绝不改用户的消息链。
+
+### 第三方表情包插件（`sticker-plus` 等）一并覆盖
+
+第三方「**增强表情包**」（`skyzhishui/kira-ai-plugin-sticker-plus`）**门槛和内置插件一模一样**：
+
+```python
+# kira-ai-plugin-sticker-plus/main.py:240
+if "sticker" not in event.message_types:
+    return                       # ← 同一个开关
+```
+
+而且它发送时用的**也是 `Sticker` 元素**（`MessageChain([Sticker(...)])` → `ctx.send_message_chain`）
+⇒ 声明 + 换壳两步都照常生效，**它一行都不用改**。
+
+> ⚠ **别把"门槛词"和"标签名"搞混**（这是最容易看错的一处）：
+>
+> | | 谁定义 | 值 |
+> |---|---|---|
+> | **门槛词**（要进 `supported_elements` 的那个） | 插件注册前自己检查 | 内置与第三方**都查 `sticker`** |
+> | **标签名**（模型实际写的那个） | 插件注册时命名 | 内置 `<sticker>` ／ 第三方 `<sticker_plus>` |
+>
+> 所以**只要声明 `sticker`**，内置与第三方两家的标签**都会注册**，模型两个都能用；
+> 默认值就是它，不用再加 `sticker_plus`（真加了也无害）。
+
+两点额外处理：
+
+* **判据不能只看内置图库**：第三方插件有自己的图库，内置表情包管理器可能是空的
+  ⇒ 判据改成「内置有图 **或** 加载了名字含关键词的插件」（如 `kira-ai-plugin-sticker-plus`）；
+* **关键词可配**（配置项 `sticker_tags`，逗号分隔，默认 `sticker`）：填进来的词都会被声明，
+  并且**类名里含该词的元素**都会按图片发出。以后遇到别的表情包插件（标签关键词不同），
+  把它填进来即可，不用改代码。
+
+### 边界
+
+* 只影响**发送侧**；入站方向 QQ 官方事件本来就不会带 sticker，行为不变；
+* 没装表情包（也没有名字含关键词的插件）⇒ 一个字节都不动（不声明、不换壳、不改提示词）；
+* 关掉插件 ⇒ 类型清单恢复原样（有测试断言其它类型一个没丢）。
+
+### 测试（新增 `tests/audit_sticker.py`，25 条；2.x / 3.0 各跑一遍都过）
+
+* 装了表情包 ⇒ 清单里有 `sticker`；**没装 ⇒ 不加**；
+* `<text>+<sticker>` 一条消息 ⇒ **msg_type=7 + media + file_type=1**，上传字节就是那张表情包，
+  正文保留文字且**不含** `[Unsupported message element]`；
+* 只发表情包（无文字）也能发出去（不是空消息）；
+* 发送后消息链**还原**成 `Sticker`；关掉插件后清单恢复；
+* **第三方**：关键词可配（`sticker,sticker_plus` 都进清单）、只摘我们加的词、
+  「内置图库为空 + 装了 `kira-ai-plugin-sticker-plus`」也照常声明、
+  **自定义元素类（`StickerPlus` 之类）同样被换成图片发出**（file_type=1）。
+
+</details>
+
+<details>
 <summary><b>v1.6.6</b> — 流式做到"零延迟开销"：收尾帧后台发 + 抽取改用 rfind（附实测数据）</summary>
 
 用户追问"这会不会让生成更卡 / 堵住看门狗"，于是逐条量了一遍并把两处开销抠掉：

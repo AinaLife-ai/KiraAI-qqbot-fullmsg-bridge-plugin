@@ -234,12 +234,18 @@ def classify(element: Any) -> Optional[int]:
     我们会把它们**临时换成 `File`** 再发；换的时候把原始类型记在标记里，
     这里按**原始类型**给值，保证 `视频→2 / 语音→3` 不会因为"变成 File"而丢。
     """
-    # ★ 先看"换壳"标记（见 media_coerce）
+    # ★ 先看"换壳"标记（见 media_coerce）—— 标记里存的是**原始类名**，
+    #   第三方表情包插件的元素类名可能是 `StickerPlus` 之类，统一按名字判类型。
     orig = getattr(element, "_kira_bridge_orig_kind", None)
-    if orig == "Video":
-        return FT_VIDEO
-    if orig == "Record":
-        return FT_RECORD
+    if orig:
+        low = str(orig).lower()
+        if "record" in low:
+            return FT_RECORD
+        if "video" in low:
+            return FT_VIDEO
+        # 其余"换壳"过来的（Sticker / StickerPlus / …）：就是一张图
+        # ⇒ file_type=1，QQ 直接当图片展示
+        return FT_IMAGE
 
     name = type(element).__name__
     if name == "Video":

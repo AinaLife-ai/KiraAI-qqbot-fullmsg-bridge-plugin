@@ -111,6 +111,7 @@ from core_profiles import (
 )
 from c2c_stream import C2CStreamManager
 from llm_stream_bridge import LLMStreamBridge
+import sticker_support
 from group_names import GroupInfoCache
 from rich_content import (
     KEYBOARD_TAG_DESCRIPTION,
@@ -239,6 +240,22 @@ def _group_names_path():
             return None
 
 
+def _split_keywords(value) -> tuple:
+    """把配置里的"逗号/空格/顿号分隔"关键词串切成去重小写元组。"""
+    import re as _re
+
+    if isinstance(value, (list, tuple)):
+        items = [str(v) for v in value]
+    else:
+        items = _re.split(r"[,，、\s]+", str(value or ""))
+    out = []
+    for item in items:
+        kw = item.strip().lower()
+        if kw and kw not in out:
+            out.append(kw)
+    return tuple(out) or ("sticker",)
+
+
 def _identity_path():
     """Where to persist the auto-learned nickname directory."""
     try:
@@ -292,6 +309,9 @@ class QQOfficialGroupBridge(BasePlugin):
         self.typing_enabled = bool(basic.get("typing_enabled", True))
         #: 私聊流式消息（官方 stream_messages；见 c2c_stream.py）
         self.c2c_stream_enabled = bool(basic.get("c2c_stream_enabled", True))
+        #: 表情包标签关键词（逗号分隔；默认 sticker —— 它同时覆盖内置表情包插件
+        #: 与第三方「增强表情包」sticker-plus，两家都是看这个词才注册标签）
+        self.sticker_tags = _split_keywords(basic.get("sticker_tags", "sticker"))
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -342,6 +362,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self._capability_cache: dict = {}
         #: 装过媒体类型修正的宿主对象（还原时要用）
         self._media_types_holders: dict = {}
+        #: 声明过 sticker 支持的宿主对象（还原时要用）
+        self._sticker_holders: dict = {}
         #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
         self._group_prefetch_task = None
         #: ★ 本实例发起的「请重连」任务 —— terminate 时必须全部取消，
@@ -691,6 +713,14 @@ class QQOfficialGroupBridge(BasePlugin):
                 changed.append(f"{name}.api_send")
             # 发送入口包装
             self._unpatch_send_entry(adapter, name)
+            # 表情包支持（sticker）
+            _sh = self._sticker_holders.pop(name, None)
+            if _sh is not None:
+                try:
+                    if sticker_support.restore(_sh, self.sticker_tags):
+                        changed.append(f"{name}.sticker")
+                except Exception:
+                    pass
             # 媒体类型修正
             _mh = self._media_types_holders.pop(name, None)
             if _mh is not None:
@@ -1039,6 +1069,18 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._media_types_holders[name] = holder
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 安装媒体类型修正失败（不影响其它功能）: %s", exc)
+
+        # ---- L3-C：表情包（`<sticker>` 标签）—— 同样世代无关 ----
+        #
+        #   内置表情包插件只在 `"sticker" in event.supported_elements` 时才注册
+        #   `<sticker>` 标签；而 QQ 官方适配器声明的类型清单里没有 sticker
+        #   ⇒ 标签压根不注册（模型看不到、写了也不解析）。
+        #   这里把 sticker 补进清单（**只在真的装了表情包时才加**），
+        #   发送侧由 media_coerce 把 Sticker 换成等价 Image（file_type=1）。
+        try:
+            self._ensure_sticker_support(adapter, name)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 表情包支持安装失败（不影响其它功能）: %s", exc)
 
         if profile.generation == GEN_UNKNOWN:
             if name not in self._broken_adapters:
@@ -1515,7 +1557,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 #   Record / Video ⇒ 语音/视频进不了发送链。这里临时换壳成 File
                 #   让核心收下（发完还原），不动核心。
                 from media_coerce import coerce_media_chain, restore_media_chain
-                chain, _swapped = coerce_media_chain(chain)
+                chain, _swapped = coerce_media_chain(chain, self.sticker_tags)
                 try:
                     return await _orig(target_id, chain)
                 finally:
@@ -2262,6 +2304,43 @@ class QQOfficialGroupBridge(BasePlugin):
             client = None
         return self._group_name_for(name, adapter, group_id, client)
 
+    def _sticker_count(self) -> int:
+        """框架装了几个表情包（没装/没管理器就返回 0）。"""
+        try:
+            mgr = getattr(self.ctx, "sticker_manager", None)
+            if mgr is None:
+                return 0
+            data = getattr(mgr, "sticker_dict", None)
+            if callable(data):                 # 3.0 是 property，2.x 是普通方法
+                data = data()
+            return len(data) if isinstance(data, dict) else 0
+        except Exception:
+            return 0
+
+    def _ensure_sticker_support(self, adapter, name: str) -> bool:
+        """让本适配器声明支持 `sticker`（幂等、可还原）。
+
+        ⚠ **只在真的装了表情包时才加**：内置插件不检查清单是否为空，
+          清单为空时那段标签说明就是一份空列表，反而会诱导模型去发不存在的 id。
+        """
+        holders = self._sticker_holders
+        holder = holders.get(name)
+        if holder is not None:
+            return False                       # 已经装过（数量变化不影响"已声明"这件事）
+        # 「确实有人在管表情包」才声明：内置管理器里有图，**或者**装了第三方表情包插件
+        # （如 kira-ai-plugin-sticker-plus —— 它有自己的图库，内置管理器可能是空的）
+        if self._sticker_count() <= 0 and not sticker_support.plugin_present(
+                getattr(self.ctx, "plugin_mgr", None), self.sticker_tags):
+            return False
+        # 落点：3.0 在能力对象（`_supported_elements`），2.x 在适配器（`message_types`）
+        target = self._capability_of(adapter)
+        if sticker_support.supported_list(target) is None:
+            target = adapter
+        if sticker_support.install(target, logger, self.sticker_tags):
+            holders[name] = target
+            return True
+        return False
+
     def _patch_send_path(self, adapter, name: str, client) -> None:
         """把「发送增强」挂到**框架真正走的那个发送入口**上。
 
@@ -2327,7 +2406,8 @@ class QQOfficialGroupBridge(BasePlugin):
             #   发送链，还会被 `_text_content` 填成 `[Unsupported message element]`。
             #   这里临时"换壳"成 File 让核心收下（发完还原），不动核心。
             from media_coerce import coerce_media_chain, restore_media_chain
-            send_message_obj, _swapped = coerce_media_chain(send_message_obj)
+            send_message_obj, _swapped = coerce_media_chain(
+                send_message_obj, self.sticker_tags)
             try:
                 return await _send_message_inner(target_id, send_message_obj, is_group)
             finally:
