@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.6
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.7
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,80 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.7</b> — 撤销我上一版的错改（#0 #0 让图**完全消失**）+ 补诊断日志</summary>
+
+### ⚠️ 先说我的错
+
+v1.5.6 我给所有图片补了 `#0 #0` 尺寸后缀（依据是论坛上一句「可以用
+`![img#0 #0]` 自动缩放」）。**结果更糟**：
+
+| 版本 | 群里显示 |
+|------|---------|
+v1.5.5 及以前 | `![香香立绘](url)` → 显示 `[香香立绘]`（**至少有个占位**） |
+v1.5.6 | `![香香立绘 #0 #0](url)` → **什么都没有** |
+
+你的原话：「**md图片都没有占位符了**」—— 正是这个改动的结果。
+
+**推断**：QQ 把 `#0 #0` 当成**真实的 0×0 像素** ⇒ 图被渲染成零尺寸 ⇒ 完全不可见。
+那句话多半只适用于**模板插值**场景，不适用于自定义 `content`。
+
+### ✅ 本次回退
+
+**不猜了** —— `_ensure_size` 现在**原样返回 alt**：
+
+* 模型自己写了尺寸 → 尊重它，不动；
+* 模型没写 → **也不加**。
+
+要不要加、加多少，等有**确定性证据**再说。功能上不再擅自改动用户/模型的内容。
+
+### 补诊断日志（这次排查最大的障碍是"看不见"）
+
+之前线上出问题，日志里**看不到**「到底按什么类型发、发出去的 md 是什么」，
+所以只能靠猜（我前几轮就是这么走弯路的）。现在加了两条：
+
+```
+[QQBOT-BRIDGE] 发送媒体：原始类型=Record 文件=jbf_v2.silk 大小=123146B 计划 file_type=3
+[QQBOT-BRIDGE] 媒体上传完成：file_type=3 文件=jbf_v2.silk → 拿到 file_info
+[QQBOT-BRIDGE] 本条 markdown 实际内容（含图片地址）：
+<完整 md>
+```
+
+失败时也会记下**平台的原始响应**，例如：
+
+```
+[QQBOT-BRIDGE] 媒体上传失败（file_type=3，文件=jbf_v2.silk）：ServerError: ...
+```
+
+### 关于语音：你的日志给了两条硬信息
+
+1. **30 秒那条根本没发出去**：
+
+```
+[botpy] 请求 .../files  错误代码: 500
+        {'message': 'call inner proxy error', 'code': 850012}
+ERROR   Failed to upload QQ official media (ServerError)
+<msg message_id="">        ← 消息 ID 是空的
+```
+
+`850012 call inner proxy error` 是**平台侧的**错误（不是插件的问题）。
+但**它到底是怎么触发的，现在还判断不了** —— 是这份 silk 本身有问题、
+还是文件太大/太频繁，都缺乏证据。
+
+2. **60 秒那条发出去了，但是文件卡片** ⇒ 说明那次 `file_type` **不是 3**。
+
+⚠️ 这两条我都**还没能定论**。装上这一版后，日志里会有上面那两条诊断，
+届时就能一眼看清「类型对不对、文件是什么」。**请下次把新日志发我**，
+我按数据定位，不再靠推测。
+
+### 测试
+
+`audit_md_img_size.py` 改为断言**原样保留**（不再期望补尺寸）。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.6</b> — ★ 修掉装不上的根因（pilk 只到 cp311）+ md 图片补尺寸后缀</summary>
 
 ### 1. ★ 语音条装不上的真因：`pilk` 的 wheel 只到 cp311
