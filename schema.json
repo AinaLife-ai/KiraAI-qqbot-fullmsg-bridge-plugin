@@ -159,6 +159,23 @@
         "default": "sticker",
         "hint": "要帮它把表情包发出去的标签关键词。填进来的词会被补进适配器声明的类型清单 —— 框架里的表情包插件正是看到这个词才会注册自己的标签（否则 QQ 会话里模型根本看不到那个标签）；这些词对应的元素发送时按图片发出，也就是 file_type=1。内置表情包插件用 sticker；第三方「增强表情包」是 sticker_plus 标签，关键词填 sticker 即可覆盖它。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效，不会平白改变提示词。"
       },
+      "gif_sticker_mode": {
+        "name": "GIF/动图怎么发（推荐 auto）",
+        "type": "string",
+        "options": [
+          "auto",
+          "image",
+          "file"
+        ],
+        "default": "auto",
+        "hint": "平台的上传接口只接受 png/jpg，GIF 直传会被拒（实测 850019）。自动：优先把动图转成 APNG（还是 PNG 魔数，客户端支持就继续动）、静图转 PNG 内嵌显示，万一平台仍拒收就自动改按文件发送（原图/动图都在，点开可看）；只按图片发：转成 PNG 内嵌，平台拒收就失败；按文件发：GIF 原样当文件发，保动图但要点开下载。png/jpg 三种模式下都是一个字节都不动。"
+      },
+      "md_drop_reference": {
+        "name": "markdown 消息不带引用（推荐开）",
+        "type": "switch",
+        "default": true,
+        "hint": "腾讯官方 Node SDK 明确让 markdown 与 message_reference 互斥（markdown 时绝不带引用）；实测两者同发会让 QQ 里 markdown 渲染不正常（图片不显示）。打开时：本条是 markdown 就去掉引用（被动回复锚点 msg_id 保留，配额与时效完全不变）。关掉则保持框架原样（引用照发）。"
+      },
       "extra_intents": {
         "name": "额外订阅事件（推荐开）",
         "type": "switch",

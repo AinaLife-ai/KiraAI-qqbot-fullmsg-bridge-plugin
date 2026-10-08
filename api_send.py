@@ -234,6 +234,34 @@ class ApiSendPatcher:
             kwargs["msg_type"] = 2
             kwargs["markdown"] = {"content": target_md}
             kwargs["content"] = None
+            # ★★★ markdown 与 message_reference **互斥**（2026-10-09 官方源码定案）
+            #
+            #   腾讯官方 Node SDK `dist/protocol/api/messages.js`：
+            #
+            #       if (messageReference && !this.markdownSupport) {
+            #           body.message_reference = { message_id: messageReference };
+            #       }
+            #       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 只有"非 markdown"时才带引用
+            #
+            #   而 KiraAI 核心**不看 msg_type 一律填 message_reference**
+            #   （`im.py`: `reference = self._resolve_reference(...)`；
+            #     2.x 适配器同理）⇒ 只要模型同时写了 `<reply>` 和 `<markdown>`，
+            #   本条就会带上引用 ⇒ **QQ 里 markdown 渲染不正常（图不显示等）**。
+            #   用户实测：同样内容**不带 reply 就一切正常** ✓
+            #
+            #   ⇒ 发 markdown 时**丢掉 message_reference**（保留 msg_id：
+            #     仍是被动回复，配额/时效完全不变），行为与官方 SDK 一致。
+            if self.plugin.md_drop_reference and kwargs.get("message_reference"):
+                dropped = kwargs.pop("message_reference", None)
+                if not flags.get("md_ref_dropped_logged"):
+                    flags["md_ref_dropped_logged"] = True
+                    self.logger.info(
+                        "[QQBOT-BRIDGE] 本条是 markdown，已**去掉引用**（message_reference=%s）——"
+                        "官方 Node SDK 明确让两者互斥（markdown 时绝不带引用），"
+                        "实测带引用会让 QQ 的 md 渲染不正常（图片不显示）。"
+                        "被动回复锚点 msg_id 保留，配额与时效不受影响",
+                        str(dropped)[:60],
+                    )
             if auto_md and not flags.get("at_md_logged"):
                 flags["at_md_logged"] = True
                 self.logger.info(
@@ -243,6 +271,22 @@ class ApiSendPatcher:
             elif md_text and not flags.get("md_logged"):
                 flags["md_logged"] = True
                 self.logger.info("[QQBOT-BRIDGE] 首次按 markdown 发送（<markdown> 标签生效）")
+
+        # ★ 观测（用户 2026-10-09 反馈"reply + md 渲染不正常"）：
+        #   把"引用 + markdown 同条发出"的报文形状如实记一条 —— 以后不用猜。
+        try:
+            if target_md and kwargs.get("message_reference") and not flags.get("md_ref_logged"):
+                flags["md_ref_logged"] = True
+                self.logger.info(
+                    "[QQBOT-BRIDGE] 本条**同时带引用与 markdown**：msg_type=2、"
+                    "message_reference=%s、markdown 长度=%d 字符；图片数=%d。"
+                    "（官方接口允许两者共存；若客户端显示出问题，请把这条连同"
+                    "「本条 markdown 实际内容」一起发来）",
+                    str(kwargs.get("message_reference"))[:64], len(str(target_md)),
+                    str(target_md).count("!["),
+                )
+        except Exception:
+            pass
 
         if keyboard:
             kwargs = dict(kwargs)

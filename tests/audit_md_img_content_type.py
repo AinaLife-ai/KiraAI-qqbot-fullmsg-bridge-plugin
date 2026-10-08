@@ -55,8 +55,9 @@ class _FakeResp:
 
 class _PatchedSession(_RealSession):
     def put(self, url, **kw):
+        data = kw.get("data", b"")
         SEEN.append({"url": url, "headers": dict(kw.get("headers") or {}),
-                     "size": len(kw.get("data", b""))})
+                     "size": len(data), "data": data})
         return _FakeResp()
 
 
@@ -166,6 +167,39 @@ async def main():
     old = [{"headers": {}}]
     check("★★ 旧行为（无 Content-Type）≠ 新行为 —— 本测试能抓到该回归",
           not all(s["headers"].get("Content-Type") == "image/png" for s in old))
+
+    print("\n[2b] ★★ md 里的 GIF：也要能内嵌 ⇒ 上传前转 APNG（PNG 魔数 + acTL）")
+    try:
+        import io as _io
+
+        from PIL import Image as _PIL
+
+        _fr = [_PIL.new("RGB", (6, 6), (255, 0, 0)), _PIL.new("RGB", (6, 6), (0, 128, 255))]
+        _b = _io.BytesIO()
+        _fr[0].save(_b, "GIF", save_all=True, append_images=_fr[1:], duration=80)
+        gif = _b.getvalue()
+    except Exception as exc:
+        gif = None
+        print(f"  skip  没有 Pillow，跳过（{exc}）")
+    if gif:
+        import random as _r
+
+        _r.seed(7)
+        gdata = gif + _r.randbytes(900_000)
+        gparts = _parts(len(gdata), 400_000)
+        SEEN.clear()
+        graw = await M._upload_bytes_to_qq(_Client(gparts), "G1", True, gdata, "meme.gif",
+                                          logger=_Log())
+        check("★ md 里的 GIF 也能上传成功（拿到公网地址）", bool(graw), repr(graw))
+        _up = b"".join(s["data"] for s in SEEN)
+        check("★★★ 上传的是 **APNG**：头部是 PNG 魔数（不是 GIF）",
+              _up[:8] == b"\x89PNG\r\n\x1a\n", _up[:12].hex())
+        check("★★★ 带 acTL 动画块 ⇒ **md 里的动图有动画**（客户端支持时）",
+              b"acTL" in _up)
+        check("★★ 分片仍带图片 Content-Type（image/png）",
+              all(s["headers"].get("Content-Type", "").startswith("image/") for s in SEEN),
+              str([s["headers"] for s in SEEN]))
+        check("★ 上传的字节 != 原始 GIF 字节（确实转换过）", _up != gdata)
 
     print("\n[3] 直链自检（观测）被调用")
     check("★ 自检真的跑了（假 URL ⇒ 记一条 warning，不影响发送）",

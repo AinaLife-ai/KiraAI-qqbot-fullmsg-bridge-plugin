@@ -111,6 +111,20 @@ async def main():
 
     sent = []
 
+    def make_adapter(http):
+        """按世代造一个**新的**适配器实例（每个用例一个，互不干扰）。"""
+        if GEN == "3":
+            from core.adapter.context import AdapterContext
+            a = QQOfficialAdapter(AdapterContext(info=info, event_queue=asyncio.Queue()))
+        else:
+            a = QQOfficialAdapter(info, asyncio.Queue())
+        a.client = type("C", (), {})()
+        a.client.api = API()
+        a.client.api._http = http
+        a.client._connection = None
+        a._client_task = type("T", (), {"done": lambda s: False})()
+        return a
+
     class HTTP:
         async def request(self, route, **kw):
             sent.append({"__upload__": kw.get("json") or {}})
@@ -299,6 +313,120 @@ async def main():
           str(msg_plus[-1] if msg_plus else None)[:150])
     check("★ 链已还原成第三方元素", type(chain_plus[1]).__name__ == "StickerPlus",
           type(chain_plus[1]).__name__)
+
+    print("\n[5e] ★★★ GIF 表情包：平台拒收 GIF（850019）⇒ 上传前转成 PNG")
+    gif_b64 = None
+    try:
+        import io as _io
+
+        from PIL import Image as _PIL
+
+        frames = [_PIL.new("RGB", (8, 8), (255, 0, 0)),
+                  _PIL.new("RGB", (8, 8), (0, 255, 0))]
+        buf = _io.BytesIO()
+        frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], duration=100)
+        gif_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as exc:
+        print(f"  skip  没有 Pillow，跳过 GIF 用例（{exc}）")
+
+    if gif_b64:
+        sent.clear()
+        ch_gif = MessageChain([Text("gif 的"), Sticker("9", sticker=gif_b64, caption="动图")])
+        await ad.send_group_message("G1", ch_gif)
+        up_gif = [x["__upload__"] for x in sent if "__upload__" in x]
+        data_up = base64.b64decode(up_gif[-1].get("file_data") or "") if up_gif else b""
+        check("★★★ GIF 被转成 PNG 再上传（平台只收 png/jpg，GIF 直传=850019）",
+              data_up[:8] == b"\x89PNG\r\n\x1a\n", data_up[:12].hex())
+        check("★ file_type 仍是 1（图片）", bool(up_gif) and up_gif[-1].get("file_type") == 1)
+        check("★ 上传的不是原始 GIF 字节",
+              bool(gif_b64) and data_up != base64.b64decode(gif_b64))
+        check("★ 链已还原", type(ch_gif[1]).__name__ == "Sticker")
+
+        print("\n[5e-2] ★★ auto 模式：多帧 GIF ⇒ **APNG**（保动画，仍是 PNG 魔数）")
+        sent.clear()
+        ch_a = MessageChain([Sticker("11", sticker=gif_b64)])
+        await ad.send_group_message("G1", ch_a)
+        up_a = [x["__upload__"] for x in sent if "__upload__" in x]
+        d_a = base64.b64decode(up_a[-1].get("file_data") or "") if up_a else b""
+        check("★★ APNG：头部是 PNG 魔数", d_a[:8] == b"\x89PNG\r\n\x1a\n", d_a[:12].hex())
+        check("★★ APNG：带 acTL 动画块（动画保住了）", b"acTL" in d_a)
+        check("★ file_type 仍是 1", bool(up_a) and up_a[-1].get("file_type") == 1)
+
+        print("\n[5e-3] ★★★ 平台仍拒收（850019）⇒ **自动改按文件发**（原始 GIF 字节，只一次）")
+        import media_types as _MT
+
+        class RejectHTTP(HTTP):
+            """图片上传一律以"格式不支持"拒（模拟真机上的 GIF 被拒）。"""
+
+            def __init__(self):
+                super().__init__()
+                self.n_img = 0
+                self.attempts = []
+
+            async def request(self, route, **kw):
+                body = kw.get("json") or {}
+                if body.get("file_type") == 1:
+                    self.n_img += 1
+                    self.attempts.append(body)     # 记下这次尝试再拒
+                    raise RuntimeError("400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                return await super().request(route, **kw)
+
+        rej = RejectHTTP()
+        ad_rej = make_adapter(rej)
+        p_rej = bridge_main.QQOfficialGroupBridge(
+            type("CtxR", (), {"adapter_mgr": type("M", (), {
+                "get_adapter": lambda self, n: ad_rej,
+                "get_adapters": lambda self: {"qqo": ad_rej}})(),
+                "sticker_manager": _StickerMgr(1)})(),
+            {"section_basic": {"enabled": True}, "section_proactive": {"proactive_enabled": True}})
+        p_rej._attach(ad_rej, "qqo", {})
+        sent.clear()
+        ch_r = MessageChain([Text("试试"), Sticker("12", sticker=gif_b64)])
+        await ad_rej.send_group_message("G1", ch_r)
+        ups = [x["__upload__"] for x in sent if "__upload__" in x] + rej.attempts
+        types = [u.get("file_type") for u in ups]
+        check("★★★ 先按图片试过（file_type=1）", 1 in types, str(types))
+        check("★★★ 被拒后**改按文件发**（file_type=4）", 4 in types, str(types))
+        fb = [u for u in ups if u.get("file_type") == 4]
+        check("★★ 文件发的是**原始 GIF 字节**（不是转出来的 PNG）",
+              bool(fb) and base64.b64decode(fb[-1].get("file_data") or "") == base64.b64decode(gif_b64))
+        check("★ 只重试一次（图片 1 次 + 文件 1 次）", rej.n_img == 1, str(rej.n_img))
+        msg_r = [x for x in sent if "__upload__" not in x and "__url_upload__" not in x]
+        check("★★ 最终仍以富媒体消息发出（表情包没丢）",
+              bool(msg_r) and msg_r[-1].get("msg_type") == 7 and msg_r[-1].get("media"),
+              str(msg_r[-1] if msg_r else None)[:120])
+
+        print("\n[5e-4] ★★ file 模式：GIF **原样按文件发**（保留动图，不转换）")
+        ad_f = make_adapter(HTTP())
+        p_file = bridge_main.QQOfficialGroupBridge(
+            type("CtxF", (), {"adapter_mgr": type("M2", (), {
+                "get_adapter": lambda self, n: ad_f,
+                "get_adapters": lambda self: {"qqo": ad_f}})(),
+                "sticker_manager": _StickerMgr(1)})(),
+            {"section_basic": {"enabled": True, "gif_sticker_mode": "file"},
+             "section_proactive": {"proactive_enabled": True}})
+        check("★ 配置读到了", p_file.gif_sticker_mode == "file")
+        p_file._attach(ad_f, "qqo", {})
+        sent.clear()
+        ch_f = MessageChain([Sticker("13", sticker=gif_b64)])
+        await ad_f.send_group_message("G1", ch_f)
+        up_f = [x["__upload__"] for x in sent if "__upload__" in x]
+        check("★★ 直接按文件发（file_type=4），零转换",
+              bool(up_f) and up_f[-1].get("file_type") == 4, str(up_f[-1].get("file_type") if up_f else None))
+        check("★★ 发出去的还是原始 GIF 字节",
+              bool(up_f) and base64.b64decode(up_f[-1].get("file_data") or "")
+              == base64.b64decode(gif_b64))
+        check("★ 带上了文件名（file_type=4 才有效）",
+              bool(up_f) and str(up_f[-1].get("file_name", "")).endswith(".gif"),
+              str(up_f[-1].get("file_name") if up_f else None))
+
+        print("\n[5f] 已经 OK 的格式（png/jpg）**原样上传**，不做多余转换")
+        sent.clear()
+        ch_png = MessageChain([Sticker("10", sticker=STICKER_B64)])
+        await ad.send_group_message("G1", ch_png)
+        up_png = [x["__upload__"] for x in sent if "__upload__" in x]
+        check("★★ PNG 一个字节都没动",
+              bool(up_png) and base64.b64decode(up_png[-1].get("file_data") or "") == PNG)
 
     print("\n[6] ★ 关掉插件 ⇒ 类型清单恢复原样")
     p._restore_all()

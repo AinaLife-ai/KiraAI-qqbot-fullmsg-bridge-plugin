@@ -206,6 +206,73 @@ def main():
           and "展览" in str(g2["markdown"].get("content")), str(g2.get("markdown")))
 
     # ---------------- 3. 单发 md（无 reply）也要正常 ----------------
+    print("\n[2b] ★★★ 用户点名场景：**引用 + markdown + 本地图片** 一条发出（报文级）")
+    # 用假的本地上传通道：把图片转存伪造成一个公网地址
+    import md_media as _mdm
+
+    async def _fake_fix(md_text, *, client=None, target_id="", is_group=False,
+                        adapter=None, logger=None):
+        # 只替换 URL（结构逐字保留），等价于真实的 "_fix_md_images"
+        return md_text.replace("data/temp/x.jpg", "https://cos.example.com/x.png?sig=1")
+
+    _orig_fix = _mdm.fix_markdown_images
+    _mdm.fix_markdown_images = _fake_fix
+    try:
+        sent.clear()
+        loop.run_until_complete(send(
+            "G1",
+            MessageChain([Reply("REFIDX_abc==", chain=None),
+                          MarkdownText("## 标题\n![图](data/temp/x.jpg)")])))
+        got3 = sent[-1] if sent else {}
+        check("★★★ 只发出**一条**请求（没有重复发送）", len(sent) == 1, str(len(sent)))
+        check("★★ msg_type=2（按 markdown 发）", got3.get("msg_type") == 2, str(got3)[:140])
+        # 说明：框架把 `<reply>` 元素落成**被动回复锚点**（payload["msg_id"]），
+        # 客户端就渲染成"引用某条消息"；`message_reference` 是另一条形态
+        # （引用**别的**消息时用）。两者都是"引用"，这里要求**有其中一个**、
+        # 且与 markdown 同时存在（用户点名要确认的点）。
+        _has_ref = bool(got3.get("message_reference")) or bool(got3.get("msg_id"))
+        check("★★ 「引用」与 markdown **同时存在**（锚点 msg_id 或 message_reference）",
+              _has_ref and bool(got3.get("markdown")),
+              str(got3)[:140])
+        check("★★ 本地图片已被换成公网地址（不是 data/temp 了）",
+              "data/temp" not in str((got3.get("markdown") or {}).get("content") or "")
+              and "cos.example.com" in str((got3.get("markdown") or {}).get("content") or ""),
+              str((got3.get("markdown") or {}).get("content"))[:120])
+        check("★ 正文里没有 [Unsupported message element]",
+              "[Unsupported" not in str(got3.get("content") or ""), str(got3)[:140])
+    finally:
+        _mdm.fix_markdown_images = _orig_fix
+
+    print("\n[2c] ★★★ markdown **不带引用**（官方 SDK：两者互斥；用户实测带引用 md 渲染不正常）")
+    # 用一个"显式引用"的链（带 Reply 元素 ⇒ 核心会填 message_reference）
+    sent.clear()
+    loop.run_until_complete(send(
+        "G1", MessageChain([Reply("REFIDX_abc==", chain=None),
+                            MarkdownText("## 带引用发 md")])))
+    got4 = sent[-1] if sent else {}
+    check("★★★ 发出去的 md **没有 message_reference**",
+          not got4.get("message_reference"), str(got4)[:160])
+    check("★★ msg_type=2 且 markdown 正文在", got4.get("msg_type") == 2
+          and bool((got4.get("markdown") or {}).get("content")), str(got4)[:120])
+    check("★★ 被动回复锚点 msg_id **保留**（配额/时效不变）",
+          bool(got4.get("msg_id")), str(got4.get("msg_id")))
+
+    print("\n[2d] 关掉开关 ⇒ 保持框架原样（引用照发）")
+    _p = p if "p" in dir() else globals().get("p")
+    if _p is not None:
+        _p.md_drop_reference = False
+        try:
+            sent.clear()
+            loop.run_until_complete(send(
+                "G1", MessageChain([Reply("REFIDX_abc==", chain=None),
+                                    MarkdownText("## 引用照发")])))
+            got5 = sent[-1] if sent else {}
+            check("★ 关掉后引用回来了（message_reference 存在）",
+                  bool(got5.get("message_reference")) or bool(got5.get("msg_id")),
+                  str(got5)[:140])
+        finally:
+            _p.md_drop_reference = True
+
     print("\n[3] 对照：单独发 markdown（无 reply）")
     sent.clear()
     loop.run_until_complete(send(

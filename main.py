@@ -240,6 +240,43 @@ def _group_names_path():
             return None
 
 
+#: 横幅只打一次（每次进程）
+_BANNER_DONE = False
+
+
+def _log_banner_once() -> None:
+    """打一条"信息量大"的启动横幅（**排查问题的第一现场**）。
+
+    为什么要它：用户反馈问题时最常说"我更新了"，但**日志里没有办法确认跑的是哪一版**；
+    语音问题又高度依赖两个外部件（silk 编码器 / ffmpeg）。
+    ⇒ 每次挂载打一行：版本 + 语音转码依赖 + 图片规范化依赖 + 表情包状态。
+    """
+    global _BANNER_DONE
+    if _BANNER_DONE:
+        return
+    _BANNER_DONE = True
+    try:
+        import audio_silk
+
+        enc = audio_silk._silk_encoder()
+        ffm = audio_silk._ffmpeg_exe()
+        silk_ok = f"✅{enc}" if enc else "❌未安装（语音条会退化成文件卡片）"
+        ff_ok = "✅" if ffm else "❌未安装"
+    except Exception:
+        silk_ok, ff_ok = "?", "?"
+    try:
+        from PIL import Image as _I  # noqa: F401
+
+        pil_ok = "✅"
+    except Exception:
+        pil_ok = "❌未安装（GIF/WEBP 图片无法转成平台接受的 PNG）"
+    logger.info(
+        "[QQBOT-BRIDGE] ╔═ 版本 v%s｜语音转码：silk 编码器=%s、ffmpeg=%s｜"
+        "图片规范化(Pillow)=%s═╗ 想确认问题请先看这一行（日志里搜 QQBOT-BRIDGE）",
+        _plugin_version(), silk_ok, ff_ok, pil_ok,
+    )
+
+
 def _split_keywords(value) -> tuple:
     """把配置里的"逗号/空格/顿号分隔"关键词串切成去重小写元组。"""
     import re as _re
@@ -312,6 +349,11 @@ class QQOfficialGroupBridge(BasePlugin):
         #: 表情包标签关键词（逗号分隔；默认 sticker —— 它同时覆盖内置表情包插件
         #: 与第三方「增强表情包」sticker-plus，两家都是看这个词才注册标签）
         self.sticker_tags = _split_keywords(basic.get("sticker_tags", "sticker"))
+        #: markdown 消息是否丢掉引用（message_reference）——官方 SDK 让两者互斥，默认开
+        self.md_drop_reference = bool(basic.get("md_drop_reference", True))
+        #: GIF/动图的发送方式：auto（默认：尽量内嵌显示，被平台拒就按文件发）/
+        #: image（只按图片发）/ file（原样按文件发，保留动图）
+        self.gif_sticker_mode = str(basic.get("gif_sticker_mode", "auto") or "auto").strip().lower()
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -624,6 +666,7 @@ class QQOfficialGroupBridge(BasePlugin):
         if report or self._last_report != names:
             self._last_report = names
             logger.info("[QQBOT-BRIDGE] 已挂载到适配器: %s", ", ".join(n for n, _ in adapters))
+            _log_banner_once()
 
     @staticmethod
     def _connection_state_cls():
@@ -1065,7 +1108,7 @@ class QQOfficialGroupBridge(BasePlugin):
             holder = self._capability_of(adapter)
             if not hasattr(holder, "_upload_file"):
                 holder = adapter            # 2.x：在适配器实例上
-            if _install_media_types(holder, client, logger):
+            if _install_media_types(holder, client, logger, self):
                 self._media_types_holders[name] = holder
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 安装媒体类型修正失败（不影响其它功能）: %s", exc)
@@ -2046,6 +2089,31 @@ class QQOfficialGroupBridge(BasePlugin):
             logger.debug("[QQBOT-BRIDGE] 输入中状态：调度失败（忽略）: %s", exc)
             return False
 
+    def _shared_msg_seq(self, adapter, target: str, msg_id: str) -> int:
+        """取该 msg_id 的**下一个**序号，并让框架的下一条从它之后继续（官方同款做法）。
+
+        拿不到框架计数器时（结构变了 / 2.x 形状不同）退回独立编号 1000+，
+        行为与 v1.6.2~1.6.7 一致（仍然可用，只是不在同一条序列上）。
+        """
+        try:
+            seqs = self._adapter_attr(adapter, "_reply_msg_seqs")
+        except Exception:
+            seqs = None
+        if isinstance(seqs, dict):
+            key = (False, str(target), str(msg_id))
+            try:
+                used = int(seqs.get(key, 0) or 0)
+            except Exception:
+                used = 0
+            seq = used + 1
+            try:
+                seqs[key] = seq          # ← 写回：框架的下一条从 seq+1 开始
+            except Exception:
+                pass
+            return seq
+        self._typing_seq = (getattr(self, "_typing_seq", 1000) + 1) % 60000
+        return self._typing_seq
+
     async def _send_typing(self, adapter, client, target: str, msg_id: str) -> None:
         """真正发出「输入中」状态。
 
@@ -2060,9 +2128,17 @@ class QQOfficialGroupBridge(BasePlugin):
             http = getattr(api, "_http", None)
             if http is None:
                 return
-            # msg_seq：与核心的 1..N 序号**刻意错开**（官方 SDK 用递增计数，
-            # Hermes 用随机数），避免和真正的回复撞 "同一 msg_id+msg_seq 重复"。
-            seq = self._typing_seq = (getattr(self, "_typing_seq", 1000) + 1) % 60000
+            # ★★ msg_seq：**接进框架自己的那条序列**（同一个 msg_id 上单调递增）。
+            #
+            #   为什么不再自己另起一套（v1.6.2~v1.6.7 用的是 1000+ 的独立编号）：
+            #   平台对"同一个 msg_id"是有去重的（错误码 40054005「消息被去重，请检查请求
+            #   msgseq」）。独立编号虽然**等于**框架的某个值概率极低，但序号语义上
+            #   与框架的 1..N 是两套；一旦平台的判定从"相等"变成"必须递增"，
+            #   我们前面用过的高位序号就会让框架接下来的回复被判重复。
+            #   官方 Node SDK 的做法就是**同一个计数器供所有发送共用**（`getNextMsgSeq`）
+            #   ⇒ 这里改成：读框架的计数器、用掉一格、**再写回去**，
+            #   这样我们的状态帧与框架的回复处在同一条递增序列里，不可能互相踩。
+            seq = self._shared_msg_seq(adapter, target, msg_id)
             route = Route("POST", "/v2/users/{openid}/messages", openid=target)
             await http.request(route, json={
                 "msg_type": 6,
@@ -2073,9 +2149,11 @@ class QQOfficialGroupBridge(BasePlugin):
             if not self._typing_logged:
                 self._typing_logged = True
                 logger.info(
-                    "[QQBOT-BRIDGE] 已在私聊里发「输入中…」状态（msg_type=6，%d 秒）——"
-                    "官方能力，KiraAI 核心没有；只在单聊生效，发失败不影响回复",
-                    self._TYPING_SECONDS,
+                    "[QQBOT-BRIDGE] 已在私聊里发「输入中…」状态（msg_type=6，%d 秒，"
+                    "msg_seq=%s 与框架共用同一条序号）—— 它显示在聊天**顶部标题下方**"
+                    "（「正在输入…」），不是机器人名字下面的「在线」；只在单聊生效，"
+                    "发失败不影响回复",
+                    self._TYPING_SECONDS, seq,
                 )
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 输入中状态发送失败（忽略）: %s", exc)

@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.7
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -130,6 +130,8 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
 | `c2c_stream_enabled` | 开 | **私聊流式消息**（官方 `stream_messages`）：把模型**正在生成的文字**实时写到那条消息上（约 0.5s 就能看到字，来源是提速器的 token 流）。**一条消息就是一条**：多段回复仍然是多条，绝不合并；没有预览就不接管（报文与从前完全一致）。只对单聊纯文本生效，失败一律回退普通发送 |
 | `sticker_tags` | **sticker** | **表情包标签关键词**（逗号分隔）：填进来的词会被补进适配器声明的类型清单（框架里的表情包插件正是看到这个词才注册自己的标签），且这些词对应的元素发送时按**图片**发出（`file_type=1`）。内置表情包用 `sticker`；第三方「增强表情包」是 `<sticker_plus>` 标签，填 `sticker` 即可覆盖。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效 |
+| `gif_sticker_mode` | **auto** | **GIF/动图怎么发**：`auto` = 优先内嵌显示（动图转 **APNG** 保留动画、静图转 PNG；平台仍拒收就**自动改按文件发**）、`image` = 只按图片发、`file` = GIF **原样按文件发**（保动图，要点开下载）。**png/jpg 三种模式下都一个字节都不动**；超过图片软限制(20MB)直接按文件发 |
+| `md_drop_reference` | **开** | **markdown 不带引用**：官方 Node SDK 让 markdown 与 `message_reference` **互斥**（markdown 时绝不带引用）；实测两者同发会让 QQ 的 md 渲染不正常（图片不显示、正文异常）。打开后本条是 markdown 就去掉引用，**被动回复锚点 `msg_id` 保留**（配额/时效不变）。关掉则保持框架原样 |
 | `extra_intents` | **开** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；插件会在连接时自动补上订阅位并请一次重连，**需重启 KiraAI** 生效。个别环境被平台拒绝订阅时会自动回退 |
 
 ### 关于「发文件」——本插件**不做**（框架原生已支持）
@@ -452,6 +454,107 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.8</b> — ★★★ GIF 表情包转 PNG + 语音排障（日志级别/启动横幅）+ 输入中序号修正</summary>
+
+### 1. ★★★ GIF：**官方上传接口只收 png/jpg**，实测 GIF 被拒
+
+用户实测（日志）：
+
+```
+POST /v2/users/{openid}/files → 400
+{'message': '富媒体文件格式不支持', 'code': 850019}
+```
+
+**文档自相矛盾，以上传接口为准**：概览页写「图片：支持 jpg/png/gif/webp/bmp」，但
+**上传接口文档**（单聊/群聊富媒体上传）写的是「`1=图片(png/jpg)`」。
+
+**三家官方/官方推荐实现都不做图片格式转换**（都查过源码）：
+
+| 实现 | 图片走的链路 | 遇到 GIF |
+|---|---|---|
+| 官方 Node SDK `@tencent-connect/qqbot-nodejs` | `MediaApi.uploadMedia` 原样 base64 上传（SDK 里**只有音频转换**，没有任何图片转换） | 一样失败 |
+| 官方 openclaw-qqbot | 走同一个 SDK | 一样失败 |
+| QQ 官方推荐的 Hermes | `send_image_file` → `_send_media` → `_upload_local_file` **原样上传，无格式校验/转换** | 一样失败 |
+
+⇒ **我们的做法比它们都进一步**（三步走，`png/jpg 一个字节都不动`）：
+
+| 情况 | 我们怎么做 |
+|---|---|
+| **动图 GIF** | 转成 **APNG**（动图版 PNG：**魔数还是 `\x89PNG`**，平台按 png 收；客户端支持就继续动） |
+| APNG 太大（>4MB）/ 转换失败 / 静图 | 转**静态 PNG**（第一帧），如实打日志 |
+| **平台仍然拒收**（850019/850031） | **自动改按「文件」再发一次**（用**原始字节**，动图下载后还是动的）—— 保证表情包**发得出去**，只是要点开看 |
+| 超过图片软限制（20MB） | 直接按文件发（平台本来也会降级） |
+
+配置项 **`gif_sticker_mode`**（默认 `auto`）：`auto` = 上面那条链路；
+`image` = 只按图片发（平台拒收就失败）；`file` = **GIF 原样按文件发**（零转换、保动图）。
+（新增依赖声明 `Pillow`；没装时不会报错，只是这类图会直接走"按文件发"。）
+
+**md 里的动图也一样**：markdown 内嵌的图片走的是同一套规范化 ⇒ **GIF 会先转成 APNG**
+（PNG 魔数 + `acTL` 动画块）再转存，于是动图在 md 里也有机会内嵌显示；
+APNG 过大或转换失败 ⇒ 静态 PNG（第一帧）。
+
+> **误伤防护**：只对"确实被转换过的图片"生效，且只在平台以**格式类错误码**拒绝时才改按文件发，
+> 只重试**一次**；语音/视频/文件元素的既有行为完全不动。
+> 想发**动图且内嵌显示**：把它放到公网 URL，用 markdown 图片 `![](url)` 发 ——
+> md 图片是平台自己下载转存（另一条链路），不受上传接口的 png/jpg 限制。
+
+### 2. ★★ 语音排障：日志级别修正 + 启动横幅 + 字节自检
+
+* 「按 `file_type=3` 上传失败 ⇒ 交回核心按文件发」这条原来在 **debug 级别**（等于没有）
+  ⇒ 改成 **WARNING** 并附上**错误码人话**（`850019`/`40093002`/`850026`…）。
+  这正是"语音变成文件卡片"的现场 —— 之前**查无可查**就是因为它没露头。
+* 新增**启动横幅**（每次挂载打一行）：**版本号 + silk 编码器/ffmpeg/Pillow 是否就位**
+  ⇒ 一眼确认"跑的是哪版""语音依赖缺不缺"。
+* 每种 `file_type` 首次上传会打一条**字节自检**（头部 hex + 大小 + file_type + 有没有带文件名）。
+
+> 语音的查证结论（三家一致，**没有第二条路**）：**必须先把音频变成 silk** ——
+> openclaw 用 `silk-wasm`（我们实测它的产物头是 `\x02#!SILK_V3`，与我们的腾讯系判定**完全一致**），
+> Hermes 则要求上游直接给出 silk 并**原样上传**。本插件已内置
+> 「ffmpeg 解码 → pysilk/pilk 编码」自动转码；**依赖缺失时日志会直接给出安装命令**
+> （`pip install silk-python imageio-ffmpeg`）。
+
+### 3. ★★★ 引用 + markdown → **md 渲染不正常**（已定案修复）
+
+**根因（官方源码实锤）**：腾讯官方 Node SDK `dist/protocol/api/messages.js`：
+
+```js
+if (messageReference && !this.markdownSupport) {     // ← 只有"非 markdown"才带引用
+    body.message_reference = { message_id: messageReference };
+}
+```
+
+⇒ **`markdown` 与 `message_reference` 互斥**。而 KiraAI 核心**不看 msg_type 一律填
+`message_reference`**（`im.py`: `reference = self._resolve_reference(...)`）⇒ 只要模型同时写了
+`<reply>` 和 `<markdown>`，本条就带上引用 ⇒ QQ 里 **md 渲染不正常（图片不显示）**。
+用户实测印证：同样内容**不带 reply 就一切正常** ✓、**带 @ 没事** ✓（@ 不产生引用）。
+
+**修法（插件侧）**：发 markdown 时**丢掉 `message_reference`**，行为与官方 SDK 一致；
+**`msg_id` 保留** ⇒ 仍是被动回复，配额与时效完全不变。配置项 `md_drop_reference`（默认开）
+
+用户反馈：机器人**带引用**发 md 时看起来"渲染不正常"。我们这一侧用**报文级测试**钉死：
+
+* 引用 + markdown + 本地图片 ⇒ **只发出一条请求**、`msg_type=2`、
+  **引用锚点（`msg_id`）与 markdown 同时存在**、本地图已换成公网地址、无占位文本；
+* 另外新增一条**观测日志**：本条同时带引用与 markdown 时，把报文形状（msg_type /
+  锚点 / markdown 长度 / 图片数）如实打出来 —— 以后不用猜。
+
+> 如果你看到正文**重复了两遍**，请顺手在日志里搜这几个关键词，能直接定位是谁发的：
+> `[accel] 剥离后剩余文本里仍含已抢发的段`（抢发段的剥离失败 ⇒ 框架补发了一次）、
+> `markdown 发送失败`（我们的 md 退回纯文本重发）、以及 `QQBOT-BRIDGE`（我们发的报文）。
+> 三者的日志里都会有明确记录。
+
+### 4. ★ 输入中状态：序号接进框架自己的序列
+
+原来用独立编号（1000+）；现在改为**读框架的 `msg_seq` 计数器、用掉一格、再写回去**
+（官方 Node SDK 就是"同一个计数器供所有发送共用"）。这样状态帧与正式回复处在
+**同一条递增序列**上，不可能互相踩（平台对同一 `msg_id` 是有去重的：`40054005`）。
+
+> 顺带说明：**它显示在聊天顶部的标题下方**（「正在输入…」），
+> 不是机器人名字下面那个「在线」——「在线」是在线状态，跟这个能力无关。
+
+</details>
+
+<details>
 <summary><b>v1.6.7</b> — ★★★ 让官 bot 能发**表情包**（框架内置插件的 `<sticker>` 标签）</summary>
 
 ### 现象（用户日志）
