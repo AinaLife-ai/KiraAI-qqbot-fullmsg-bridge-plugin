@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.7
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.5.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -448,6 +448,73 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.5.8</b> — ★★ 图片尺寸**必需且必须真实**（用户拿到了决定性证据）</summary>
+
+### 决定性证据
+
+用户给了一个**没装本插件**的 KiraAI 3.0 **成功显示图片**的例子 ——
+它用的正是 **QQ 官方文档里那个示例原样**：
+
+```
+![text #208px #320px](https://resource5-.../abcmouse_word_watch/markdown/building.png)
+             ^^^^^^^^^^ 官方示例本身就是带尺寸的
+```
+
+官方文档「图片」节的原话：
+
+> 图片：`![text #wpx #hpx](图片链接)` —— **必须带尺寸**，否则可能加载失败
+
+### 我踩过的两个坑（都在这一版收口）
+
+| 做法 | 结果 |
+|------|------|
+| `![alt](url)`（**不带尺寸**） | 只显示 `[alt 文字]` —— 图渲染不出来 |
+| `![alt #0 #0](url)`（**假尺寸**） | **连占位都没有** —— QQ 把它当真实的 0×0 像素 ⇒ 零尺寸 ⇒ 不可见 |
+| **`![alt #208px #320px](url)`（真实尺寸）** | ✅ **正常显示**（用户实测成功） |
+
+⇒ 结论很清楚：**尺寸是必需的，而且必须填图片的真实宽高**。
+
+### 本版实现
+
+替换图片 URL 时，**顺便把真实宽高读出来填进去**：
+
+* **本地图** → 用 Pillow 读（读不出则退回手写 PNG/JPEG/GIF/WEBP 文件头解析，零依赖）；
+* **远程图** → 转存时我们**本来就要把字节下载下来**，顺手算一次 —— **零额外开销**；
+  尺寸在**压缩之前**读，保证填的是原图真实宽高。
+
+**拿不到尺寸时保持原样（不加）** —— 宁可维持"有占位"的现状，
+也不能塞个假值把它变成"完全不可见"。
+
+```
+![香香立绘](data/temp/pic.png)
+   ↓
+![香香立绘 #300px #180px](https://cos.xxx/xxx?sign=...)
+```
+
+md 正文依旧**零改动** —— 只动图片的尺寸后缀与 URL。
+
+### 诊断日志
+
+```
+[QQBOT-BRIDGE] markdown 图片处理：共 1 张，1 张换成了公网地址，1 张补上了真实尺寸
+              （QQ 的 md 图片**必须**带 `#宽px #高px`，否则不渲染）
+```
+
+### 测试
+
+`tests/audit_md_img_real_size.py`（**10 断言**）：
+
+* PNG 各种尺寸（含 1×1、1600×900）读取正确；
+* JPEG / 本地文件读取正确；
+* 有真实尺寸 ⇒ 补 `#Wpx #Hpx`；
+* **拿不到尺寸 ⇒ 不加**（不塞假值）；
+* 模型已写尺寸 ⇒ 不动；0 尺寸 ⇒ 不加。
+
+**双世代全量：2.x ALL PASSED ／ 3.0 ALL PASSED。**
+
+</details>
+
+<details>
 <summary><b>v1.5.7</b> — 撤销我上一版的错改（#0 #0 让图**完全消失**）+ 补诊断日志</summary>
 
 ### ⚠️ 先说我的错

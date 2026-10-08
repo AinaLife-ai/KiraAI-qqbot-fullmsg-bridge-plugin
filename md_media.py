@@ -65,26 +65,107 @@ _REMOTE_RE = re.compile(r"^https?://", re.I)
 _SIZE_RE = re.compile(r"#[^#\]]*(?:px)?\s*#[^#\]]*(?:px)?\s*$")
 
 
-def _ensure_size(alt: str) -> str:
-    """**原样返回 alt** —— 我们不再补尺寸了。
+def _ensure_size(alt: str, width: Optional[int] = None,
+                 height: Optional[int] = None) -> str:
+    """给图片 alt 补上 QQ 要求的**真实尺寸** `#Wpx #Hpx`。
 
-    ## ★★★ 为什么回退（2026-10-08 线上实测）
+    ## ★★★ 为什么必须带尺寸、而且必须填**真实值**（2026-10-08 用户实测）
 
-    v1.5.6 我给所有图片补了 `#0 #0`（依据是 Koishi 论坛有人说
-    「图片可以使用 `![img#0 #0]` 进行自动缩放」）。结果**更糟**：
+    用户给了一个**没装本插件**的 KiraAI 3.0 成功示例 —— 它用的是
+    **QQ 官方文档里那个示例原样**：
 
-    * 之前：`![香香立绘](url)` → 群里显示 `[香香立绘]`（至少有个占位）
-    * 之后：`![香香立绘 #0 #0](url)` → 群里**什么都没有**（连占位都没了）
+        ![text #208px #320px](https://resource5-…/building.png)
+                     ^^^^^^^^^^ 官方示例本身就是带尺寸的
 
-    用户原话：「**md图片都没有占位符了**」。
+    官方文档「图片」节的原话：
 
-    推断：QQ 把 `#0 #0` 当成**真实的 0×0 像素** ⇒ 图渲染成零尺寸
-    ⇒ 完全不可见。那句论坛经验多半只适用于**模板插值**场景，不适用于自定义 content。
+        图片：`![text #wpx #hpx](图片链接)`
+        **必须带尺寸**，否则可能加载失败
 
-    ⇒ **不猜了**：模型自己写了尺寸就尊重它，没写就不加。
-      要不要加、加多少，等有确定性证据再说。
+    ### 我踩过的两个坑（都别再犯）
+
+    1. **不带尺寸** ⇒ 群里只显示 `[alt 文字]`（图渲染不出来）；
+    2. **带 `#0 #0`** ⇒ 群里**连占位都没有**（QQ 把它当**真实 0×0 像素**，
+       渲染成零尺寸 ⇒ 完全不可见）。
+
+    ⇒ 所以**必须填图片的真实宽高**。本地图用 Pillow 读；
+    远程图从下载到的字节里读（见 `fix_markdown_images`）。
+
+    拿不到尺寸时**保持原样**（不加）—— 宁可维持"有占位"的现状，
+    也不能塞个假尺寸把它变成"完全不可见"。
     """
-    return alt or ""
+    a = (alt or "").rstrip()
+    if _SIZE_RE.search(a):
+        return a                       # 模型/用户已经写了尺寸 ⇒ 尊重它
+    if not width or not height:
+        return a                       # 拿不到真实尺寸 ⇒ **不加**（别塞假值）
+    return f"{a} #{int(width)}px #{int(height)}px".strip()
+
+
+def _image_size_from_bytes(data: bytes) -> Optional[Tuple[int, int]]:
+    """从图片字节里读真实宽高；读不出返回 None。
+
+    Pillow 可用就用 Pillow（格式支持最全），否则退回手写 PNG/JPEG 头解析
+    （这两种覆盖了绝大多数情况，且**零依赖**）。
+    """
+    if not data:
+        return None
+    try:
+        import io
+        from PIL import Image as _PILImage
+        with _PILImage.open(io.BytesIO(data)) as im:
+            w, h = im.size
+            if w and h:
+                return int(w), int(h)
+    except Exception:
+        pass
+    return _size_from_header(data)
+
+
+def _size_from_header(data: bytes) -> Optional[Tuple[int, int]]:
+    """不依赖 Pillow 的兜底：直接读 PNG / JPEG / GIF / WEBP 文件头。"""
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+            w = int.from_bytes(data[16:20], "big")
+            h = int.from_bytes(data[20:24], "big")
+            return (w, h) if w and h else None
+        if data[:3] == b"\xff\xd8\xff":
+            i = 2
+            n = len(data)
+            while i + 9 < n:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+                # SOF0..SOF3 / SOF5..SOF7 / SOF9..SOF11 / SOF13..SOF15
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h = int.from_bytes(data[i + 5:i + 7], "big")
+                    w = int.from_bytes(data[i + 7:i + 9], "big")
+                    return (w, h) if w and h else None
+                i += 2 + seg_len
+            return None
+        if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+            w = int.from_bytes(data[6:8], "little")
+            h = int.from_bytes(data[8:10], "little")
+            return (w, h) if w and h else None
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+            fmt = data[12:16]
+            if fmt == b"VP8X":
+                w = int.from_bytes(data[24:27], "little") + 1
+                h = int.from_bytes(data[27:30], "little") + 1
+                return w, h
+            if fmt == b"VP8 " and len(data) >= 30:
+                w = int.from_bytes(data[26:28], "little") & 0x3FFF
+                h = int.from_bytes(data[28:30], "little") & 0x3FFF
+                return (w, h) if w and h else None
+    except Exception:
+        pass
+    return None
 
 _MIME_BY_EXT = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -377,8 +458,8 @@ async def upload_local_to_public_url(
 
 async def upload_remote_to_public_url(
     client: Any, target_id: str, is_group: bool, url: str,
-    logger: Any = None, timeout: float = 30.0,
-) -> Optional[str]:
+    logger: Any = None, timeout: float = 30.0, want_size: bool = False,
+):
     """**远程图片** → 转存到 QQ 自己的 COS，返回公网 URL。
 
     ## ★★★ 为什么要做这件事（2026-10-07 的教训）
@@ -399,14 +480,19 @@ async def upload_remote_to_public_url(
     顺便还能把过大的图**压缩**到软限制内。
     """
     if not url:
-        return None
+        return (None, None) if want_size else None
     data = await _fetch_bytes(url, logger=logger, timeout=timeout)
     if not data:
-        return None
+        return (None, None) if want_size else None
+    # ★ 尺寸要在**压缩之前**读（压缩会缩尺寸），这样填进去的是原图真实宽高
+    size = _image_size_from_bytes(data)
     # 太大的图先压缩（官方软限制：图片 20 MB，超过会降级成"文件"）
     data, name = await _shrink_if_needed(data, url, logger=logger)
-    return await _upload_bytes_to_qq(client, target_id, is_group, data, name,
-                                     logger=logger)
+    pub = await _upload_bytes_to_qq(client, target_id, is_group, data, name,
+                                    logger=logger)
+    if want_size:
+        return pub, size
+    return pub
 
 
 async def _fetch_bytes(url: str, logger: Any = None,
@@ -555,22 +641,31 @@ async def fix_markdown_images(
     #   所以 md 结构、图片顺序、行数全都不变。
     sem = asyncio.Semaphore(_MAX_CONCURRENT)
 
-    async def _resolve_one(idx: int, alt: str, url: str) -> Tuple[int, str]:
+    async def _resolve_one(idx: int, alt: str, url: str) -> Tuple[int, str, Optional[Tuple[int, int]]]:
+        """返回 `(下标, 新URL, 尺寸或None)`。
+
+        ★ 尺寸必须**在这里一起拿到**（2026-10-08 定案）：
+          * 本地图 → 直接读文件算尺寸；
+          * 远程图 → 转存时我们**已经把字节下载下来过**，顺手算一次，零额外开销；
+          * 拿不到 → None（下游就**不加尺寸**，保持原样）。
+        """
         async with sem:
             try:
-                return idx, await _resolve_image_url(
+                new_url, size = await _resolve_image_url(
                     url, client=client, target_id=target_id, is_group=is_group,
-                    adapter=adapter, logger=logger)
+                    adapter=adapter, logger=logger, want_size=True)
+                return idx, new_url, size
             except Exception as exc:
                 if logger is not None:
                     logger.debug("[QQBOT-BRIDGE] 处理第 %d 张图失败（原样保留）: %s", idx, exc)
-                return idx, url
+                return idx, url, None
 
     results = await _gather_with_budget(
         {i: _resolve_one(i, m.group("alt"), m.group("url"))
          for i, m in enumerate(matches)},
         logger=logger)
-    new_urls = dict(results)
+    new_urls = {idx: url for idx, url, _sz in results}
+    sizes = {idx: sz for idx, _url, sz in results}
 
     out = []
     last = 0
@@ -581,12 +676,19 @@ async def fix_markdown_images(
         new_url = new_urls.get(i, url)
         if new_url != url:
             changed += 1
-        out.append(f"![{_ensure_size(alt)}]({new_url})")
+        _sz = sizes.get(i)
+        _w, _h = _sz if _sz else (None, None)
+        out.append(f"![{_ensure_size(alt, _w, _h)}]({new_url})")
         last = m.end()
     out.append(md_text[last:])
 
-    if changed and logger is not None:
-        logger.info("[QQBOT-BRIDGE] markdown 内 %d 张图片已换成可访问地址（格式未改动）", changed)
+    if logger is not None and ("![" in md_text):
+        _with = sum(1 for i, _m in enumerate(matches) if sizes.get(i))
+        logger.info(
+            "[QQBOT-BRIDGE] markdown 图片处理：共 %d 张，%d 张换成了公网地址，%d 张补上了真实尺寸"
+            "（QQ 的 md 图片**必须**带 `#宽px #高px`，否则不渲染）",
+            len(matches), changed, _with,
+        )
     return "".join(out)
 
 
@@ -645,10 +747,15 @@ async def _gather_with_budget(tasks: Dict[int, Any], logger: Any = None) -> List
 
 
 async def _resolve_image_url(url: str, *, client: Any, target_id: str,
-                             is_group: bool, adapter: Any, logger: Any) -> str:
-    """把**一个**图片地址解析成 QQ 能下载到的地址；任何失败都原样返回。"""
+                             is_group: bool, adapter: Any, logger: Any,
+                             want_size: bool = False):
+    """把**一个**图片地址解析成 QQ 能下载到的地址；任何失败都原样返回。
+
+    `want_size=True` 时返回 `(新URL, (宽,高) 或 None)` —— 尺寸用来补
+    QQ md 图片**必需**的 `#Wpx #Hpx` 后缀（见 `_ensure_size`）。
+    """
     if not url:
-        return url
+        return (url, None) if want_size else url
     if _is_remote(url):
         # ★★★ 远程图也**转存到 QQ 自己的 COS**（不再只是"验真"）。
         #
@@ -664,19 +771,28 @@ async def _resolve_image_url(url: str, *, client: Any, target_id: str,
         cached = _cache_get(_URL_CACHE, url)
         if cached is None:
             pub = None
+            size = None
             try:
-                pub = await upload_remote_to_public_url(
-                    client, target_id, is_group, url, logger=logger)
+                # ★ 转存时我们**本来就要把字节下载下来**，顺手把真实尺寸也算出来，
+                #   零额外开销（尺寸是 QQ md 图片的**必需项**，见 `_ensure_size`）。
+                pub, size = await upload_remote_to_public_url(
+                    client, target_id, is_group, url, logger=logger, want_size=True)
             except Exception as exc:
                 if logger is not None:
                     logger.debug("[QQBOT-BRIDGE] 远程图转存失败: %s", exc)
             if pub:
                 cached = pub
             else:
-                # 转存不成 ⇒ 退回"验真"：能确认真图就保留原地址
+                # 转存不成 ⇒ 退回"验真"：能确认真图就保留原地址（也许平台能转成功）
                 real = await resolve_image_url(client, url, logger=logger)
                 cached = real or url
-            _cache_put(_URL_CACHE, url, cached, _URL_TTL)
+            _cache_put(_URL_CACHE, url, (cached, size), _URL_TTL)
+        elif isinstance(cached, tuple):
+            cached, size = cached
+        else:
+            size = None
+        if want_size:
+            return cached, size
         return cached
 
     # 本地路径：转存成公网 URL（按 (路径,大小,mtime) 缓存，避免重复上传）
@@ -687,7 +803,7 @@ async def _resolve_image_url(url: str, *, client: Any, target_id: str,
         if os.path.exists(cand):
             path = cand
     if not os.path.exists(path):
-        return url
+        return (url, None) if want_size else url
     key = _digest(path)
     cached = _cache_get(_LOCAL_CACHE, key)
     if cached is None:
@@ -695,4 +811,24 @@ async def _resolve_image_url(url: str, *, client: Any, target_id: str,
             client, target_id, is_group, path, logger=logger)
         cached = pub or url
         _cache_put(_LOCAL_CACHE, key, cached, _LOCAL_TTL)
+    if want_size:
+        return cached, _local_image_size(path)
     return cached
+
+
+def _local_image_size(path: str) -> Optional[Tuple[int, int]]:
+    """读本地图片的真实宽高（Pillow 优先，失败退回读文件头）。"""
+    try:
+        import io
+        from PIL import Image as _PILImage
+        with _PILImage.open(path) as im:
+            w, h = im.size
+            if w and h:
+                return int(w), int(h)
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as f:
+            return _image_size_from_bytes(f.read(65536))
+    except Exception:
+        return None
