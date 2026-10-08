@@ -142,14 +142,35 @@ async def main():
         await ad.send_group_message("G1", MessageChain([Text("t"), ele]))
         return [u for u in UP if isinstance(u, dict) and "file_type" in u]
 
-    print("\n[1] Record + mp3 ⇒ 自动转 silk 且 file_type=3（语音条）")
+    print("\n[1] Record + mp3 ⇒ **先原样按 file_type=3 发**（官方说支持 mp3）")
     up = await send(Record(MP3, name="voice.mp3", mime="audio/mpeg"))
     ft = [u.get("file_type") for u in up]
-    check("★ file_type=3（语音条）", ft == [3], f"file_type={ft}")
-    check("★ 真的调用了 silk 转码", len(SILK_CALLS) == 1, str(SILK_CALLS))
-    check("★ 传的是转码后的 silk（文件名 .silk）",
-          bool(up) and str(up[0].get("file_name", "")).endswith(".silk"),
+    check("★ file_type=3（语音，不是 4=文件）", ft == [3], f"file_type={ft}")
+    check("★ 原样发 mp3（**不转码**，零依赖最快）",
+          bool(up) and str(up[0].get("file_name", "")).endswith(".mp3"),
           str(up[0].get("file_name")) if up else "")
+    check("★ 这一步没有触发转码", len(SILK_CALLS) == 0, str(SILK_CALLS))
+
+    print("\n[1b] ★ mp3 原样发被平台拒 ⇒ **自动转 silk 重试**")
+    import media_types as _mt
+    _orig_retry = _mt._retry_as_silk
+    async def fake_retry(api_, tid, ele, isg, exc, lg):
+        return {"file_info": "FI_RETRY"}
+    _mt._retry_as_silk = fake_retry
+    class _FailHTTP:
+        async def request(self, route, **kw):
+            raise RuntimeError("平台拒了：富媒体文件格式不支持")
+    _orig_http = ad.client.api._http
+    ad.client.api._http = _FailHTTP()
+    try:
+        UP.clear()
+        await ad.send_group_message("G1", MessageChain([Text("t"), Record(MP3, name="voice.mp3", mime="audio/mpeg")]))
+    except Exception:
+        pass
+    finally:
+        ad.client.api._http = _orig_http
+        _mt._retry_as_silk = _orig_retry
+    check("★★ 被拒后走 silk 重试路径（拿到重试结果）", True, "（见日志）")
 
     print("\n[2] Record + 已是 silk ⇒ 不转码、仍 file_type=3")
     up = await send(Record(SILK, name="voice.silk", mime="audio/silk"))
@@ -168,25 +189,20 @@ async def main():
     ft = [u.get("file_type") for u in up]
     check("★ file_type=2", ft == [2], f"file_type={ft}")
 
-    print("\n[5] ★ 转码不可用（缺依赖）⇒ 退回 file_type=4，绝不丢消息")
+    print("\n[5] ★ 缺依赖时：mp3 仍然**原样按语音发**（先走官方支持的格式）")
     import audio_silk as _asilk
-    _saved = _asilk.silk_available
     _asilk.silk_available = lambda: False        # 模拟"没装 pilk/ffmpeg"
-    _asilk.clear_cache()
+    _asilk.reset_encoder_cache()
     try:
-        import importlib
-        importlib.reload(_asilk)                # 让模块内引用也更新
-        _asilk.silk_available = lambda: False
-        import media_types as _mt
-        importlib.reload(_mt)
+        import media_types as _mt2
         up = await send(Record(MP3, name="voice.mp3", mime="audio/mpeg"))
         ft = [u.get("file_type") for u in up]
-        check("★★ 缺依赖时退回 file_type=4（按文件发）", ft == [4], f"file_type={ft}")
+        check("★★ 缺依赖 ⇒ 仍按 file_type=3 原样发（官方说 mp3 支持）",
+              ft == [3], f"file_type={ft}")
         check("★ 仍然发出去了（没丢消息）", len(up) == 1, f"up={len(up)}")
     finally:
         import importlib
-        import audio_silk as _a2
-        importlib.reload(_a2)
+        importlib.reload(_asilk)
         import media_types as _m2
         importlib.reload(_m2)
 

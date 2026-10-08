@@ -49,7 +49,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["reset_encoder_cache", "reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
+__all__ = ["convert_to_silk_forced", "is_silk_path", "reset_encoder_cache", "reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
 
 #: silk 文件以这个魔数开头（`#!SILK_V3`）
 SILK_MAGIC = b"#!SILK_V3"
@@ -135,6 +135,14 @@ def _ffmpeg_exe() -> Optional[str]:
         pass
     _FFMPEG_CACHE = None
     return None
+
+
+def is_silk_path(path: str) -> bool:
+    """这个路径是不是 silk（按扩展名或魔数）。给 media_types 用。"""
+    try:
+        return bool(path) and _is_silk_file(path)
+    except Exception:
+        return False
 
 
 def _is_silk_file(path: str) -> bool:
@@ -289,6 +297,44 @@ def _fix_tencent_header(silk_path: str, logger_: Any = None) -> bool:
         return False
 
 
+async def convert_to_silk_forced(path: str, logger_: Any = None) -> Optional[str]:
+    """**强制**把音频转成 silk（不管它现在是什么格式），返回新路径或 None。
+
+    与 `to_silk_if_needed` 的区别：后者对"已经是 silk"会原样返回，
+    而这个是"**我要一份 silk**"—— 给"mp3/ogg 原样发被平台拒了、需要重试"用。
+
+    ⚠ **不阻塞**：转码走 `asyncio.to_thread`（`_convert_sync` 里是 subprocess +
+      pilk/pysilk 的同步调用），事件循环不受影响。
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    if is_silk_path(path):
+        return path if _fix_tencent_header(path, logger_) else None
+    if not silk_available():
+        return None
+    # 已有缓存就直接用（避免重复转）
+    key = _digest(path)
+    hit = _CACHE.get(key)
+    if hit and os.path.exists(hit[0]):
+        return hit[0]
+    out_dir = None
+    try:
+        out_dir = tempfile.mkdtemp(prefix="qqbot_silk_")
+        silk = await asyncio.to_thread(_convert_sync, path, out_dir)
+        if not silk:
+            _rm_tree(out_dir)
+            return None
+        _prune_cache()
+        _CACHE[key] = (silk,) + (out_dir,)
+        return silk
+    except Exception as exc:
+        if out_dir:
+            _rm_tree(out_dir)
+        if logger_ is not None:
+            logger_.warning("[QQBOT-BRIDGE] 强制转 silk 失败：%s", exc)
+        return None
+
+
 def _convert_sync(src: str, out_dir: str) -> Optional[str]:
     """同步转码：`src`（任意音频）→ silk 文件路径；失败返回 None。
 
@@ -372,7 +418,21 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
     if not path or not os.path.isfile(path):
         return None
     if path.lower().endswith(_SILK_EXT) or _is_silk_file(path):
-        return path                       # 已经是 silk，不用动
+        # ★★★ 已经是 silk，但**仍然要过一遍腾讯系头校验**（2026-10-08 修的真 bug）。
+        #
+        #   原来这里直接 `return path`，等于**跳过了 _fix_tencent_header**
+        #   ⇒ 如果这个 silk 是**标准系**（例如 `silk-wasm` 的 `encode(pcm, rate)`
+        #   产出 —— 它**没有 tencent 选项**），我们原样发给 QQ
+        #   ⇒ QQ 不认 ⇒ **文件卡片**。
+        #   用户的 `jbf_v2.silk` 正是这种情况（我们一直没修它）。
+        if not _fix_tencent_header(path, logger_):
+            if logger_ is not None:
+                logger_.warning(
+                    "[QQBOT-BRIDGE] 这个 silk 文件不是 QQ 认的格式（%s）—— 本条按文件发送",
+                    os.path.basename(path),
+                )
+            return None
+        return path
     try:
         if os.path.getsize(path) > _MAX_SOURCE_BYTES:
             if logger_ is not None:

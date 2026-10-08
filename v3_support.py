@@ -29,6 +29,7 @@ from typing import Any
 #: 标记：确保我们只包装一次
 _PUBLISH_MARK = "_kira_bridge_publish"
 _QUOTE_MARK = "_kira_bridge_selfquote"
+_HANDLE_MARK = "_kira_bridge_handle"
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -51,6 +52,7 @@ class V3Enhancer:
         im = profile.im_capability
         if im is None:
             return False
+        self._adapter_name = name
         state = self._patched.get(name)
         if state is not None and state.get("adapter") is adapter:
             return False
@@ -100,11 +102,43 @@ class V3Enhancer:
         else:
             is_self_quote = original_quote
 
+        # ---- ③ _handle_message：**只旁听学昵称**（不接管、不造事件、不改行为）----
+        #
+        #   ★ 为什么需要（用户反馈「私聊昵称又变回 hex 了」）：
+        #     QQ 官方 API 里 **C2C（私聊）的 `author.username` 恒为空**，
+        #     而**群消息是带 username 的**。3.0 核心的 `nickname()` 只从
+        #     `author.username` 取，取不到就**回退成 user_id**（那串 hex）
+        #     ⇒ 私聊里就显示 hex。
+        #
+        #     我们的 `IdentityStore` 本来就是为这件事写的（跨场景共享：
+        #     群里认识过的人，私聊也认得），但它的「学习入口」挂在
+        #     **2.x 的事件处理**里 —— 而 3.0 上我们**不接管事件**
+        #     ⇒ 学不到 ⇒ 私聊一直是 hex。
+        #
+        #   ★ 做法：包一层 `_handle_message`（群聊/私聊的**统一入口**），
+        #     在**调用原方法之前**顺手把 `author.username` 记进 IdentityStore。
+        #     不接管、不造事件、不改任何返回值 —— 纯粹"旁听"。
+        original_handle = getattr(im, "_handle_message", None)
+        if callable(original_handle) and not getattr(original_handle, _HANDLE_MARK, False):
+            def handle(message, is_group, force_mention, _orig=original_handle):
+                try:
+                    enhancer._learn_nickname(message, is_group)
+                except Exception:
+                    pass                       # 学不到昵称绝不影响消息处理
+                return _orig(message, is_group, force_mention)
+
+            setattr(handle, _HANDLE_MARK, True)
+            im._handle_message = handle
+        else:
+            handle = original_handle
+
         self._patched[name] = {
             "adapter": adapter, "im": im,
             "publish": publish, "quote": is_self_quote,
+            "handle": handle,
             "has_publish": publish is not original_publish,
             "has_quote": is_self_quote is not original_quote,
+            "has_handle": handle is not original_handle,
         }
         return True
 
@@ -124,6 +158,12 @@ class V3Enhancer:
         if state.get("has_quote") and im is not None:
             try:
                 del im._is_self_quote
+                count += 1
+            except Exception:
+                pass
+        if state.get("has_handle") and im is not None:
+            try:
+                del im._handle_message          # 恢复成类上的原方法
                 count += 1
             except Exception:
                 pass
@@ -162,6 +202,50 @@ class V3Enhancer:
                 gid[:12] + "…", name,
             )
         return True
+
+    def _learn_nickname(self, message: Any, is_group: bool) -> None:
+        """从**原始 payload** 里学昵称，存进跨场景共享的 IdentityStore。
+
+        ## 为什么需要（用户反馈「私聊昵称又变回 hex 了」）
+
+        QQ 官方 API 的 **C2C（私聊）`author.username` 恒为空**，
+        而**群消息是带 username 的**。核心的 `nickname()` 只从
+        `author.username` 取，取不到就回退成 `user_id`（那串 hex）。
+
+        我们的 `IdentityStore` 就是为这件事写的（群里认识过的人，私聊也认得），
+        但它的学习入口挂在 **2.x 的事件处理**里 ——
+        3.0 上我们**不接管事件**，所以一直学不到。
+
+        ⇒ 这里在 `_handle_message`（群/私聊的统一入口）里**旁听**一次：
+        拿到 `author.username` 就记下来。**不接管、不造事件、不改行为。**
+        """
+        store = getattr(self.plugin, "identities", None)
+        if store is None:
+            return
+        try:
+            author = message.get("author") if isinstance(message, dict) else None
+            if author is None:
+                return
+            name = author.get("username") if isinstance(author, dict) else None
+            uid = None
+            if isinstance(author, dict):
+                uid = author.get("member_openid") or author.get("user_openid") or author.get("id")
+            if not (isinstance(name, str) and name.strip() and uid):
+                return                       # 私聊本来就没 username ⇒ 安静跳过
+            # 群消息带 group_openid；私聊没有 —— 但 uid 是同一个，跨场景共享
+            scope = ""
+            if is_group and isinstance(message, dict):
+                scope = str(message.get("group_openid") or "")
+            adapter_name = self._adapter_name
+            got = store.remember(adapter_name, scope, str(uid), name.strip())
+            if got and not self._logged.get("nick"):
+                self._logged["nick"] = True
+                self.logger.info(
+                    "[QQBOT-BRIDGE] 已补上跨场景昵称共享：群里的真昵称会带给私聊"
+                    "（KiraAI 3.0 原实现只认 author.username，而私聊该字段恒为空 ⇒ 显示 hex）"
+                )
+        except Exception:
+            pass                             # 学昵称失败绝不影响消息处理
 
     def _quoted_is_self(self, message: Any, is_group: bool, target_id: str) -> bool:
         """读**原始 payload** 判断"被引用的是不是机器人自己"。
