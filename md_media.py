@@ -521,11 +521,15 @@ async def _upload_bytes_to_qq(
     if api is None or not data:
         return None
 
-    # ★ 平台上传接口只收 png/jpg：GIF/WEBP 直传会被拒（850019）⇒ 先规范化
+    # ★ 平台上传接口只收 png/jpg：GIF/WEBP 直传会被拒（850019）⇒ 先规范化。
+    #   `allow_anim=True`（默认）⇒ **md 里的动图也会转成 APNG**（动图版 PNG，
+    #   魔数仍是 \x89PNG），于是它同样有机会在 md 里内嵌显示；
+    #   APNG 过大（>4MB）或转换失败 ⇒ 退回静态 PNG（第一帧）。
     try:
         from media_types import normalize_image_data
 
-        data, name, _note = normalize_image_data(data, name or "image.png", logger)
+        data, name, _note = normalize_image_data(data, name or "image.png", logger,
+                                                allow_anim=True)
     except Exception:
         pass
     if not data:

@@ -349,6 +349,8 @@ class QQOfficialGroupBridge(BasePlugin):
         #: 表情包标签关键词（逗号分隔；默认 sticker —— 它同时覆盖内置表情包插件
         #: 与第三方「增强表情包」sticker-plus，两家都是看这个词才注册标签）
         self.sticker_tags = _split_keywords(basic.get("sticker_tags", "sticker"))
+        #: markdown 消息是否丢掉引用（message_reference）——官方 SDK 让两者互斥，默认开
+        self.md_drop_reference = bool(basic.get("md_drop_reference", True))
         #: GIF/动图的发送方式：auto（默认：尽量内嵌显示，被平台拒就按文件发）/
         #: image（只按图片发）/ file（原样按文件发，保留动图）
         self.gif_sticker_mode = str(basic.get("gif_sticker_mode", "auto") or "auto").strip().lower()
