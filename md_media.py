@@ -50,7 +50,7 @@ import asyncio
 import hashlib
 import os
 import re
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 #: markdown 图片语法：`![alt](url)`，alt 里可能带 `#208px #320px` 尺寸标记
@@ -253,31 +253,45 @@ async def _upload_bytes_to_qq(
         #   block_size 比前面小**（例：12 MB 文件按 5 MB 分片 ⇒ [5MB, 5MB, 2MB]），
         #   第 2 片就会算成 `data[4MB:6MB]`（应该是 10MB 起）⇒ 拼出来的文件是坏的
         #   ⇒ 平台合并后校验格式失败，回 400 / 850019，图还是显示不出来。
+        #
+        # ★ 2026-10-08 又踩一次：修上面这个 bug 时，把 `async with ... as sess`
+        #   那行连同旧循环一起删掉了，却没补回来 ⇒ 运行时 `NameError: name 'sess'
+        #   is not defined` ⇒ **图片转存整条链路全废**（用户日志抓到的）。
+        #   教训：**改缩进/搬代码块时，一定要确认外层上下文（with / try / 变量）
+        #   还在**，光看语法通过没用 —— NameError 是运行时才炸的。
         ordered = [p for p in parts if _get(p, "index") is not None]
         ordered.sort(key=lambda p: int(_get(p, "index")))
+        # ★ 分片 index **可能不从 0 开始**（AstrBot 用 `part_index_base = min(index)`
+        #   来算偏移，说明平台不保证从 0 起）。按基准值算偏移更稳。
+        base = int(_get(ordered[0], "index")) if ordered else 0
         offset = 0
-        for part in ordered:
-            idx = int(_get(part, "index"))
-            purl = _get(part, "presigned_url")
-            bsize = int(_get(part, "block_size") or 0)
-            if not purl:
-                continue
-            # bsize<=0 时按「剩下的全部」兜底（不该发生，但不至于拼错）
-            chunk = data[offset:offset + bsize] if bsize > 0 else data[offset:]
-            if not chunk:
-                break
-            offset += len(chunk)
-            async with sess.put(purl, data=chunk) as r:
-                if r.status >= 300:
-                    if logger is not None:
-                        logger.debug("[QQBOT-BRIDGE] 分片 %s PUT 失败: %s", idx, r.status)
-                    return None
-            await _route_request(api, finish_route, json={
-                "upload_id": upload_id,
-                "part_index": idx,
-                "block_size": str(len(chunk)),
-                "md5": hashlib.md5(chunk).hexdigest(),
-            })
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=120)) as sess:
+            for part in ordered:
+                idx = int(_get(part, "index"))
+                purl = _get(part, "presigned_url")
+                bsize = int(_get(part, "block_size") or 0)
+                if not purl:
+                    continue
+                # bsize<=0 时按「剩下的全部」兜底（不该发生，但不至于拼错）
+                chunk = data[offset:offset + bsize] if bsize > 0 else data[offset:]
+                if not chunk:
+                    break
+                offset += len(chunk)
+                async with sess.put(purl, data=chunk) as r:
+                    if r.status >= 300:
+                        if logger is not None:
+                            logger.warning(
+                                "[QQBOT-BRIDGE] 图片分片 %s 上传失败：HTTP %s",
+                                idx, r.status,
+                            )
+                        return None
+                await _route_request(api, finish_route, json={
+                    "upload_id": upload_id,
+                    "part_index": idx,
+                    "block_size": str(len(chunk)),
+                    "md5": hashlib.md5(chunk).hexdigest(),
+                })
 
         # ★ 完整性自检：拼出来的必须和原文件一字不差，否则**宁可不传**
         #   （传个坏文件上去只会换来一个看不懂的平台错误）。
@@ -500,65 +514,44 @@ async def fix_markdown_images(
     if not md_text or "![" not in md_text:
         return md_text
 
+    matches = list(_MD_IMAGE_RE.finditer(md_text))
+    if not matches:
+        return md_text
+
+    # ★★★ **并行**解析所有图片（原来是串行 for ⇒ 3 张图最坏要等 3 倍时间）。
+    #
+    #   为什么可以并行：每张图的处理（下载 / 验证 / 上传）互相独立，
+    #   而且各自都有超时；并发上限压到 `_MAX_CONCURRENT`，避免一次几十张时
+    #   把网络打满或触发平台限流（上传接口官方限 10 QPS）。
+    #
+    #   注意：**替换仍然按原顺序**（下面按 index 写回），
+    #   所以 md 结构、图片顺序、行数全都不变。
+    sem = asyncio.Semaphore(_MAX_CONCURRENT)
+
+    async def _resolve_one(idx: int, alt: str, url: str) -> Tuple[int, str]:
+        async with sem:
+            try:
+                return idx, await _resolve_image_url(
+                    url, client=client, target_id=target_id, is_group=is_group,
+                    adapter=adapter, logger=logger)
+            except Exception as exc:
+                if logger is not None:
+                    logger.debug("[QQBOT-BRIDGE] 处理第 %d 张图失败（原样保留）: %s", idx, exc)
+                return idx, url
+
+    results = await _gather_with_budget(
+        {i: _resolve_one(i, m.group("alt"), m.group("url"))
+         for i, m in enumerate(matches)},
+        logger=logger)
+    new_urls = dict(results)
+
     out = []
     last = 0
     changed = 0
-    for m in _MD_IMAGE_RE.finditer(md_text):
+    for i, m in enumerate(matches):
         out.append(md_text[last:m.start()])
         alt, url = m.group("alt"), m.group("url")
-        new_url = url
-
-        if _is_remote(url):
-            # ★★★ 远程图也**转存到 QQ 自己的 COS**（不再只是"验真"）。
-            #
-            #   为什么（2026-10-07 用户实测）：官方说「用公网 URL，平台会下载转存」，
-            #   但**公网 + 国内 + 200 + 真图片**照样失败 —— 用户给的萌娘百科国内站
-            #   直链（HEAD 200、content-type: image/png）在群里依旧只显示 alt 文字。
-            #   平台转存是**异步**的、失败只回错误码（304010 CHANGE_IMAGE_URL /
-            #   304021 GET_FILE / 304020 FILE_SIZE），前端完全拿不到反馈。
-            #   用户那张 Luka1.jpg 有 13.7 MB，很可能撞了大小限制。
-            #
-            #   ⇒ 我们自己取下来，走 QQ 自己的上传通道转存一次：
-            #     raw_url 是 QQ 自己的 COS 预签名地址，平台去下载它**必然成功**；
-            #     顺便还能把过大的图压到软限制内。
-            cached = _cache_get(_URL_CACHE, url)
-            if cached is None:
-                pub = None
-                try:
-                    pub = await upload_remote_to_public_url(
-                        client, target_id, is_group, url, logger=logger)
-                except Exception as exc:
-                    if logger is not None:
-                        logger.debug("[QQBOT-BRIDGE] 远程图转存失败: %s", exc)
-                if pub:
-                    cached = pub
-                else:
-                    # 转存不成，退回"验真"：能确认是真图就保留原地址
-                    # （也许平台那边能转成功），确认不是图就也保留并告警。
-                    real = await resolve_image_url(client, url, logger=logger)
-                    cached = real or url
-                _cache_put(_URL_CACHE, url, cached, _URL_TTL)
-            new_url = cached
-        else:
-            # 本地路径：转存成公网 URL（按 (路径,大小,mtime) 缓存，避免重复上传）
-            path = url
-            if not os.path.isabs(path):
-                base = getattr(adapter, "workspace", None) or os.getcwd()
-                cand = os.path.join(str(base), path)
-                if os.path.exists(cand):
-                    path = cand
-            if os.path.exists(path):
-                key = _digest(path)
-                cached = _cache_get(_LOCAL_CACHE, key)
-                if cached is None:
-                    pub = await upload_local_to_public_url(
-                        client, target_id, is_group, path, logger=logger)
-                    cached = pub or url
-                    _cache_put(_LOCAL_CACHE, key, cached, _LOCAL_TTL)
-                new_url = cached
-            else:
-                new_url = url
-
+        new_url = new_urls.get(i, url)
         if new_url != url:
             changed += 1
         out.append(f"![{alt}]({new_url})")
@@ -568,3 +561,111 @@ async def fix_markdown_images(
     if changed and logger is not None:
         logger.info("[QQBOT-BRIDGE] markdown 内 %d 张图片已换成可访问地址（格式未改动）", changed)
     return "".join(out)
+
+
+#: 一条消息里同时处理几张图（多了会打满网络 / 撞上传接口 10 QPS 限流）
+_MAX_CONCURRENT = 4
+
+#: ★ 整条消息的图片处理**总预算**（秒）。
+#:
+#   为什么必须有：图片处理是**内联在发送路径上**的 ——
+#   每张图最坏是「下载 30s + 分片上传 120s」，6 张图串成 ceil(6/4)×150 ≈ 5 分钟，
+#   而 **QQ 被动回复窗口只有 5 分钟**（过期就发不出去）。
+#   所以宁可**超时就保留原地址**（至少消息发得出去），
+#   也不能让转存把整条消息拖死。
+_IMAGE_BUDGET_SECONDS = 45.0
+
+
+async def _gather_with_budget(tasks: Dict[int, Any], logger: Any = None) -> List[Any]:
+    """`asyncio.gather` + **总超时预算**：超时的那些任务**按原样保留**。
+
+    `tasks` 是 `{下标: 协程}`；返回 `[(下标, 结果url), ...]`。
+    超时的任务返回**它自己的原始 url**（由调用方在 `except` 分支保证），
+    这里只把没跑完的**取消掉**并让调用方按原样发送。
+
+    为什么要预算：图片处理是**内联在发送路径上**的 ——
+    每张图最坏「下载 30s + 分片上传 120s」，6 张图能串到 ≈5 分钟，
+    而 **QQ 被动回复窗口只有 5 分钟**（过期就整条发不出去）。
+    宁可超时后保留原地址（消息至少发得出去），也不能让转存把消息拖死。
+    """
+    if not tasks:
+        return []
+    # ★ 必须自己造 Task：`asyncio.gather` 内部会把协程包成 Task，
+    #   但**我们手里拿到的仍是协程对象**（没有 `.done()`）——
+    #   超时后想检查"哪些跑完了"就必须先自己 `ensure_future`。
+    #   （踩过：直接对协程调 `.done()` ⇒ AttributeError）
+    wrapped = {idx: asyncio.ensure_future(c) for idx, c in tasks.items()}
+    try:
+        done = await asyncio.wait_for(
+            asyncio.gather(*wrapped.values(), return_exceptions=False),
+            timeout=_IMAGE_BUDGET_SECONDS,
+        )
+        return list(done)
+    except asyncio.TimeoutError:
+        if logger is not None:
+            logger.warning(
+                "[QQBOT-BRIDGE] 图片转存超过 %.0f 秒预算（本条 %d 张）——"
+                "未完成的按原地址发送，保证消息能发出去",
+                _IMAGE_BUDGET_SECONDS, len(tasks),
+            )
+        out: List[Any] = []
+        for idx, t in wrapped.items():
+            if t.done() and not t.cancelled() and t.exception() is None:
+                out.append(t.result())
+            else:
+                t.cancel()
+        return out
+
+
+async def _resolve_image_url(url: str, *, client: Any, target_id: str,
+                             is_group: bool, adapter: Any, logger: Any) -> str:
+    """把**一个**图片地址解析成 QQ 能下载到的地址；任何失败都原样返回。"""
+    if not url:
+        return url
+    if _is_remote(url):
+        # ★★★ 远程图也**转存到 QQ 自己的 COS**（不再只是"验真"）。
+        #
+        #   为什么（用户实测）：官方说「用公网 URL，平台会下载转存」，
+        #   但**公网 + 国内 + 200 + 真图片**照样失败 —— 萌娘百科国内站直链
+        #   （HEAD 200、content-type: image/png）在群里依旧只显示 alt 文字。
+        #   平台转存是**异步**的、失败只回错误码（304010 CHANGE_IMAGE_URL /
+        #   304021 GET_FILE / 304020 FILE_SIZE），前端完全拿不到反馈。
+        #
+        #   ⇒ 我们自己取下来，走 QQ 自己的上传通道转存一次：
+        #     raw_url 是 QQ 自己的 COS 预签名地址，平台去下载它**必然成功**；
+        #     顺便还能把过大的图压到软限制内。
+        cached = _cache_get(_URL_CACHE, url)
+        if cached is None:
+            pub = None
+            try:
+                pub = await upload_remote_to_public_url(
+                    client, target_id, is_group, url, logger=logger)
+            except Exception as exc:
+                if logger is not None:
+                    logger.debug("[QQBOT-BRIDGE] 远程图转存失败: %s", exc)
+            if pub:
+                cached = pub
+            else:
+                # 转存不成 ⇒ 退回"验真"：能确认真图就保留原地址
+                real = await resolve_image_url(client, url, logger=logger)
+                cached = real or url
+            _cache_put(_URL_CACHE, url, cached, _URL_TTL)
+        return cached
+
+    # 本地路径：转存成公网 URL（按 (路径,大小,mtime) 缓存，避免重复上传）
+    path = url
+    if not os.path.isabs(path):
+        base = getattr(adapter, "workspace", None) or os.getcwd()
+        cand = os.path.join(str(base), path)
+        if os.path.exists(cand):
+            path = cand
+    if not os.path.exists(path):
+        return url
+    key = _digest(path)
+    cached = _cache_get(_LOCAL_CACHE, key)
+    if cached is None:
+        pub = await upload_local_to_public_url(
+            client, target_id, is_group, path, logger=logger)
+        cached = pub or url
+        _cache_put(_LOCAL_CACHE, key, cached, _LOCAL_TTL)
+    return cached

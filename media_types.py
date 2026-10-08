@@ -51,6 +51,42 @@ _VIDEO_EXT = {".mp4"}
 _RECORD_EXT = {".silk", ".mp3", ".wav", ".ogg"}
 
 
+#: 哨兵：源文件本来就是 silk，**无需改路径、file_type 保持 3**
+KEEP_AS_IS = "\x00KEEP"
+
+
+async def maybe_convert_to_silk(media_element: Any, logger_: Any) -> Optional[str]:
+    """`Record` 音频若不是 silk，就转成 silk 并返回**新文件路径**。
+
+    返回值语义（调用方必须区分）：
+
+    * ``KEEP_AS_IS`` —— 源文件本来就是 silk，**路径不用改**，`file_type` 保持 3；
+    * ``<路径>``     —— 转码成功，**改用这个路径**上传；
+    * ``None``       —— 转不了（缺依赖 / 解码失败 / 远程地址）
+      ⇒ 调用方**按文件（file_type=4）发**，宁可降级也不失败。
+
+    ★ 只处理**本地文件**；远程 URL 交给平台自己处理。
+    """
+    try:
+        if getattr(media_element, "file_type", None) == "url":
+            return None                       # 远程地址：不动
+        from audio_silk import to_silk_if_needed
+        path = await media_element.to_path()
+        if not path or not os.path.isfile(path):
+            return None
+        silk = await to_silk_if_needed(path, logger_=logger_)
+        if not silk:
+            return None
+        # 源文件本身就是 silk ⇒ 保持原路径、file_type=3
+        if os.path.realpath(silk) == os.path.realpath(path):
+            return KEEP_AS_IS
+        return silk
+    except Exception as exc:
+        if logger_ is not None:
+            logger_.debug("[QQBOT-BRIDGE] silk 转码不可用: %s", exc)
+        return None
+
+
 def _guess_name(element: Any) -> str:
     g = getattr(element, "guess_name", None)
     if callable(g):
@@ -130,6 +166,27 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
             return await _orig(target_id, media_element, is_group)
 
     async def _upload(target_id, media_element, is_group, file_type):
+        # ★★★ 语音条（file_type=3）要求 **silk** 格式 —— 官方限制表只列 silk，
+        #   第三方实测也确认「MP3 直接上传会降级成文件」。
+        #   ⇒ 在真正上传前，把非 silk 的音频转成 silk。
+        #   转不了（缺依赖 / 解码失败）就**退回 file_type=4 按文件发** ——
+        #   宁可降级成文件，也绝不失败。
+        silk_path = None
+        if file_type == FT_RECORD:
+            got = await maybe_convert_to_silk(media_element, logger)
+            if got == KEEP_AS_IS:
+                pass                          # 本来就是 silk，路径/类型都不动
+            elif got:
+                silk_path = got
+            else:
+                # 转不了 ⇒ 按「文件」发（用户仍能下载/播放，不会丢消息）
+                file_type = FT_FILE
+                if logger is not None:
+                    logger.info(
+                        "[QQBOT-BRIDGE] 无法把音频转成 silk（缺依赖或解码失败）——"
+                        "本条按「文件」发送；装上 pilk + imageio-ffmpeg 后即可自动转成语音条",
+                    )
+
         # ---- 与核心逐行一致，唯一区别是 file_type 由上面算出来 ----
         if getattr(media_element, "file_type", None) == "url":
             if is_group:
@@ -141,14 +198,15 @@ def install(holder: Any, client: Any, logger: Any = None) -> bool:
                 url=media_element.file, srv_send_msg=False)
 
         from botpy.http import Route
-        file_path = await media_element.to_path()
+        # 有转码产物就用它；否则用元素自己的路径
+        file_path = silk_path or await media_element.to_path()
         data = await asyncio.to_thread(Path(file_path).read_bytes)
         payload: dict = {
             "file_type": file_type,
             "file_data": base64.b64encode(data).decode("ascii"),
             "srv_send_msg": False,
         }
-        name = _guess_name(media_element)
+        name = os.path.basename(silk_path) if silk_path else _guess_name(media_element)
         if name:
             payload["file_name"] = os.path.basename(name.split("?")[0])
         if is_group:

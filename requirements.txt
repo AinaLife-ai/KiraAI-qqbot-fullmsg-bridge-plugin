@@ -1,0 +1,19 @@
+# QQ 官方 bot 语音条（silk）所需依赖 —— 由 KiraAI 插件加载器自动安装。
+#
+# 为什么需要这两个（2026-10-08 查证）：
+#   ★ **ffmpeg 只能解码 silk，不能编码**（实测 `ffmpeg -encoders | grep silk` 为空）。
+#     Silk 是 Skype 的专有编解码器，编 silk 必须用专门的实现 ⇒ 用 `pilk`
+#     （纯绑定，官方带 Windows 预编译 wheel）。
+#   ★ pilk 只接受 **PCM** 输入 ⇒ 还要有个东西把 mp3/wav/ogg 解成 PCM。
+#     用户机器上没有系统 ffmpeg（`where ffmpeg` 失败），所以用
+#     `imageio-ffmpeg` —— 它把一份**静态 ffmpeg 二进制**一起打包进 wheel，
+#     `pip install` 就有，不需要用户自己装、不需要管理员权限。
+#
+# 两个包都有 Windows / macOS / Linux 的预编译 wheel（pilk 覆盖 cp36–cp311），
+# 无需编译工具链。
+#
+# 说明：这两个只在「要发语音条且源文件不是 silk」时才会用到；
+# 缺了也不影响其它功能（会自动退回"按文件发送"，见 audio_silk.py）。
+
+pilk>=0.2.4
+imageio-ffmpeg>=0.5.1
