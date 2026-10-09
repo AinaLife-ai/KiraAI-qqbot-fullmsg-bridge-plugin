@@ -394,7 +394,11 @@ _UPLOAD_SOFT_BUDGET = 35.0
 
 #: 参数类错误重试没有意义（官方 `UPLOAD_RETRY_POLICY.shouldRetry` 里就是按
 #: "400 / 401 / Invalid / timeout" 这几个关键字**排除**的）。
-_NO_RETRY_MARKERS = ("401", "403", "invalid", "timeout", "timed out", "超时")
+#: 不值得重试的错误特征。
+#: ★ 2026-10-09：加"格式不支持" —— qq-botpy 的 ServerError **只有 message 没有码**
+#: （"富媒体文件格式不支持"），原来靠 "400" 字符串判断，对这种异常完全失配，
+#: 导致"格式被拒"被当作网络抖动**反复重试 3 次**（用户日志实锤：合并分片重试 3 次）。
+_NO_RETRY_MARKERS = ("401", "403", "invalid", "timeout", "timed out", "超时", "格式不支持")
 
 
 def _api_retryable(exc: BaseException, *, allow_code: str = "") -> bool:

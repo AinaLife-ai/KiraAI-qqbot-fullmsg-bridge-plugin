@@ -105,14 +105,14 @@ class _FakeHTTP:
         if body.get("file_type") == 1:
             if raw[:6] in (b"GIF87a", b"GIF89a") and self.reject_gif:
                 raise RuntimeError(
-                    "400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                    "富媒体文件格式不支持")
             if raw[:8] == b"\x89PNG\r\n\x1a\n" and self.reject_apng:
                 raise RuntimeError(
-                    "400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                    "富媒体文件格式不支持")
         if body.get("file_type") == 3:
             if not (raw[:10] == b"\x02#!SILK_V3" or raw[:9] == b"#!SILK_V3"):
                 raise RuntimeError(
-                    "400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                    "富媒体文件格式不支持")
         return {"file_info": "FI"}
 
 
@@ -139,6 +139,44 @@ async def main():
     from botpy.http import Route
 
     M._HTTP_GUARD_LOGGED.clear()
+
+    print("\n[0] ★★★ 2026-10-09 根因回归：僵尸包装必须被接管换新")
+    check("★ is_format_error：无错误码的『富媒体文件格式不支持』也算格式类错误",
+          M.is_format_error(RuntimeError("富媒体文件格式不支持")) is True)
+    check("★ is_format_error：网络抖动不算",
+          M.is_format_error(RuntimeError("boom: connection reset")) is False)
+
+    class _Holder:
+        def __init__(self):
+            self.hits = 0
+
+        async def _upload_file(self, target_id, media_element, is_group):   # 核函数
+            self.hits += 1
+            return {"file_info": "CORE"}
+
+    h = _Holder()
+    core = h._upload_file                       # 原始核函数（bound method）
+
+    async def _old_wrapper(target_id, media_element, is_group):
+        return await core(target_id, media_element, is_group)
+
+    _old_wrapper._kira_bridge_ftype = True      # 旧世代包装：有标记、无世代戳
+    _old_wrapper._kira_bridge_orig = core
+    h._upload_file = _old_wrapper
+    check("★ 旧包装对 installed_current 应当为 False（世代不符）",
+          M.installed_current(h) is False)
+    c0 = _client(_FakeHTTP())
+    ok = M.install(h, c0, _Log(), None)
+    check("★★★ install() 应接管僵尸包装（返回 True 且换成新版）",
+          ok is True and h._upload_file is not _old_wrapper)
+    check("★★★ 新包装已盖本世代戳", M.installed_current(h) is True)
+    check("★★ 剥壳正确：新包装直接包在核函数上（不是包在旧包装上）",
+          getattr(h._upload_file, "_kira_bridge_orig", None) is core)
+    fn_before = h._upload_file
+    ok2 = M.install(h, c0, _Log(), None)
+    check("★ 同世代重复安装幂等（不重复包）",
+          ok2 is True and h._upload_file is fn_before)
+
     try:
         gif = _gif_bytes()
     except Exception as exc:
@@ -298,6 +336,59 @@ async def main():
     check("★ 还原后：GIF 直传原样被拒（回到平台原行为）", raised and len(http.calls) == 1)
     check("★ 还原后请求里就是原始 GIF 字节",
           http.calls[0]["raw"] == gif, http.calls[0]["raw"][:12].hex())
+
+    print("\n[8] ★★★ 语音救援：file_type=4 音频 + <record> 信号 ⇒ 就地转 silk 按语音条发")
+    import shutil as _sh
+
+    _ff = _sh.which("ffmpeg")
+    if not _ff:
+        print("  skip  没有 ffmpeg，跳过语音救援节")
+    else:
+        import subprocess as _sp
+
+        ogg2 = "/tmp/guard_rescue.ogg"
+        _sp.run([_ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "sine=frequency=520:duration=0.5", "-c:a", "libvorbis",
+                 ogg2, "-y"], capture_output=True)
+        with open(ogg2, "rb") as f:
+            ogg_bytes = f.read()
+        import audio_silk as _as
+
+        _as.reset_encoder_cache()
+
+        log8 = _Log()
+        http = _FakeHTTP()
+        client = _client(http)
+        M.install_http_guard(client, log8, None)
+
+        M.PENDING_RECORD.set(False)
+        await http.request(route, json={
+            "file_type": 4,
+            "file_data": base64.b64encode(ogg_bytes).decode("ascii"),
+            "file_name": "voice.ogg", "srv_send_msg": False, "openid": "U1"})
+        check("★ 没有 <record> 信号 ⇒ 保持文件通道（不误伤『故意发文件』）",
+              http.calls[-1]["body"].get("file_type") == 4,
+              str(http.calls[-1]["body"].get("file_type")))
+        check("★ 有提示日志（线索可见）",
+              any("音频" in m for _lv, m in log8.lines), str(log8.lines[-2:]))
+
+        http.calls.clear()
+        M.PENDING_RECORD.set(True)
+        try:
+            await http.request(route, json={
+                "file_type": 4,
+                "file_data": base64.b64encode(ogg_bytes).decode("ascii"),
+                "file_name": "voice.ogg", "srv_send_msg": False, "openid": "U1"})
+        finally:
+            M.PENDING_RECORD.set(False)
+        last = http.calls[-1]
+        check("★★★ 救援成功：改按 file_type=3 发出",
+              last["body"].get("file_type") == 3,
+              str([c["body"].get("file_type") for c in http.calls]))
+        check("★★ 内容已转成腾讯系 silk",
+              last["raw"][:10] == b"\x02#!SILK_V3", last["raw"][:12].hex())
+        check("★★ 语音不带文件名（与官方口径一致）",
+              "file_name" not in last["body"], str(list(last["body"].keys())))
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

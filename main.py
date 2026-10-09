@@ -2103,13 +2103,21 @@ class QQOfficialGroupBridge(BasePlugin):
             name = ""
         if name:
             # ★ 不能只信 dict 记录 —— 旧实例/错位还原可能已经把包装**拆掉**而
-            #   dict 里还留着记录（热重载场景）。每次都验证一下标记还在不在，
-            #   不在就重装（成本 = 两次 getattr）。
+            #   dict 里还留着记录（热重载场景）。每次都验证一下标记还在不在。
+            # ★★ 2026-10-09 实锤：光验证"标记在"还不够 —— 旧版本留下的
+            #   「僵尸包装」**标记也在**，但世代是老的（没有逐条日志、行为过时，
+            #   正是"贴纸/语音没有任何媒体日志"的根因）。所以改成**世代戳比对**：
+            #   不是本世代的包装 ⇒ 交给 install() 剥壳重包（它会自动接管）。
             holder0 = self._media_types_holders.get(name)
-            if holder0 is not None and getattr(
-                    getattr(holder0, "_upload_file", None), "_kira_bridge_ftype", False):
-                return True
             if holder0 is not None:
+                try:
+                    from media_types import installed_current as _cur
+                    if _cur(holder0):
+                        return True
+                except Exception:
+                    if getattr(getattr(holder0, "_upload_file", None),
+                               "_kira_bridge_ftype", False):
+                        return True
                 self._media_types_holders.pop(name, None)
         try:
             holder = cap if cap is not None else self._media_holder_for(adapter)
@@ -2305,23 +2313,34 @@ class QQOfficialGroupBridge(BasePlugin):
                 "msg_seq": seq,
                 "input_notify": {"input_type": 1, "input_second": self._TYPING_SECONDS},
             })
-            if not self._typing_logged:
-                self._typing_logged = True
+            try:
+                self._typing_count = int(getattr(self, "_typing_count", 0)) + 1
+            except Exception:
+                self._typing_count = 1
+            # ★ 前 3 次打 INFO（用户常问"输入中到底发没发"）；之后 DEBUG 留痕。
+            if self._typing_count <= 3:
                 logger.info(
-                    "[QQBOT-BRIDGE] 已在私聊里发「输入中…」状态（msg_type=6，%d 秒，"
-                    "msg_seq=%s 与框架共用同一条序号）—— 单聊里对方会看到「输入中/正在输入…」，"
-                    "群里官方不支持；发失败不影响回复",
-                    self._TYPING_SECONDS, seq,
+                    "[QQBOT-BRIDGE] 输入中状态已发（第 %d 次；msg_type=6，%d 秒，"
+                    "msg_seq=%s）—— 单聊里对方可见「输入中/正在输入…」，群里官方不支持；"
+                    "发失败不影响回复",
+                    self._typing_count, self._TYPING_SECONDS, seq,
                 )
             else:
-                # ★ 第 2 次起也留痕（DEBUG）——「输入中到底发没发」是用户常问的问题，
-                #   有这行就能对着日志回答，而不是猜（前几次 INFO 见上）。
                 logger.debug(
                     "[QQBOT-BRIDGE] 输入中状态已发（msg_id=%s…, msg_seq=%s）",
                     str(msg_id)[:18], seq,
                 )
         except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 输入中状态发送失败（忽略）: %s", exc)
+            # ★ 失败要**可见**（原来 debug = 等于没有）：用户截图里"在线状态没有
+            #   输入中"时，这行就是答案 —— 要么我们没发出去，要么平台拒了。
+            if not getattr(self, "_typing_fail_logged", False):
+                self._typing_fail_logged = True
+                logger.warning(
+                    "[QQBOT-BRIDGE] 输入中状态发送失败（%s: %s）—— 平台可能拒收了 "
+                    "msg_type=6；请把本条反馈（不影响正常回复）",
+                    type(exc).__name__, str(exc)[:120])
+            else:
+                logger.debug("[QQBOT-BRIDGE] 输入中状态发送失败（忽略）: %s", exc)
 
     def _adapter_attr(self, adapter, attr: str, default=None):
         """取适配器上的方法/属性 —— **两处都找**（2.x 在实例上，3.0 在能力对象上）。
@@ -2656,6 +2675,24 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._ensure_media_layer(adapter, client, cap)
             except Exception as _exc:
                 logger.debug("[QQBOT-BRIDGE] 发送前补装媒体层异常（忽略）: %s", _exc)
+            # ★★ 语音救援信号（2026-10-09）：把「本条含 <record> 语音」传给
+            #   HTTP 安全网 —— 万一媒体包装仍然没装上、核心把语音按文件发，
+            #   安全网看到这个信号就能就地救援成语音条（否则它分不清
+            #   "故意发文件" 和 "本该是语音条"）。
+            _has_record = False
+            try:
+                for _el in send_message_obj:
+                    if type(_el).__name__ == "Record":
+                        _has_record = True
+                        break
+            except Exception:
+                pass
+            _pr = None
+            try:
+                from media_types import PENDING_RECORD as _pr  # noqa: PLC0415
+            except Exception:
+                _pr = None
+            _pr_tok = _pr.set(_has_record) if _pr is not None else None
             from media_coerce import coerce_media_chain, restore_media_chain
             send_message_obj, _swapped = coerce_media_chain(
                 send_message_obj, self.sticker_tags)
@@ -2663,6 +2700,11 @@ class QQOfficialGroupBridge(BasePlugin):
                 return await _send_message_inner(target_id, send_message_obj, is_group)
             finally:
                 restore_media_chain(send_message_obj, _swapped)
+                if _pr is not None and _pr_tok is not None:
+                    try:
+                        _pr.reset(_pr_tok)
+                    except Exception:
+                        pass
 
         async def _send_message_inner(target_id, send_message_obj, is_group):
             ref = self._quote_ref_for(adapter, target_id, send_message_obj, is_group) \
