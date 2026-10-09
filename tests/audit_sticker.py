@@ -343,6 +343,9 @@ async def main():
         check("★ file_type 仍是 1（图片）", bool(up_gif) and up_gif[-1].get("file_type") == 1)
         check("★ 只发了一次（原图成功就不转档）",
               len(up_gif) == 1, f"uploads={len(up_gif)}")
+        check("★★ 原图直传**带文件名**（.gif，与 KiraAI 原生成功路径一致）",
+              str(up_gif[-1].get("file_name") or "").endswith(".gif"),
+              str(up_gif[-1].get("file_name")))
         check("★ 链已还原", type(ch_gif[1]).__name__ == "Sticker")
 
         print("\n[5e-2] ★★ 原图被平台拒（850019）⇒ 自动退守 APNG")
@@ -383,6 +386,9 @@ async def main():
         check("★★ APNG：头部是 PNG 魔数", d_a[:8] == b"\x89PNG\r\n\x1a\n", d_a[:12].hex())
         check("★★ APNG：带 acTL 动画块（动画保住了）", b"acTL" in d_a)
         check("★ file_type 仍是 1", bool(up_a) and up_a[-1].get("file_type") == 1)
+        check("★ 转档后文件名同步为 .png",
+              str(up_a[-1].get("file_name") or "").endswith(".png"),
+              str(up_a[-1].get("file_name")))
 
         print("\n[5e-3] ★★★ 平台仍拒收（850019）⇒ **自动改按文件发**（原始 GIF 字节，只一次）")
         import media_types as _MT

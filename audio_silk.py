@@ -97,44 +97,105 @@ _FFMPEG_CACHE: Any = None
 _FFMPEG_TRIED = False
 
 
-def _ffmpeg_exe() -> Optional[str]:
-    """拿一个可用的 ffmpeg。
+#: 插件配置里指定的 ffmpeg 路径（由 main.py 注入；最高优先之一）
+_FFMPEG_CFG: Optional[str] = None
 
-    **顺序（先便宜后昂贵，与视频插件一致）**：
+#: 「配置路径不存在」只警告一次
+_FFMPEG_CFG_WARNED = False
 
-    1. `IMAGEIO_FFMPEG_EXE` 环境变量（用户显式指定，最高优先，不校验存在性）；
-    2. **系统 PATH** 上的 `ffmpeg` —— 不下载、不依赖 pip 包，最快；
-    3. `imageio-ffmpeg` 自带的静态二进制（pip 装好就有，兜底）。
+#: ffmpeg 解码单次超时（秒）。★ 2026-10-10：从 300 收紧到 120 ——
+#: Windows 上 ffmpeg 启动失败会弹**系统错误对话框**（0xC0000142 DLL 初始化失败），
+#: 进程会挂在对话框上等用户点确定 ⇒ 我们只能靠超时兜底；
+#: 300 秒太长（被动回复窗口只有 5 分钟，用户消息会被拖到快过期），120 秒足够
+#: 任何正常音频解码，卡住时也更快退到"换下一个候选/按文件发"。
+FFMPEG_TIMEOUT = 120
 
-    ★ 结果缓存：这是**每次发语音都会问一次**的路径，不缓存的话每轮都要
-      `shutil.which` 扫 PATH。缓存后固定不变（进程生命周期内 ffmpeg 不会挪窝）。
+
+def set_ffmpeg_path(path: Optional[str]) -> None:
+    """注入插件配置里的 `ffmpeg_path`（每轮巡检调用，幂等；空=清除）。"""
+    global _FFMPEG_CFG
+    _FFMPEG_CFG = str(path).strip() if path else None
+
+
+def _ffmpeg_candidates() -> list:
+    """按优先级列出**所有候选 ffmpeg**（存在性已校验）。
+
+    顺序：插件配置 `ffmpeg_path` → `IMAGEIO_FFMPEG_EXE` 环境变量 →
+    系统 PATH → imageio-ffmpeg 自带二进制。
+    去重保序；配置/环境变量指向不存在的路径会记一条 WARNING（只记一次）。
     """
-    global _FFMPEG_CACHE, _FFMPEG_TRIED
-    if _FFMPEG_TRIED:
-        return _FFMPEG_CACHE
-    _FFMPEG_TRIED = True
+    global _FFMPEG_CFG_WARNED
+    cands: list = []
 
-    # ① 用户显式指定
-    env = os.environ.get("IMAGEIO_FFMPEG_EXE")
-    if env and os.path.exists(env):
-        _FFMPEG_CACHE = env
-        return env
-    # ② 系统 PATH（最省事，无需任何下载）
-    sys_exe = shutil.which("ffmpeg")
-    if sys_exe:
-        _FFMPEG_CACHE = sys_exe
-        return sys_exe
-    # ③ imageio-ffmpeg 自带的静态二进制
+    def _add(p, label: str) -> None:
+        if not p:
+            return
+        if not os.path.exists(str(p)):
+            if label in ("配置", "环境变量") and not _FFMPEG_CFG_WARNED:
+                _FFMPEG_CFG_WARNED = True
+                logger.warning(
+                    "[QQBOT-BRIDGE] ffmpeg %s指向的路径不存在：%s —— 已忽略，"
+                    "改用其它候选（检查插件配置的 ffmpeg_path / IMAGEIO_FFMPEG_EXE）",
+                    label, p)
+            return
+        p = str(p)
+        if p not in cands:
+            cands.append(p)
+
+    _add(_FFMPEG_CFG, "配置")
+    _add(os.environ.get("IMAGEIO_FFMPEG_EXE"), "环境变量")
+    _add(shutil.which("ffmpeg"), "PATH")
     try:
         import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe and os.path.exists(exe):
-            _FFMPEG_CACHE = exe
-            return exe
+        _add(imageio_ffmpeg.get_ffmpeg_exe(), "imageio")
     except Exception:
         pass
-    _FFMPEG_CACHE = None
-    return None
+    return cands
+
+
+def _ffmpeg_spawn_kwargs() -> dict:
+    """子进程 spawn 参数（2026-10-10 加固）。
+
+    * `stdin=DEVNULL`：永远不让 ffmpeg 去读 stdin（经典卡死来源之一）；
+    * Windows 上 `CREATE_NO_WINDOW`：不弹控制台窗，后台干净跑。
+    """
+    import subprocess as _sp
+
+    kw = {"stdin": _sp.DEVNULL}
+    if os.name == "nt":
+        kw["creationflags"] = 0x08000000        # CREATE_NO_WINDOW
+    return kw
+
+
+def _ffmpeg_startup_failure(code) -> bool:
+    """退出码看着像「**进程根本没跑起来**」吗？（Windows 弹窗类错误）
+
+    0xC0000142 = STATUS_DLL_INIT_FAILED —— 用户线报的正是它：
+    `ffmpeg-win-x86_64-v7.1.exe - 应用程序无法正常启动(0xc0000142)`，
+    进程挂在系统错误对话框上不退出 ⇒ 换一个候选二进制往往就能绕过。
+    0xC0000135 = 缺 DLL；0xC0000005/0xC000001D 等也一并按"启动类"处理。
+    """
+    try:
+        u = int(code) & 0xFFFFFFFF
+    except Exception:
+        return False
+    return u in (0xC0000142, 0xC0000135, 0xC0000005, 0xC000001D, 0xC00000FD)
+
+
+def _ffmpeg_exe() -> Optional[str]:
+    """拿一个可用的 ffmpeg（上一次成功的优先；没有就取候选第一个）。
+
+    **候选顺序**（先便宜后昂贵）：插件配置 `ffmpeg_path` →
+    `IMAGEIO_FFMPEG_EXE` → 系统 PATH → `imageio-ffmpeg` 自带二进制。
+    转换成功后会记住那个二进制（`_FFMPEG_CACHE`），后续优先复用。
+    """
+    global _FFMPEG_CACHE, _FFMPEG_TRIED
+    if _FFMPEG_TRIED and _FFMPEG_CACHE and os.path.exists(_FFMPEG_CACHE):
+        return _FFMPEG_CACHE
+    _FFMPEG_TRIED = True
+    cands = _ffmpeg_candidates()
+    _FFMPEG_CACHE = cands[0] if cands else None
+    return _FFMPEG_CACHE
 
 
 def is_silk_path(path: str) -> bool:
@@ -361,7 +422,18 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
 
     ★ 注意：**ffmpeg 压不出 silk**（它没有 silk 编码器），
       只负责第一步的 PCM 解码 —— 这一点已被实测确认。
+
+    ★★ 2026-10-10 加固（用户线报 "5 分钟音频 ffmpeg 报
+      `应用程序无法正常启动(0xc0000142)` 并把窗口卡住"）：
+      * 解码步骤**遍历全部 ffmpeg 候选**（配置 → 环境变量 → PATH → imageio），
+        遇到**启动类错误/超时**就换下一个候选（0xC0000142 是
+        `STATUS_DLL_INIT_FAILED`，换一个二进制往往就能绕过）；
+      * `-nostdin` + `stdin=DEVNULL`（经典卡死来源）+ Windows `CREATE_NO_WINDOW`；
+      * 单次超时 300s → **120s**（弹窗卡住时更快退到"换候选/按文件发"，
+        不给被动回复窗口添乱）；
+      * 成功一次后就记住那个二进制，后续优先复用。
     """
+    global _FFMPEG_CACHE
     encoder = _silk_encoder()
     if not encoder:
         logger.warning(
@@ -371,10 +443,13 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
         )
         return None
 
-    ffmpeg = _ffmpeg_exe()
-    if not ffmpeg:
+    cands = _ffmpeg_candidates()
+    if not cands:
         logger.warning("[QQBOT-BRIDGE] 找不到 ffmpeg（imageio-ffmpeg 也没装上），无法转 silk")
         return None
+    # 上次成功的二进制优先
+    if _FFMPEG_CACHE and _FFMPEG_CACHE in cands:
+        cands = [_FFMPEG_CACHE] + [c for c in cands if c != _FFMPEG_CACHE]
 
     base = os.path.splitext(os.path.basename(src))[0] or "voice"
     pcm_path = os.path.join(out_dir, base + ".pcm")
@@ -383,19 +458,62 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
     # ① 解码成 PCM。采样率必须和后面 pilk 的 pcm_rate 一致。
     #    24000 是 SILK 宽带模式（QQ/微信语音常用），单声道。
     rate = 24000
-    cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", src,
-        "-f", "s16le", "-acodec", "pcm_s16le",
-        "-ac", "1", "-ar", str(rate),
-        pcm_path,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=300)
-    if proc.returncode != 0 or not os.path.exists(pcm_path):
+    proc = None
+    ok_decode = False
+    for i, ffmpeg in enumerate(cands):
+        cmd = [
+            ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", src,
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ac", "1", "-ar", str(rate),
+            pcm_path,
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT,
+                                  **_ffmpeg_spawn_kwargs())
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "[QQBOT-BRIDGE] ffmpeg 解码超时（%ss，候选 %d/%d：%s）—— "
+                "Windows 上常见于启动弹窗卡死（0xC0000142）；已杀掉，尝试下一个候选",
+                FFMPEG_TIMEOUT, i + 1, len(cands), os.path.basename(str(ffmpeg)))
+            proc = None
+            continue
+        except Exception as exc:
+            logger.warning(
+                "[QQBOT-BRIDGE] ffmpeg 启动失败（候选 %d/%d：%s）：%s: %s",
+                i + 1, len(cands), os.path.basename(str(ffmpeg)),
+                type(exc).__name__, str(exc)[:120])
+            proc = None
+            continue
+        if proc.returncode == 0 and os.path.exists(pcm_path) and os.path.getsize(pcm_path) > 0:
+            _FFMPEG_CACHE = ffmpeg          # 记住这个能用的
+            ok_decode = True
+            break
+        if _ffmpeg_startup_failure(proc.returncode):
+            logger.warning(
+                "[QQBOT-BRIDGE] ffmpeg **启动类错误**（exit=0x%X，候选 %d/%d：%s）—— "
+                "0xC0000142 = 应用程序无法正常启动（DLL 初始化失败，会弹窗卡住）；"
+                "已换下一个候选",
+                int(proc.returncode) & 0xFFFFFFFF, i + 1, len(cands),
+                os.path.basename(str(ffmpeg)))
+            proc = None
+            continue
+        # 普通解码错误（文件损坏/没有音轨）⇒ 换候选也没用，直接失败
+        break
+
+    if not ok_decode:
+        _err = ""
+        try:
+            if proc is not None:
+                _err = (proc.stderr or b"")[:180].decode(errors="replace")
+        except Exception:
+            _err = ""
         logger.warning(
-            "[QQBOT-BRIDGE] ffmpeg 解码音频失败（exit=%s）：%s",
-            proc.returncode, (proc.stderr or b"")[:180].decode(errors="replace"),
-        )
+            "[QQBOT-BRIDGE] ffmpeg 解码音频失败（%d 个候选都试过）%s —— "
+            "若在 Windows 看到「应用程序无法正常启动(0xC0000142)」弹窗，"
+            "建议装一个系统 ffmpeg（winget install Gyan.FFmpeg）并在插件配置里"
+            "填 ffmpeg_path，或在环境变量里设 IMAGEIO_FFMPEG_EXE；本插件会自动优先使用",
+            len(cands), ("：" + _err) if _err else "")
         return None
 
     # ② PCM → silk（采样率必须与上面 ffmpeg 的 -ar 一致）

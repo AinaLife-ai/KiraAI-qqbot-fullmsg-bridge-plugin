@@ -1,31 +1,19 @@
-"""★★★ 媒体上传体形状：**`file_name` 只对 `file_type=4` 发**（三家官方实现一致）。
+"""★★★ 媒体上传体形状：`file_name` 的发放规则（2026-10-10 修订版）。
 
-## 线上现象（2026-10-08 用户实测）
+| file_type | 带文件名？ | 依据 |
+|---|---|---|
+| 4 文件 | **必带** | 官方文档/三家实现一致（用于显示文件名） |
+| 3 语音 | **绝不带** | 2026-10-08 定位："语音变文件卡片"的根因就是它；去掉后语音条正常 |
+| 1 图片 | **带**（本版修订） | ① KiraAI 原生路径（不带插件）**发 GIF 成功**：`<file type="image">` 的元素自带真实文件名（`test.gif`），上传体必然带 `file_name`；而本插件贴纸来自 base64、无名字、GIF 被拒（850019）<br>② 官方「富媒体概述」把 gif/webp/bmp 列为图片支持格式，扩展名是平台识别格式的最直接线索<br>③ 官方 Node SDK 只是"不主动给非 FILE 带名"，并非禁止 |
+| 2 视频 | 不带 | 无实证需求，先不动 |
 
-语音（ogg 与 silk）在 QQ 里一律显示成**文件卡片**，卡片上的名字正是我们传的
-`jbf_v2.silk` / `jbf_voice60s.ogg`。
+## 旧结论（2026-10-08，已被上面的实锤修订）
 
-## 依据（三家官方/官方推荐实现，逐条可查）
-
-1. **腾讯官方 Node SDK** `@tencent-connect/qqbot-nodejs@1.0.4`
-   `src/protocol/api/media.ts`：
-   ```ts
-   if (fileType === MediaFileType.FILE && opts.fileName) {
-       body.file_name = this.sanitize(opts.fileName);
-   }
-   ```
-   其 `USAGE.md` 也写：`fileName: "2025-Q4-报告.pdf",   // 仅 FILE 类型有效`
-2. **官方 openclaw-qqbot** 走同一个 SDK ⇒ 语音上传体里没有 `file_name`。
-3. **QQ 官方推荐的 Hermes**（`gateway/platforms/qqbot/adapter.py`）：
-   ```python
-   body: Dict[str, Any] = {"file_type": file_type, "srv_send_msg": srv_send_msg}
-   ...
-   if file_type == MEDIA_TYPE_FILE and file_name:
-       body["file_name"] = file_name
-   ```
-   `_send_media` 里也是 `file_name=resolved_name if file_type == MEDIA_TYPE_FILE else None`。
-
-⇒ 给语音带文件名属于**超出官方约定的用法**，本插件改为严格对齐。
+语音（ogg 与 silk）在 QQ 里显示成**文件卡片**、卡片上正是我们传的名字
+（`jbf_v2.silk` / `jbf_voice60s.ogg`）→ 对照腾讯 Node SDK / openclaw-qqbot /
+Hermes 三家实现（都不给语音带 `file_name`），改为非 FILE 不带。
+——该结论对**语音**依然成立；2026-10-10 发现它对**图片**并不成立：
+图片要带（见上表），且这正是 GIF 失败的差异点。
 
 本测试：用假的元素 + 假的 client 真跑 `media_types.install()` 的 `_upload_file`，
 把上传体抓下来逐字段断言（不需要任何核心，跑得飞快）。
@@ -73,12 +61,15 @@ class _Log:
 
 
 class Elem:
-    """最小媒体元素（形状与核心 `BaseMediaElement` 一致就够）。"""
+    """最小媒体元素（形状与核心 `BaseMediaElement` 一致就够）。
+
+    `name=None` ⇒ 默认用文件名；`name=""` ⇒ **没有名字**（模拟 sticker 的 base64）。
+    """
 
     def __init__(self, path, name=None, orig_kind=None):
         self.file = path
         self.file_type = "path"
-        self._name = name or path.rsplit("/", 1)[-1]
+        self._name = name if name is not None else path.rsplit("/", 1)[-1]
         if orig_kind:
             self._kira_bridge_orig_kind = orig_kind   # media_coerce 留下的标记
 
@@ -158,10 +149,42 @@ async def main():
         check("★ 交回核心原逻辑（File 归核心，我们只改类型不准的那几类）",
               "交回原逻辑" in str(exc))
 
+    print("\n[3c] ★★★ 图片（file_type=1）⇒ **带文件名**（2026-10-10 对齐原生成功路径）")
+    try:
+        import base64 as _b64
+        import io as _io
+
+        from PIL import Image as _PIL
+
+        _fr = [_PIL.new("RGB", (8, 8), (255, 0, 0)), _PIL.new("RGB", (8, 8), (0, 0, 255))]
+        _b = _io.BytesIO()
+        _fr[0].save(_b, "GIF", save_all=True, append_images=_fr[1:], duration=100)
+        open("/tmp/payloadtest/sticker.gif", "wb").write(_b.getvalue())
+        open("/tmp/payloadtest/s.png", "wb").write(_b64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="))
+        have_img = True
+    except Exception as exc:
+        have_img = False
+        print(f"  skip  没有 Pillow（{exc}）")
+    if have_img:
+        body = await upload(Elem("/tmp/payloadtest/sticker.gif", "", orig_kind="Sticker"))
+        check("★★★ 无名字的 GIF 贴纸 ⇒ 上传体带 file_name 且扩展名 .gif",
+              body.get("file_type") == 1
+              and str(body.get("file_name") or "").endswith(".gif"),
+              f"type={body.get('file_type')} name={body.get('file_name')}")
+        body = await upload(Elem("/tmp/payloadtest/s.png", "", orig_kind="Sticker"))
+        check("★★ 无名字的 PNG 贴纸 ⇒ 补 .png",
+              body.get("file_type") == 1
+              and str(body.get("file_name") or "").endswith(".png"),
+              f"name={body.get('file_name')}")
+        body = await upload(Elem("/tmp/payloadtest/s.png", "my_pic.png", orig_kind="Sticker"))
+        check("★ 元素自带名字 ⇒ 原样沿用（不瞎改用户内容）",
+              body.get("file_name") == "my_pic.png", str(body.get("file_name")))
+
     print("\n[4] 诊断：上传体形状只记一次")
     shapes = [m for lv, m in log.lines if "媒体上传体形状" in m]
     check("★ 每种 file_type 只记一条（不刷屏）",
-          0 < len(shapes) <= 3, f"{len(shapes)} 条")
+          0 < len(shapes) <= 4, f"{len(shapes)} 条")
 
     print("\n[5] 反向验证：旧代码会带上 file_name（本测试能抓到该回归）")
     old_body = {"file_type": 3, "file_name": "jbf_v2.silk", "file_data": "x"}

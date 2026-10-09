@@ -145,6 +145,12 @@ async def main():
           M.is_format_error(RuntimeError("富媒体文件格式不支持")) is True)
     check("★ is_format_error：网络抖动不算",
           M.is_format_error(RuntimeError("boom: connection reset")) is False)
+    import json as _json
+
+    _mf = os.path.join(os.path.dirname(os.path.abspath(M.__file__)), "manifest.json")
+    _ver = _json.load(open(_mf, encoding="utf-8"))["version"]
+    check("★ 世代戳 == manifest 版本（自动取，杜绝手写漏改导致修复不生效）",
+          M._WRAPPER_BUILD == _ver, f"{M._WRAPPER_BUILD} vs {_ver}")
 
     class _Holder:
         def __init__(self):
@@ -239,6 +245,9 @@ async def main():
     check("★★★ 只发了一次且就是**原始 GIF 字节**（没有转档）",
           len(http.calls) == 1 and http.calls[0]["raw"] == gif,
           f"calls={len(http.calls)} head={http.calls[-1]['raw'][:8].hex()}")
+    check("★★ 原样直传**带文件名**（.gif，与原生成功路径一致）",
+          str(http.calls[0]["body"].get("file_name") or "").endswith(".gif"),
+          str(http.calls[0]["body"].get("file_name")))
 
     print("\n[3] 连 APNG 都被拒 ⇒ 原始 GIF 字节改按文件发（保投递）")
     M._RAW_IMG_REJECTED.clear()
