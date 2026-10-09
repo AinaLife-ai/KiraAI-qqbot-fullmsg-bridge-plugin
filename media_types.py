@@ -261,7 +261,7 @@ def normalize_image_data(data: bytes, name: str = "", logger_: Any = None, *,
         if logger_ is not None:
             logger_.info(
                 "[QQBOT-BRIDGE] 图片格式已规范化：%s（%s，%d 字节 → %d 字节）"
-                "—— 平台的上传接口只接受 png/jpg，GIF/WEBP 直传会被拒（850019）",
+                "—— 平台实测：WebP 直传会被拒（850019；GIF 可直传）—— 这里是保底静态转档",
                 note, os.path.basename(name or "?"), len(data), len(out),
             )
         return out, base, note
@@ -292,10 +292,19 @@ _FORMAT_ERROR_TEXT = ("格式不支持", "format not support", "unsupported form
 #: 3000 万 ≈ 60 帧 720×720 / 120 帧 500×500。
 _APNG_SKIP_PIXELS = 30_000_000
 
-#: 「原图被平台拒」记忆（md5 -> 时间戳）：10 分钟内不再对同一张图试原图直传，
+#: 「原图被平台拒」记忆（md5 -> 时间戳）：TTL 内不再对同一张图试原图直传，
 #: 免得每次都白撞一次 850019。有界（最多 64 条）。
+#: ★ 2026-10-10：600s → 1800s；且**元素层 / HTTP 安全网 / md 转存三路共享**
+#: （实测：贴纸 17:35 拒过 webp，md 17:39 又白撞了两次）。
 _RAW_IMG_REJECTED: dict = {}
-_RAW_IMG_REJECT_TTL = 600.0
+_RAW_IMG_REJECT_TTL = 1800.0
+
+#: WebP→GIF 转换结果缓存（md5(源) → (gif 字节, 时间戳)）。
+#: 同一张贴纸/md 图常被重复发送；实测 41 秒内对同一文件转换了两次。
+#: TTL 30 分钟、有界 32（满了丢最旧一半）。
+_GIF_CACHE: dict = {}
+_GIF_CACHE_TTL = 1800.0
+_GIF_CACHE_MAX = 32
 
 
 def _animated_format(data: bytes) -> str:
@@ -348,7 +357,7 @@ def _image_upload_name(data: bytes, name: Any) -> str:
 
 def to_animated_gif(data: bytes, logger_: Any = None,
                     max_bytes: int = 20 * 1024 * 1024) -> Optional[bytes]:
-    """动画图片（WebP 等）→ 动画 **GIF**（保动画）。
+    """动画图片（WebP 等）→ 动画 **GIF**（保动画）。**带结果缓存**。
 
     ★★★ 依据（2026-10-10 实锤）：**平台收 GIF、不收 WebP** ——
     用户"GIF 贴纸"其实是 WebP（日志 `file_name: image.webp`，556282 字节），
@@ -357,9 +366,25 @@ def to_animated_gif(data: bytes, logger_: Any = None,
     退守 APNG/PNG（会变静图）之前 —— 先试 **WebP→GIF**：动画保住，
     而且平台认 GIF。三条路（元素层 / 安全网 / md）共用本函数。
 
+    ★ 2026-10-10 性能：**结果缓存**（md5(源) → gif 字节，TTL 30 分钟、有界 32）——
+      同一张贴纸/md 图常被重复发送（实测 41 秒内转换了两次，白烧几百毫秒）。
+
     实现：Pillow 逐帧读（WebP 多帧支持）→ 每帧转 P 调色板 → GIF(save_all)。
     失败/超过 max_bytes 返回 None（调用方继续退守，绝不丢消息）。
     """
+    import time as _t
+
+    key = ""
+    try:
+        import hashlib as _h
+
+        key = _h.md5(data).hexdigest()
+    except Exception:
+        key = ""
+    if key:
+        hit = _GIF_CACHE.get(key)
+        if hit and (_t.time() - hit[1]) < _GIF_CACHE_TTL:
+            return hit[0]
     try:
         import io
 
@@ -396,6 +421,13 @@ def to_animated_gif(data: bytes, logger_: Any = None,
                 "[QQBOT-BRIDGE] 动画 WebP 已转成动画 GIF（%d 帧，%d 字节 → %d 字节）——"
                 "平台收 GIF，保动画",
                 frames, len(data), len(gif))
+        if key:
+            _GIF_CACHE[key] = (gif, _t.time())
+            if len(_GIF_CACHE) > _GIF_CACHE_MAX:
+                _old = sorted(_GIF_CACHE, key=lambda k: _GIF_CACHE[k][1])[
+                    : _GIF_CACHE_MAX // 2]
+                for k in _old:
+                    _GIF_CACHE.pop(k, None)
         return gif
     except Exception as exc:
         if logger_ is not None:
@@ -462,7 +494,7 @@ def _log_upload_shape_once(file_type: int, payload: dict, logger_: Any) -> None:
               for k, v in payload.items() if k not in ("group_openid", "openid")}
     logger_.info(
         "[QQBOT-BRIDGE] 媒体上传体形状（file_type=%s）：%s —— "
-        "官方口径：file_name 只对 file_type=4 发（腾讯 Node SDK / openclaw-qqbot / Hermes 三家一致）",
+        "—— 现行规则：文件(4)/图片(1) 带 file_name、语音(3) 不带（2026-10-10 修订）",
         file_type, fields,
     )
 

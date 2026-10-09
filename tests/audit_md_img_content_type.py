@@ -318,6 +318,30 @@ async def main():
             check("★★ prepare 先试 .webp、再换 .gif",
                   cli_w.api._http.names[:2] == ["meme.webp", "meme.gif"],
                   str(cli_w.api._http.names[:3]))
+
+            # ★★ 2026-10-10 性能回归：候选链**惰性** —— .gif 档成功时
+            #   APNG/静态 PNG 档**不应被构建**（normalize 零调用）。
+            import media_types as _MTX
+
+            _norm_calls = {"n": 0}
+            _orig_norm = _MTX.normalize_image_data
+
+            def _spy_norm(*a, **k):
+                _norm_calls["n"] += 1
+                return _orig_norm(*a, **k)
+
+            _MTX.normalize_image_data = _spy_norm
+            try:
+                SEEN.clear()
+                cli_w2 = _Client(gparts)
+                cli_w2.api._http = _HTTPRejectWebp(gparts)
+                _w2 = await M._upload_bytes_to_qq(cli_w2, "G1", True, webp_data,
+                                                  "meme.webp", logger=_Log())
+            finally:
+                _MTX.normalize_image_data = _orig_norm
+            check("★★★ 惰性构建：gif 档成功时 normalize **零调用**（不再预烧 APNG/PNG）",
+                  bool(_w2) and _norm_calls["n"] == 0,
+                  f"url={_w2} norm_calls={_norm_calls['n']}")
         M.set_md_gif_mode("auto")
 
         print("   [2c-1] url 模式：远程动图**保留原公网地址**（平台自己下载）")

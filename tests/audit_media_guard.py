@@ -283,6 +283,15 @@ async def main():
     check("★ 有日志说明（WebP→GIF 直传成功）",
           any("WebP" in m and "GIF" in m for _lv, m in log.lines), str(log.lines[-2:]))
 
+    print("\n[2d] GIF 转换缓存：同一文件不重复转（实测曾 41 秒内转两次）")
+    _g1 = M.to_animated_gif(webp)
+    _g2 = M.to_animated_gif(webp)
+    check("★ 两次结果一致且命中缓存",
+          bool(_g1) and _g1 == _g2 and len(M._GIF_CACHE) >= 1,
+          f"cache={len(M._GIF_CACHE)} g1={bool(_g1)}")
+    check("★ memo TTL 已延长到 30 分钟（原 10 分钟）",
+          M._RAW_IMG_REJECT_TTL >= 1800.0, str(M._RAW_IMG_REJECT_TTL))
+
     print("\n[3] 连 APNG 都被拒 ⇒ 原始 GIF 字节改按文件发（保投递）")
     M._RAW_IMG_REJECTED.clear()
     log = _Log()
