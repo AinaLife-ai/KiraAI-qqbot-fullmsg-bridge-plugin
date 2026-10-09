@@ -513,10 +513,11 @@ async def _call_part_finish(api: Any, route: Any, body: dict, *, label: str,
 #: 动图策略（由插件配置注入；auto=试原图优先 / static=直接转存）
 _MD_GIF_MODE = "auto"
 
-#: 原始动图被平台拒过（(md5) -> 时间戳）；10 分钟内不再重复试，
-#: 免得同一条动图每发一次就白撞一次 850019。有界（最多 64 条）。
-_RAW_GIF_REJECTED: dict = {}
-_RAW_GIF_REJECT_TTL = 600.0
+#: 原始动图被平台拒过 ⇒ 记忆改**三路共享**（media_types._RAW_IMG_REJECTED，
+#: 元素层 / HTTP 安全网 / md 共用一份；TTL 30 分钟）。实测贴纸 17:35 拒过 WebP，
+#: md 17:39 又白撞两次 —— 共享后一处被拒、处处不再试。
+from media_types import _probe_mark as _shared_probe_mark
+from media_types import _probe_recently_rejected as _shared_probe_rejected
 
 
 def set_md_gif_mode(mode: str) -> None:
@@ -551,69 +552,67 @@ def _count_frames(data: bytes) -> int:
 
 
 def _make_upload_candidates(data: bytes, name: str, logger: Any):
-    """按当前策略给出转存候选链：[(标签, bytes, 文件名), ...]。
+    """按当前策略给出**惰性**候选链：``[(标签, getter)]``，``getter() → (bytes, name)``。
 
     * png/jpeg ⇒ 原样一条（零开销）；
     * 动图（gif/webp 多帧）且 auto ⇒ 原图 →（WebP 则加）**动画 GIF** →
       APNG → 静态 PNG（逐级退守）；
     * 其它非 png/jpg（webp 静图 / bmp / …）⇒ 一次规范化（静态 PNG / 可转 APNG）。
+
+    ★★ 2026-10-10 改**惰性构建**（性能）：以前把所有候选（含 APNG / 静态 PNG）
+      **提前全部构建** —— 即使第一档就成功。实测出现过"69 帧动图先白建 6.2MB
+      APNG（超限被丢）× 2"的白烧（数秒）。现在每档**用到才构建**，
+      构建失败/为空由调用方跳下一档。
     """
     try:
         from media_types import normalize_image_data, sniff_image_format
     except Exception:
-        return [("", data, name)]
+        return [("", lambda: (data, name))]
     fmt = sniff_image_format(data)
     if fmt in ("png", "jpeg") or not data:
-        return [("", data, name)]
+        return [("", lambda: (data, name))]
 
     base_name = name or "image.png"
+
+    def _apng():
+        b, n, _note = normalize_image_data(data, base_name, logger, allow_anim=True)
+        return None if b is data else (b, n)
+
+    def _png():
+        b, n, _note = normalize_image_data(data, base_name, logger, allow_anim=False)
+        return None if b is data else (b, n)
+
+    def _gif():
+        try:
+            from media_types import to_animated_gif as _to_gif
+
+            b = _to_gif(data, logger)
+        except Exception:
+            b = None
+        if not b:
+            return None
+        return b, os.path.splitext(base_name)[0] + ".gif"
+
     if fmt in ("gif", "webp") and _count_frames(data) > 1:
         if _MD_GIF_MODE == "auto":
-            import hashlib as _h
-            import time as _t
-
-            key = _h.md5(data).hexdigest()
-            ts = _RAW_GIF_REJECTED.get(key, 0.0)
-            fresh = (_t.time() - ts) < _RAW_GIF_REJECT_TTL
-            cands = [] if fresh else [("原始动图（保动画优先）", data, base_name)]
+            cands = []
+            if not _shared_probe_rejected(data):
+                cands.append(("原始动图（保动画优先）", lambda: (data, base_name)))
             # ★★ 平台收 GIF、不收 WebP（2026-10-10 实锤）：WebP 候选之后先给
             #   一个**动画 GIF** 候选（保动画），再退 APNG/PNG（静图）。
             if fmt == "webp":
-                try:
-                    from media_types import to_animated_gif as _to_gif
-
-                    _gif_b = _to_gif(data, logger)
-                except Exception:
-                    _gif_b = None
-                if _gif_b:
-                    _gif_name = os.path.splitext(base_name)[0] + ".gif"
-                    cands.append(("动画 GIF（转档保动画）", _gif_b, _gif_name))
-            apng, apng_name, _n1 = normalize_image_data(data, base_name, logger,
-                                                        allow_anim=True)
-            if apng is not data and not any(apng == c[1] for c in cands):
-                cands.append(("APNG（动图版 PNG）", apng, apng_name))
-            png, png_name, _n2 = normalize_image_data(data, base_name, logger,
-                                                      allow_anim=False)
-            if png is not data and not any(png == c[1] for c in cands):
-                cands.append(("静态 PNG（第一帧）", png, png_name))
-            return cands or [("", data, base_name)]
+                cands.append(("动画 GIF（转档保动画）", _gif))
+            cands.append(("APNG（动图版 PNG）", _apng))
+            cands.append(("静态 PNG（第一帧）", _png))
+            return cands
         # static：跳过原图，直接 APNG → PNG
-        cands = []
-        apng, apng_name, _n1 = normalize_image_data(data, base_name, logger,
-                                                    allow_anim=True)
-        if apng is not data:
-            cands.append(("APNG（动图版 PNG）", apng, apng_name))
-        png, png_name, _n2 = normalize_image_data(data, base_name, logger,
-                                                  allow_anim=False)
-        if png is not data and not any(png == c[1] for c in cands):
-            cands.append(("静态 PNG（第一帧）", png, png_name))
-        return cands or [("", data, base_name)]
+        return [("APNG（动图版 PNG）", _apng), ("静态 PNG（第一帧）", _png)]
 
     # 非动图：一次规范化（保持 v1.6.8 行为）
     norm, nname, _note = normalize_image_data(data, base_name, logger)
     if norm is data:
-        return [("", data, base_name)]
-    return [("PNG 规范化", norm, nname)]
+        return [("", lambda: (data, base_name))]
+    return [("PNG 规范化", lambda: (norm, nname))]
 
 
 async def _upload_bytes_to_qq(
@@ -646,7 +645,28 @@ async def _upload_bytes_to_qq(
 
     candidates = await asyncio.to_thread(_make_upload_candidates, data, name, logger)
     last_exc: Optional[BaseException] = None
-    for _i, (label, cdata, cname) in enumerate(candidates):
+    attempted: set = set()
+    for _i, (label, getter) in enumerate(candidates):
+        # ★ 惰性构建：用到才转档（失败的档位直接跳过，不再提前全建一遍）
+        try:
+            built = await asyncio.to_thread(getter)
+        except Exception:
+            built = None
+        if not built:
+            if logger is not None and label:
+                logger.debug("[QQBOT-BRIDGE] 候选「%s」构建失败/不适用 —— 跳过", label)
+            continue
+        cdata, cname = built
+        try:
+            import hashlib as _h
+
+            sig = _h.md5(cdata).hexdigest()
+        except Exception:
+            sig = None
+        if sig and sig in attempted:
+            continue                      # 与已试候选字节相同（如 APNG==PNG）⇒ 不重复上传
+        if sig:
+            attempted.add(sig)
         try:
             url = await _upload_one_bytes(client, target_id, is_group, cdata,
                                           cname, logger=logger, file_type=file_type)
@@ -655,20 +675,9 @@ async def _upload_bytes_to_qq(
 
             if _is_fmt(exc):
                 last_exc = exc
-                # 「原图被平台拒」要记下来：10 分钟内不再对同一张图白撞
+                # 「原图被平台拒」记进**三路共享**的记忆（元素层/安全网/md 同一份）
                 if label.startswith("原始动图"):
-                    try:
-                        import hashlib as _h
-                        import time as _t
-
-                        _RAW_GIF_REJECTED[_h.md5(data).hexdigest()] = _t.time()
-                        if len(_RAW_GIF_REJECTED) > 64:
-                            _oldest = sorted(_RAW_GIF_REJECTED.items(),
-                                             key=lambda kv: kv[1])[:16]
-                            for _k, _ in _oldest:
-                                _RAW_GIF_REJECTED.pop(_k, None)
-                    except Exception:
-                        pass
+                    _shared_probe_mark(data, True)
                 nxt = candidates[_i + 1][0] if _i + 1 < len(candidates) else None
                 if logger is not None:
                     if nxt:
@@ -692,12 +701,7 @@ async def _upload_bytes_to_qq(
                         "md 里这条**有机会真动**；若客户端仍显示静图，把 md_gif_mode 设为 static 可回退",
                         name or "动图")
                     # 清掉"曾被拒"的旧记忆（平台侧行为可能已变化）
-                    try:
-                        import hashlib as _h
-
-                        _RAW_GIF_REJECTED.pop(_h.md5(data).hexdigest(), None)
-                    except Exception:
-                        pass
+                    _shared_probe_mark(data, False)
                 else:
                     logger.info(
                         "[QQBOT-BRIDGE] 动图已按「%s」转存成功（逐步退守的结果）", label)

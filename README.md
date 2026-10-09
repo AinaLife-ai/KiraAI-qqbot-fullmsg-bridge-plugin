@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.14
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.15
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -456,6 +456,41 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.15</b> — ★★ 表情包/md 动图性能优化：惰性候选链 + 转换缓存 + 负缓存三路共享（实测白烧点清零）</summary>
+
+### 背景（对用户 2026-10-09 17:33–17:39 日志逐帧分析）
+
+功能全通后，日志里还留着三处**真实的浪费**（时间戳都能对上）：
+
+1. **md 候选链"预烧"**：`动图转出的 APNG 超过体积上限（6.2 MB）` 是
+   **构建完才发现超标被丢**——而这档根本用不上（下一档 GIF 立刻成功）。
+   69 帧动图白烧数秒 × 2 张图。
+2. **重复转换**：同一文件 41 秒内转换了两次（17:35 贴纸 → 17:36 又一遍）。
+3. **负缓存不共享**：媒体层 17:35 拒过 WebP，md 17:39 又白撞两次（两份独立记忆）。
+
+### 修复（四件）
+
+* **md 候选链改「惰性构建」**：每档**用到才转档**，成功即停 ——
+  GIF 档成功时 APNG / 静态 PNG **零构建**（已用测试钉死：normalize 零调用）；
+* **WebP→GIF 转换加缓存**（md5 → 产物，TTL 30 分钟、有界 32）：
+  同一张贴纸 / md 图重复发送**不再重复转码**；
+* **「被平台拒」负缓存三路共享**（元素层 / HTTP 安全网 / md 共用同一份）
+  + TTL 10 分钟 → **30 分钟**：一处被拒、处处不再白撞；
+* 两条日志文案更新为现行事实（WebP 不收 / file_name 现行规则）。
+
+### 预期效果（同场景对照）
+
+| 场景 | 旧行为 | 新行为 |
+|---|---|---|
+| 30 分钟内重复发同一贴纸 | 每次≈转码 0.5s + 上传 | **仅上传** |
+| md 发 69 帧动图 | 转码 + GIF + 白建 APNG（秒级） | **GIF 一次（可缓存）+ 直传** |
+| 贴纸拒过后再走 md | 白撞 1-2 次请求 | **直接跳过** |
+
+**全套件双世代全绿。**
+
+</details>
+
+<details>
 <summary><b>v1.6.14</b> — ★ 兼容 v3.0.0-alpha.3（A3）：全链路复核通过 + sticker_mgr 新属性名优先适配</summary>
 
 ### 背景
