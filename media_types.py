@@ -121,10 +121,19 @@ async def maybe_convert_to_silk(media_element: Any, logger_: Any,
         path = await media_element.to_path()
         if not path or not os.path.isfile(path):
             return None
-        # ① 内容**确实是** silk ⇒ 只做腾讯系头校验（是则原路径复用）
+        # ① 内容**确实是** silk ⇒ 做腾讯系头校验；★ 超长的还要剪裁到上限
+        #    （实测踩到过：外部工具 silk-wasm 产出的长语音会超 5 分钟）
         if silk_magic_ok(path):
-            return KEEP_AS_IS if await to_silk_if_needed(
-                path, logger_=logger_, max_seconds=max_seconds) else None
+            out = await to_silk_if_needed(path, logger_=logger_,
+                                          max_seconds=max_seconds)
+            if not out:
+                return None
+            if os.path.realpath(out) == os.path.realpath(path):
+                return KEEP_AS_IS
+            # ★★ 2026-10-10 审查修复：**剪裁产物是新路径**，必须返回它。
+            #    原写法一律返回 KEEP_AS_IS ⇒ 调用方会继续用原文件（仍然超长）
+            #    ⇒ 平台照样拒收、退回文件卡片，剪裁等于白做。
+            return out
         # ② 其它一律尝试转 silk（含"改名 silk"与 ogg/m4a/amr…）
         silk = await to_silk_if_needed(path, logger_=logger_, max_seconds=max_seconds)
         if not silk:
@@ -513,7 +522,7 @@ def _log_upload_shape_once(file_type: int, payload: dict, logger_: Any) -> None:
               for k, v in payload.items() if k not in ("group_openid", "openid")}
     logger_.info(
         "[QQBOT-BRIDGE] 媒体上传体形状（file_type=%s）：%s —— "
-        "—— 现行规则：文件(4)/图片(1) 带 file_name、语音(3) 不带（2026-10-10 修订）",
+        "现行规则：文件(4)/图片(1) 带 file_name、语音(3) 不带（2026-10-10 修订）",
         file_type, fields,
     )
 

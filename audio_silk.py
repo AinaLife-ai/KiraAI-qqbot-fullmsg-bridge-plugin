@@ -140,7 +140,7 @@ def _fmt_secs(seconds: Any) -> str:
     return f"{int(s // 60)}:{int(s % 60):02d}"
 
 
-def probe_duration_sync(path: str, timeout: int = 20) -> Optional[float]:
+def probe_duration_sync(path: str, timeout: int = 10) -> Optional[float]:
     """用 ffmpeg 头解析读音频时长（秒）；读不到返回 ``None``。
 
     * **只解析文件头**（不给输出文件 ⇒ ffmpeg 立刻带着 "Duration: …" 退出），
@@ -553,6 +553,12 @@ def _truncate_silk(path: str, cap: float, logger_: Any):
         return None
     if size <= cap * _SILK_MIN_BYTES_PER_SEC:
         return None                       # 便宜筛：这么点字节不可能超过 cap 秒
+    # ★ 量过的长度也要缓存：大而不超长的 silk（1.5–5 分钟档）重复发送时
+    #   不必每次都解码（实测 10 秒音频 13ms，5 分钟级就是几百毫秒）
+    mkey = "silk|" + _digest(path)
+    measured = _DUR_CACHE.get(mkey)
+    if measured is not None and measured <= cap:
+        return None                       # 上次量过：没超 ⇒ 直接放过
     encoder = _silk_encoder()
     if encoder not in ("pysilk", "pilk"):
         return None                       # 没有能解码的后端 ⇒ 放过
@@ -566,6 +572,9 @@ def _truncate_silk(path: str, cap: float, logger_: Any):
             pysilk.decode(fi, fo, _SILK_RATE)
         got = os.path.getsize(pcm_path)
         cap_bytes = int(cap * _SILK_RATE) * 2
+        _DUR_CACHE[mkey] = got / (_SILK_RATE * 2)      # ★ 记住这次量到的长度
+        if len(_DUR_CACHE) > 256:                      # 有界，防长会话里无限增长
+            _DUR_CACHE.clear()
         if got <= cap_bytes:
             _rm_tree(out_dir)
             return None                   # 量完发现没超 ⇒ 原样用（也不会留临时目录）
@@ -595,8 +604,7 @@ def _truncate_silk(path: str, cap: float, logger_: Any):
         return None
 
 
-def _silk_with_cap(path: str, cap: Optional[float], logger_: Any,
-                   cache_key: Optional[str] = None) -> Optional[str]:
+def _silk_with_cap(path: str, cap: Optional[float], logger_: Any) -> Optional[str]:
     """已合法 silk：``cap`` 生效且确实超长 ⇒ 返回剪裁后的新路径，否则返回**原路径**。
 
     带缓存（``_CACHE``，与转码产物同一张表、同一套淘汰/清理逻辑）：
@@ -604,7 +612,7 @@ def _silk_with_cap(path: str, cap: Optional[float], logger_: Any,
     """
     if not cap:
         return path
-    key = (cache_key or _digest(path)) + f"|trim{cap:.3f}"
+    key = _digest(path) + f"|trim{cap:.3f}"
     hit = _CACHE.get(key)
     if hit and os.path.exists(hit[0]):
         return hit[0]
@@ -737,12 +745,15 @@ def _convert_sync(src: str, out_dir: str,
             _got = 0
         if _got and _got >= max(0, cap_bytes - 4096):
             _src_len = probe_duration_sync(src)
-            logger.info(
-                "[QQBOT-BRIDGE] 语音超长：已自动剪裁（原 %s → %s）——"
-                "平台语音条上限 5 分钟（超 1 秒都会失败并退回文件卡片），多出的部分已丢弃。"
-                "（voice_max_seconds 可调上限；voice_auto_trim=false 可关）",
-                _fmt_secs(_src_len) if _src_len else "?", _fmt_secs(cap),
-            )
+            # ★ 源正好等于上限（或只差一个帧）⇒ 其实没剪掉什么，不谎报"已剪裁"；
+            #   探测不到长度（None）时照常写日志（无法证伪，如实带个 "?"）。
+            if _src_len is None or _src_len > cap + 0.05:
+                logger.info(
+                    "[QQBOT-BRIDGE] 语音超长：已自动剪裁（原 %s → %s）——"
+                    "平台语音条上限 5 分钟（超 1 秒都会失败并退回文件卡片），多出的部分已丢弃。"
+                    "（voice_max_seconds 可调上限；voice_auto_trim=false 可关）",
+                    _fmt_secs(_src_len) if _src_len else "?", _fmt_secs(cap),
+                )
 
     # ② PCM → silk（采样率必须与上面 ffmpeg 的 -ar 一致）
     #
@@ -911,5 +922,6 @@ def clear_cache() -> None:
         if entry and len(entry) > 1:
             _rm_tree(entry[1])
     _CACHE.clear()
+    _DUR_CACHE.clear()                    # ★ 时长/量长缓存一并清（测试与还原用）
     reset_ffmpeg_cache()
     reset_encoder_cache()

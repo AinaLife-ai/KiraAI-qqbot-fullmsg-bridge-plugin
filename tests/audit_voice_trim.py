@@ -15,6 +15,7 @@
 10. 剪裁产物缓存（同一份超长音频不重复解码重编码）
 """
 import asyncio
+import base64
 import math
 import os
 import struct
@@ -350,6 +351,257 @@ class PlainFileElem:
 
 ck("★ classify() 对普通 File 返回 None（交回核心按文件发）",
    M.classify(PlainFileElem()) is None)
+
+
+print("\n═══ 12) ★审查修复回归：**已 silk 且超长**必须真的用上剪裁产物 ═══")
+# （原缺陷：maybe_convert_to_silk 对"已是 silk"一律返回 KEEP_AS_IS ⇒
+#   剪裁结果被丢掉，上传的仍是超长原文件 ⇒ 平台拒收 ⇒ 文件卡片，功能等于没做）
+A._CACHE.clear()
+A._DUR_CACHE.clear()
+lg6 = L()
+got2 = asyncio.run(M.maybe_convert_to_silk(FakeElem(silk10), lg6, 4))
+ck("★★ 超长 silk：返回的是**剪裁产物**（不是 KEEP_AS_IS）",
+   bool(got2) and got2 != M.KEEP_AS_IS, repr(got2))
+ck("★★ 产物时长 = 4.00s（真的剪了）", abs(silk_secs(str(got2)) - 4.0) <= 0.05,
+   silk_secs(str(got2)))
+ck("★ 产物是腾讯系 silk", open(str(got2), "rb").read(10) == b"\x02#!SILK_V3")
+
+A._CACHE.clear()
+lg7 = L()
+got3 = asyncio.run(M.maybe_convert_to_silk(FakeElem(silk2), lg7, 300))
+ck("★ 不超长的 silk：仍然返回 KEEP_AS_IS（老行为不变、零成本）",
+   got3 == M.KEEP_AS_IS, repr(got3))
+
+print("\n═══ 13) 源正好等于上限 ⇒ 不谎报『已剪裁』（日志准确性）═══")
+A._CACHE.clear()
+A._DUR_CACHE.clear()
+wav6 = os.path.join(D, "src6.wav")
+mk_wav(wav6, 6)
+_h13 = cap_logs()
+A._CACHE.clear()
+p13 = asyncio.run(A.convert_to_silk_forced(wav6, logger_=L(), max_seconds=6))
+A.logger.removeHandler(_h13)
+ck("★ 产物时长 ~6s（精确等于上限，没被剪短）", abs(silk_secs(p13) - 6.0) <= 0.1,
+   silk_secs(p13))
+ck("★★ 没有『已自动剪裁』日志（源没超，不该谎报）",
+   not any("已自动剪裁" in m for m in _h13.recs),
+   str([m for m in _h13.recs if "剪裁" in m][:1]))
+
+print("\n═══ 14) 量长缓存：大而不超长的 silk 不重复解码 ═══")
+silk6 = to_silk(wav6, os.path.join(D, "s6.silk"))
+print(f"    6 秒 silk = {os.path.getsize(silk6)}B（尺寸筛阈值 cap×500；取 cap=10 ⇒ 5000B）")
+calls3 = {"n": 0}
+
+
+def _spy_decode2(fi, fo, r, *a, **k):
+    calls3["n"] += 1
+    return _orig_decode(fi, fo, r, *a, **k)
+
+
+A._CACHE.clear()
+A._DUR_CACHE.clear()
+pysilk.decode = _spy_decode2
+try:
+    r1 = asyncio.run(A.to_silk_if_needed(silk6, logger_=L(), max_seconds=10))
+    n_after_first = calls3["n"]
+    r2 = asyncio.run(A.to_silk_if_needed(silk6, logger_=L(), max_seconds=10))
+    n_after_second = calls3["n"]
+finally:
+    pysilk.decode = _orig_decode
+ck("★ 第一次：解码量长度（没超 ⇒ 原样返回）", r1 == silk6 and n_after_first == 1,
+   f"r1={r1} decode={n_after_first}")
+ck("★★ 第二次：命中量长缓存 ⇒ **零解码**", r2 == silk6 and n_after_second == n_after_first,
+   f"decode 累计={n_after_second}")
+
+print("\n═══ 15) 安全网（HTTP 层）也按上限剪裁（端到端，真 ffmpeg+pysilk）═══")
+try:
+    import types as _types
+
+    from _env import botpy_parent as _bp
+
+    sys.path.insert(0, _bp())
+    from botpy.http import Route
+
+    class _GuardHTTP:
+        def __init__(self):
+            self.calls = []
+
+        async def request(self, route, **kw):
+            body = dict(kw.get("json") or {})
+            raw = base64.b64decode(body.get("file_data") or "") if body.get("file_data") else b""
+            self.calls.append({"body": body, "raw": raw})
+            return {"file_info": "FI"}
+
+    class _Plugin:
+        voice_auto_trim = True
+        voice_max_seconds = 2
+
+    http = _GuardHTTP()
+    client = _types.SimpleNamespace()
+    client.api = _types.SimpleNamespace()
+    client.api._http = http
+    A._CACHE.clear()
+    ok_guard = M.install_http_guard(client, L(), _Plugin())
+    ck("★ 安全网安装成功", ok_guard is True, repr(ok_guard))
+    route = Route("POST", "/v2/users/{openid}/files", openid="U1")
+    with open(wav6, "rb") as _f:
+        _payload = _f.read()
+    res = asyncio.run(http.request(route, json={
+        "file_type": 3,
+        "file_data": base64.b64encode(_payload).decode("ascii"),
+        "srv_send_msg": False, "openid": "U1"}))
+    ck("★ 拿到 file_info（消息没丢）", (res or {}).get("file_info") == "FI", str(res)[:80])
+    ck("★ 安全网发出了请求（file_type=3）", bool(http.calls) and http.calls[-1]["body"].get("file_type") == 3)
+    _sent = http.calls[-1]["raw"]
+    ck("★★ 安全网发出的字节是腾讯系 silk",
+       _sent[:10] == b"\x02#!SILK_V3", _sent[:12].hex())
+    with open("/tmp/voicetrim/guard_out.silk", "wb") as _f:
+        _f.write(_sent)
+    ck("★★ 安全网产物 ≤ 2 秒（按插件配置的上限剪裁）",
+       silk_secs("/tmp/voicetrim/guard_out.silk") <= 2.05,
+       silk_secs("/tmp/voicetrim/guard_out.silk"))
+    M.restore_http_guard(client)
+except ImportError as exc:                     # botpy 不在本机 ⇒ 跳过该节
+    print(f"    SKIP（botpy 不可用：{exc}）")
+except Exception as exc:
+    ck("★ 安全网用例无异常", False, f"{type(exc).__name__}: {exc}")
+
+
+print("\n═══ 16) 元素层端到端（_upload_file 全链路：分类→转码→剪裁→上传体）═══")
+try:
+    import types as _t2
+
+    from _env import botpy_parent as _bp2
+
+    sys.path.insert(0, _bp2())
+
+    class _CapHTTP:
+        def __init__(self):
+            self.calls = []
+
+        async def request(self, route, **kw):
+            body = dict(kw.get("json") or {})
+            raw = base64.b64decode(body.get("file_data") or "") if body.get("file_data") else b""
+            self.calls.append({"body": body, "raw": raw})
+            return {"file_info": "FI"}
+
+    class _Elem:
+        """假媒体元素：够 _guess_name/classify/_upload 用。"""
+
+        def __init__(self, path, kind="Record"):
+            self.file = path
+            self.file_type = "file"
+            self._kira_bridge_orig_kind = kind
+
+        async def to_path(self):
+            return self.file
+
+    class _Plugin2:
+        voice_auto_trim = True
+        voice_max_seconds = 4
+        gif_sticker_mode = "auto"
+
+    async def _run_case(elem, plugin):
+        http = _CapHTTP()
+        client = _t2.SimpleNamespace()
+        client.api = _t2.SimpleNamespace()
+        client.api._http = http
+        delegated = []
+
+        async def _orig_upload(target_id, media_element, is_group):
+            delegated.append(media_element)
+            return {"file_info": "ORIG"}
+
+        holder = _t2.SimpleNamespace()
+        holder._upload_file = _orig_upload
+        A._CACHE.clear()
+        if not M.install(holder, client, L(), plugin):
+            raise RuntimeError("install 失败")
+        out = await holder._upload_file("U1", elem, False)
+        return http, delegated, out
+
+    # (a) 非 silk 源（10 秒 wav）+ 上限 4 ⇒ 上传体必须是 ≤4 秒的腾讯系 silk
+    http_a, deleg_a, out_a = asyncio.run(_run_case(_Elem(wav10), _Plugin2()))
+    raw_a = http_a.calls[-1]["raw"] if http_a.calls else b""
+    ck("★(a) 走了元素层上传（没交回核心）", bool(http_a.calls) and not deleg_a,
+       f"calls={len(http_a.calls)} delegated={len(deleg_a)}")
+    ck("★(a) 体 = file_type=3 + 腾讯系 silk",
+       http_a.calls[-1]["body"].get("file_type") == 3 and raw_a[:10] == b"\x02#!SILK_V3",
+       raw_a[:12].hex())
+    open("/tmp/voicetrim/e2e_a.silk", "wb").write(raw_a)
+    ck("★★(a) 上传体时长 = 4.00s", abs(silk_secs("/tmp/voicetrim/e2e_a.silk") - 4.0) <= 0.05,
+       silk_secs("/tmp/voicetrim/e2e_a.silk"))
+
+    # (b) ★ 已经是 silk 且超长（10 秒 silk）+ 上限 4 ⇒ 上传体必须是被剪过的产物
+    http_b, deleg_b, out_b = asyncio.run(_run_case(_Elem(silk10), _Plugin2()))
+    raw_b = http_b.calls[-1]["raw"] if http_b.calls else b""
+    open("/tmp/voicetrim/e2e_b.silk", "wb").write(raw_b)
+    ck("★★(b) 已 silk 超长：上传体被剪到 ≤4s（回归：原缺陷会原样发 10s）",
+       bool(raw_b) and silk_secs("/tmp/voicetrim/e2e_b.silk") <= 4.05,
+       silk_secs("/tmp/voicetrim/e2e_b.silk"))
+    ck("★(b) 且是腾讯系 silk、file_type=3",
+       raw_b[:10] == b"\x02#!SILK_V3" and http_b.calls[-1]["body"].get("file_type") == 3)
+
+    # (c) 已 silk 且不超长（2 秒 silk）+ 上限 300 ⇒ 字节一字不改（零成本老行为）
+    http_c, _, _ = asyncio.run(_run_case(_Elem(silk2), _Plugin2.__class__(
+        "P", (), {"voice_auto_trim": True, "voice_max_seconds": 300,
+                  "gif_sticker_mode": "auto"})()))
+    raw_c = http_c.calls[-1]["raw"] if http_c.calls else b""
+    with open(silk2, "rb") as _f:
+        ck("★★(c) 短 silk：上传体与原文件**逐字节一致**（未剪裁、零额外开销）",
+           raw_c == _f.read(), f"{len(raw_c)}B")
+
+    # (d) 关闭剪裁（voice_auto_trim=False）⇒ 超长 silk 原样发（老行为，可回退）
+    _off = _t2.SimpleNamespace(voice_auto_trim=False, voice_max_seconds=300,
+                               gif_sticker_mode="auto")
+    http_d, _, _ = asyncio.run(_run_case(_Elem(silk10), _off))
+    raw_d = http_d.calls[-1]["raw"] if http_d.calls else b""
+    with open(silk10, "rb") as _f:
+        ck("★★(d) 关闭剪裁：超长 silk 原样发（回退老行为，功能可关）",
+           raw_d == _f.read(), f"{len(raw_d)}B")
+
+    # (e) 普通文件（file_type=4 路径）⇒ 完全交回核心，一个字节都不动
+    http_e, deleg_e, out_e = asyncio.run(_run_case(
+        _Elem(os.path.abspath(__file__), kind=None), _Plugin2()))
+    ck("★★(e) 普通 File：不进媒体层（交回核心）", not http_e.calls and len(deleg_e) == 1,
+       f"calls={len(http_e.calls)} delegated={len(deleg_e)}")
+except ImportError as exc:
+    print(f"    SKIP（botpy 不可用：{exc}）")
+except Exception as exc:
+    ck("★ 元素层端到端用例无异常", False, f"{type(exc).__name__}: {exc}")
+
+
+print("\n═══ 17) 零额外成本的硬证据：进程数（上限 ≥ 源长时）═══")
+_procs = []
+_orig_run2 = A.subprocess.run
+
+
+def _count_run(cmd, *a, **k):
+    try:
+        if "ffmpeg" in os.path.basename(str(cmd[0])):
+            _procs.append(list(cmd))
+    except Exception:
+        pass
+    return _orig_run2(cmd, *a, **k)
+
+
+A.subprocess.run = _count_run
+try:
+    A._CACHE.clear()
+    A._DUR_CACHE.clear()
+    asyncio.run(A.convert_to_silk_forced(wav10, logger_=L(), max_seconds=300))
+    n_ok = len(_procs)
+    _procs.clear()
+    A._CACHE.clear()
+    A._DUR_CACHE.clear()
+    asyncio.run(A.convert_to_silk_forced(wav10, logger_=L(), max_seconds=3))
+    n_trim = len(_procs)
+finally:
+    A.subprocess.run = _orig_run2
+ck("★★ 不超长：**只启动 1 个 ffmpeg**（-t 是 no-op，没有额外探测）", n_ok == 1,
+   f"进程数={n_ok}")
+ck("★ 真剪裁：2 个 ffmpeg（解码 + 为日志探一次头），只在真剪时才付",
+   n_trim == 2, f"进程数={n_trim}")
 
 print(f"\n结果：{P} passed, {F} failed")
 sys.exit(1 if F else 0)
