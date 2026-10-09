@@ -53,10 +53,62 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 
 
 def _body(payload: Any) -> Optional[dict]:
-    if not isinstance(payload, dict):
+    """把 botpy 的 `Interaction` 对象 / 原始 payload 统一成**扁平 dict**。
+
+    ★★★ 2026-10-10 修的真断点（用户实测："回调按钮点了没反应 / 客户端提示
+      请求第三方失败"，香里查到"适配层没把 INTERACTION 事件接进来"）：
+
+    botpy 的派发形状是 `Interaction` **对象**（见 `botpy/interaction.py` 与
+    `botpy/connection.py:165`）：
+
+        parse_interaction_create(payload)
+            → Interaction(api, payload["id"], payload["d"])
+            → _dispatch("interaction_create", 对象)
+            → client.on_interaction_create(对象)      # ← 我们收到的就是这个对象
+
+    而原来的实现只认 dict（`payload.get("d")`）⇒ **对象形态被直接丢弃**：
+    不回执（客户端一直 loading / 报错）、也不转成消息 ⇒ 看起来就像"没接进来"。
+
+    现在两种形状都认：
+      * `Interaction` 对象 ⇒ 取 `id/type/scene/chat_type/user_openid/group_openid/
+        group_member_openid/data.resolved.{button_id,button_data,message_id,user_id}`；
+      * 原始 dict ⇒ `{"d": {...}}`（网关包一层）或内层 dict 本身（webhook/测试用）。
+    """
+    if isinstance(payload, dict):
+        inner = payload.get("d")
+        return inner if isinstance(inner, dict) else payload
+
+    # ---- botpy 的 Interaction 对象（真派发形状）----
+    if not hasattr(payload, "type") and not hasattr(payload, "data"):
         return None
-    inner = payload.get("d")
-    return inner if isinstance(inner, dict) else payload
+    data = getattr(payload, "data", None)
+    if isinstance(data, dict):
+        resolved = data.get("resolved") or {}
+    else:
+        resolved = getattr(data, "resolved", None) or {}
+
+    def _r(name: str) -> Any:
+        if isinstance(resolved, dict):
+            return resolved.get(name)
+        return getattr(resolved, name, None)
+
+    return {
+        # ⚠ 回执要用**内层 d.id**（官方：interaction_id 取自事件的 d.id，不带前缀）；
+        #  botpy 的 Interaction.id 正是 d.id（外层信封 id 存在 event_id 里）。
+        "id": getattr(payload, "id", None) or getattr(payload, "event_id", None),
+        "type": getattr(payload, "type", None),
+        "scene": getattr(payload, "scene", None),
+        "chat_type": getattr(payload, "chat_type", None),
+        "user_openid": getattr(payload, "user_openid", None),
+        "group_openid": getattr(payload, "group_openid", None),
+        "group_member_openid": getattr(payload, "group_member_openid", None),
+        "data": {"resolved": {
+            "button_id": _r("button_id"),
+            "button_data": _r("button_data"),
+            "message_id": _r("message_id"),
+            "user_id": _r("user_id"),
+        }},
+    }
 
 
 class InteractionBridge:
@@ -68,6 +120,10 @@ class InteractionBridge:
         self._acked: set = set()          # 同一 interaction_id 只回执一次
         self._logged = False
         self._miss_logged = False
+        #: 载荷形状不认识时只喊一次（真出过"事件到了却被丢弃"的事故）
+        self._shape_logged = False
+        #: 回执失败/不可用时只喊一次（回执是官方硬要求，静默失败=用户看到一直转圈）
+        self._ack_fail_logged = False
 
     # ------------------------------------------------------------------ #
     def install(self, client: Any) -> str:
@@ -108,6 +164,12 @@ class InteractionBridge:
     async def _on_interaction(self, client: Any, payload: Any) -> None:
         body = _body(payload)
         if not isinstance(body, dict):
+            if not self._shape_logged:
+                self._shape_logged = True
+                self.logger.warning(
+                    "[QQBOT-BRIDGE] 互动事件载荷形状不认识（%s）—— 已忽略；"
+                    "请把这条连同 botpy 版本一起反馈（事件可能到了但没被接住）",
+                    type(payload).__name__)
             return
         interaction_id = str(body.get("id") or "")
         itype = body.get("type")
@@ -176,11 +238,23 @@ class InteractionBridge:
         api = getattr(client, "api", None)
         fn = getattr(api, "on_interaction_result", None)
         if not callable(fn):
+            if not self._ack_fail_logged:
+                self._ack_fail_logged = True
+                self.logger.warning(
+                    "[QQBOT-BRIDGE] 接口层没有 on_interaction_result ⇒ **无法回执**"
+                    "（官方要求 3 秒内回执，否则客户端一直 loading）——"
+                    "请把这条连同 botpy 版本一起反馈")
             return False
         try:
             await asyncio.wait_for(fn(interaction_id, 0), timeout=_ACK_TIMEOUT)
             return True
         except Exception as exc:
-            self.logger.debug("[QQBOT-BRIDGE] 互动回执失败（已忽略）: %s: %s",
-                              type(exc).__name__, exc)
+            if not self._ack_fail_logged:
+                self._ack_fail_logged = True
+                self.logger.warning(
+                    "[QQBOT-BRIDGE] 互动回执失败（%s: %s）—— 客户端可能一直转圈；"
+                    "把这条连同 botpy 版本反馈即可（不影响其它功能）",
+                    type(exc).__name__, str(exc)[:160])
+            else:
+                self.logger.debug("[QQBOT-BRIDGE] 互动回执失败（忽略）: %s", exc)
             return False
