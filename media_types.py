@@ -74,7 +74,25 @@ def _record_ext(path: str) -> str:
     return os.path.splitext(str(path or "").split("?")[0])[1].lower()
 
 
-async def maybe_convert_to_silk(media_element: Any, logger_: Any) -> Optional[str]:
+def _voice_cap(plugin: Any) -> Optional[float]:
+    """读插件的「语音条超长自动剪裁」配置 ⇒ 上限秒数；关闭/非法 ⇒ ``None``。
+
+    * ``voice_auto_trim=False`` ⇒ 不剪裁（回退到"超长就发文件卡片"的老行为）；
+    * ``voice_max_seconds`` 默认 **300 秒**（用户实测：平台语音条上限 5 分钟整，
+      多 1 秒都会失败并退回文件卡片）；
+    * 只在**语音条**（file_type=3）路径上生效 —— 当普通文件发的音频一个字节都不动。
+    """
+    try:
+        if not bool(getattr(plugin, "voice_auto_trim", True)):
+            return None
+        sec = float(getattr(plugin, "voice_max_seconds", 300) or 300)
+        return sec if 1.0 <= sec <= 3600.0 else 300.0
+    except Exception:
+        return 300.0
+
+
+async def maybe_convert_to_silk(media_element: Any, logger_: Any,
+                                max_seconds: Any = None) -> Optional[str]:
     """决定 `Record` 音频该怎么发（**只信 silk**，其余尽量转）。
 
     ## 三种线上形态（2026-10-08 用户实测，都必须能变成语音条）
@@ -105,9 +123,10 @@ async def maybe_convert_to_silk(media_element: Any, logger_: Any) -> Optional[st
             return None
         # ① 内容**确实是** silk ⇒ 只做腾讯系头校验（是则原路径复用）
         if silk_magic_ok(path):
-            return KEEP_AS_IS if await to_silk_if_needed(path, logger_=logger_) else None
+            return KEEP_AS_IS if await to_silk_if_needed(
+                path, logger_=logger_, max_seconds=max_seconds) else None
         # ② 其它一律尝试转 silk（含"改名 silk"与 ogg/m4a/amr…）
-        silk = await to_silk_if_needed(path, logger_=logger_)
+        silk = await to_silk_if_needed(path, logger_=logger_, max_seconds=max_seconds)
         if not silk:
             return None
         if os.path.realpath(silk) == os.path.realpath(path):
@@ -684,7 +703,8 @@ def classify(element: Any) -> Optional[int]:
     return None
 
 
-async def _retry_as_silk(api, target_id, media_element, is_group, exc, logger_):
+async def _retry_as_silk(api, target_id, media_element, is_group, exc, logger_,
+                         max_seconds: Any = None):
     """原样发被拒 ⇒ 转成 silk 再上传一次。返回结果或 None（转不了就交回）。
 
     ⚠ **全程不阻塞**：转码本身在 `to_silk_if_needed` 里走 `asyncio.to_thread`，
@@ -693,7 +713,8 @@ async def _retry_as_silk(api, target_id, media_element, is_group, exc, logger_):
     try:
         from audio_silk import convert_to_silk_forced
         src = await media_element.to_path()
-        silk = await convert_to_silk_forced(src, logger_= logger_)
+        silk = await convert_to_silk_forced(src, logger_= logger_,
+                                            max_seconds=max_seconds)
         if not silk:
             if logger_ is not None:
                 logger_.warning(
@@ -1071,7 +1092,8 @@ async def _guard_upload(route, args, body, kwargs, orig, logger, plugin):
                     return p
 
                 tmp = await asyncio.to_thread(_write_tmp)
-                silk = await convert_to_silk_forced(tmp, logger_=logger)
+                silk = await convert_to_silk_forced(tmp, logger_=logger,
+                                                    max_seconds=_voice_cap(plugin))
                 if silk:
                     with open(silk, "rb") as f:
                         silk_data = await asyncio.to_thread(f.read)
@@ -1123,7 +1145,8 @@ async def _guard_upload(route, args, body, kwargs, orig, logger, plugin):
                     return p
 
                 tmp2 = await asyncio.to_thread(_write_tmp2)
-                silk2 = await convert_to_silk_forced(tmp2, logger_=logger)
+                silk2 = await convert_to_silk_forced(tmp2, logger_=logger,
+                                                     max_seconds=_voice_cap(plugin))
                 if silk2:
                     with open(silk2, "rb") as f:
                         silk_data2 = await asyncio.to_thread(f.read)
@@ -1275,7 +1298,7 @@ def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) ->
                 file_type,
             )
         if file_type == FT_RECORD:
-            got = await maybe_convert_to_silk(media_element, logger)
+            got = await maybe_convert_to_silk(media_element, logger, _voice_cap(plugin))
             if got == KEEP_AS_IS:
                 pass                          # 本来就是（合法腾讯系）silk，全部不动
             elif got:
@@ -1440,7 +1463,8 @@ def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) ->
             #   又保证最终一定能发成语音条。
             if _pending_silk_retry and silk_path is None:
                 retried = await _retry_as_silk(
-                    api, target_id, media_element, is_group, exc, logger)
+                    api, target_id, media_element, is_group, exc, logger,
+                    _voice_cap(plugin))
                 if retried is not None:
                     return retried
             # ★★ 图片被平台以"格式不支持"拒（850019/850031）⇒ **按文件再发一次**（只一次）。

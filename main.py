@@ -277,10 +277,18 @@ def _log_banner_once() -> None:
         pil_ok = "✅"
     except Exception:
         pil_ok = "❌未安装（GIF/WEBP 图片无法转成平台接受的 PNG）"
+    try:
+        import audio_silk as _asilk2
+
+        _cap = _asilk2.voice_limit()
+        trim_ok = f"✅{_cap:.0f}s" if _cap else "已关闭（超长发文件卡片）"
+    except Exception:
+        trim_ok = "?"
     logger.info(
         "[QQBOT-BRIDGE] ╔═ 版本 v%s｜语音转码：silk 编码器=%s、ffmpeg=%s｜"
-        "图片规范化(Pillow)=%s═╗ 想确认问题请先看这一行（日志里搜 QQBOT-BRIDGE）",
-        _plugin_version(), silk_ok, ff_ok, pil_ok,
+        "图片规范化(Pillow)=%s｜语音条上限=%s═╗ "
+        "想确认问题请先看这一行（日志里搜 QQBOT-BRIDGE）",
+        _plugin_version(), silk_ok, ff_ok, pil_ok, trim_ok,
     )
 
 
@@ -361,6 +369,18 @@ class QQOfficialGroupBridge(BasePlugin):
         #: GIF/动图的发送方式：auto（默认：尽量内嵌显示，被平台拒就按文件发）/
         #: image（只按图片发）/ file（原样按文件发，保留动图）
         self.gif_sticker_mode = str(basic.get("gif_sticker_mode", "auto") or "auto").strip().lower()
+        #: ★★★ 2026-10-10 新增：**语音条超长自动剪裁**（默认开）。
+        #:   用户实测：QQ 官方 bot 语音条上限 **5 分钟（300 秒整）**——多 1 秒都失败、
+        #:   退回文件卡片。开着它，插件在转语音条（silk）时按上限截断：
+        #:   超长语音自动变成"5 分钟整"的语音条，不用再提醒模型注意长度。
+        #:   只影响**语音条**路径（<file type="record">）；当普通文件发的音频不动。
+        self.voice_auto_trim = bool(basic.get("voice_auto_trim", True))
+        try:
+            self.voice_max_seconds = float(basic.get("voice_max_seconds", 300) or 300)
+        except Exception:
+            self.voice_max_seconds = 300.0
+        if not (1.0 <= self.voice_max_seconds <= 3600.0):
+            self.voice_max_seconds = 300.0
         #: md 里的**动图**怎么发（2026-10-09 新增）：
         #:   auto（默认）= 先试"原始动图直传"（保动画优先）→ 被平台拒则 APNG → 静态 PNG；
         #:   url         = 远程动图**保留原公网地址**（平台自己下载转存，绕开上传接口的
@@ -678,6 +698,11 @@ class QQOfficialGroupBridge(BasePlugin):
         # ffmpeg 自定义路径同步给 audio_silk（同上）
         try:
             self._sync_ffmpeg_path()
+        except Exception:
+            pass
+        # 语音条上限同步给 audio_silk（同上）
+        try:
+            self._sync_voice_trim()
         except Exception:
             pass
         adapters = self._find_adapters()
@@ -2160,6 +2185,18 @@ class QQOfficialGroupBridge(BasePlugin):
         try:
             import md_media as _mdm
             _mdm.set_md_gif_mode(self.md_gif_mode)
+        except Exception:
+            pass
+
+    def _sync_voice_trim(self) -> None:
+        """把「语音条超长自动剪裁」的配置同步给 audio_silk（热改配置也能生效）。
+
+        注入的是**模块默认上限**：元素层 / 安全网还会按需显式传一次（同一份配置）。
+        ``voice_auto_trim=False`` ⇒ 传 None = 不剪裁（回退老行为：超长发文件卡片）。
+        """
+        try:
+            import audio_silk as _asilk
+            _asilk.configure_trim(self.voice_max_seconds if self.voice_auto_trim else None)
         except Exception:
             pass
 
