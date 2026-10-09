@@ -90,11 +90,13 @@ class _Log:
 class _FakeHTTP:
     """模拟平台上传接口：能按 file_type + 字节内容做判断/拒收。"""
 
-    def __init__(self, reject_gif=True, reject_apng=False, hard_fail=False):
+    def __init__(self, reject_gif=True, reject_apng=False, hard_fail=False,
+                 reject_webp=False):
         self.calls = []
         self.reject_gif = reject_gif
         self.reject_apng = reject_apng
         self.hard_fail = hard_fail
+        self.reject_webp = reject_webp
 
     async def request(self, route, **kw):
         body = dict(kw.get("json") or {})
@@ -103,6 +105,8 @@ class _FakeHTTP:
         if self.hard_fail and body.get("file_type") == 1:
             raise RuntimeError("boom: 网络抖动")
         if body.get("file_type") == 1:
+            if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP" and self.reject_webp:
+                raise RuntimeError("富媒体文件格式不支持")
             if raw[:6] in (b"GIF87a", b"GIF89a") and self.reject_gif:
                 raise RuntimeError(
                     "富媒体文件格式不支持")
@@ -114,6 +118,14 @@ class _FakeHTTP:
                 raise RuntimeError(
                     "富媒体文件格式不支持")
         return {"file_info": "FI"}
+
+def _webp_bytes(frames=3, size=(8, 8)):
+    from PIL import Image as P
+
+    fs = [P.new("RGB", size, (i * 40 % 255, 30, 200)) for i in range(frames)]
+    b = io.BytesIO()
+    fs[0].save(b, "WEBP", save_all=True, append_images=fs[1:], duration=100, quality=80)
+    return b.getvalue()
 
 
 def _client(http):
@@ -248,6 +260,28 @@ async def main():
     check("★★ 原样直传**带文件名**（.gif，与原生成功路径一致）",
           str(http.calls[0]["body"].get("file_name") or "").endswith(".gif"),
           str(http.calls[0]["body"].get("file_name")))
+
+    print("\n[2c] ★★★ WebP 被拒 ⇒ 转**动画 GIF** 再试（平台收 GIF、不收 WebP）")
+    M._RAW_IMG_REJECTED.clear()
+    log = _Log()
+    webp = _webp_bytes()
+    http = _FakeHTTP(reject_webp=True, reject_gif=False)
+    client = _client(http)
+    M.install_http_guard(client, log, None)
+    result = await http.request(route, json={
+        "file_type": 1,
+        "file_data": base64.b64encode(webp).decode("ascii"),
+        "srv_send_msg": False, "openid": "U1"})
+    check("★ 调用没抛、拿到 file_info", result.get("file_info") == "FI", str(result))
+    check("★★ 请求序列：① WebP 被拒 ② GIF 成功",
+          len(http.calls) == 2
+          and http.calls[0]["raw"][:4] == b"RIFF"
+          and http.calls[-1]["raw"][:6] in (b"GIF87a", b"GIF89a"),
+          str([c["raw"][:6] for c in http.calls]))
+    check("★★ GIF 带 .gif 文件名", str(http.calls[-1]["body"].get("file_name") or "").endswith(".gif"),
+          str(http.calls[-1]["body"].get("file_name")))
+    check("★ 有日志说明（WebP→GIF 直传成功）",
+          any("WebP" in m and "GIF" in m for _lv, m in log.lines), str(log.lines[-2:]))
 
     print("\n[3] 连 APNG 都被拒 ⇒ 原始 GIF 字节改按文件发（保投递）")
     M._RAW_IMG_REJECTED.clear()

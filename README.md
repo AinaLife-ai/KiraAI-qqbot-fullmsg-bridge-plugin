@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.12
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.13
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -456,6 +456,39 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.13</b> — ★★★ 真相：平台收 GIF、不收 WebP —— 动图新增「WebP→动画 GIF」通道</summary>
+
+### 真相（用户日志实锤）
+
+用户"发不出的 GIF 贴纸"其实全是 **WebP**（日志里 `file_name: image.webp`、
+556282 字节；同一份 WebP 字节连分片合并都被 `850019` 拒），而用户对照的
+**KiraAI 原生成功案例发的是真 GIF**（`test.gif`，动画正常）。
+⇒ **平台收 GIF、不收 WebP** —— 之前的"转 APNG/静态 PNG"方向能保显示，
+但把动画做没了；正确姿势是**把 WebP 转成动画 GIF** 再发。
+
+### 修复
+
+动图候选链新增一档（三条路同步：元素层 / HTTP 安全网 / md 转存）：
+
+```
+GIF 源  : 原样 GIF（保动画）→ APNG → 静态 PNG
+WebP 源 : 原样 WebP（先试）→ 动画 GIF（保动画）→ APNG → 静态 PNG
+```
+
+* 转换用 Pillow 逐帧（WebP 多帧 → P 调色板 → GIF `save_all`），
+  实测 12 帧动图转换正常、体积可控；失败/过大自动跳过该候选；
+* 每一档都写日志（含**格式名**：`动图「原图」直传被平台拒（webp 格式不收…）`），
+  哪条路通一清二楚；
+* 被拒过的字节记 10 分钟，不再反复白撞。
+
+### 测试
+
+`audit_sticker`（49）/`audit_media_guard`（44）/`audit_md_img_content_type`（29）
+新增「WebP 被拒 ⇒ 转 GIF 后成功」用例（三条路各一）；全套件双世代全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.12</b> — ★★ 语音转码加固：ffmpeg「0xC0000142 弹窗卡死」对策 + 自定义 ffmpeg 路径；世代戳改为自动取版本号</summary>
 
 ### 现场（用户线报）
