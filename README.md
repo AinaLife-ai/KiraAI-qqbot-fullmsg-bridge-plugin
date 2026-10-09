@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.20
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.21
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -461,6 +461,43 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.21</b> — ★★★ 「输入中」批次事件真根因 + 互动订阅位重连必达 + 回调按钮可降级</summary>
+
+### 一、「输入中」的真根因：事件是**批次事件**（用户诊断日志实证）
+```
+【输入中】诊断：event=KiraMessageBatchEvent  message=NoneType  session_id='9CD5…'
+```
+核心 `KiraMessageBatchEvent`（`core/chat/message_utils.py:210`）把消息放在
+**`event.messages` 列表**里，并自带 `is_group_message()`；而我们的判据只读
+`event.message` ⇒ 永远为空 ⇒ 报“不是单聊会话”。
+**修**：批次分支 —— `is_group_message()` 优先 → `messages[-1].sender.user_id/pid`
+→ 链里出现真群则判群；再加“裸 `session_id` + 适配器 `_direct_reply_ids` 命中 ⇒ 单聊”。
+
+### 二、互动订阅位**重连必达**（按钮回调一直不来的那一环）
+botpy 的 `_runner` 里 `BotWebSocket(...)` 是**局部变量**、`ConnectionSession` 不留引用
+⇒ 原来只能靠 `send_msg` 心跳（约 45 秒一次）抓活网关；刚启动时抓不到，
+强制重连只能超时并“推迟到下次连接” ⇒ **按钮回调/成员事件的订阅位可能几小时不生效**。
+**修**：再包一层 `BotWebSocket.ws_connect`（连接一建立就登记）⇒ 重连立刻可达。
+
+### 三、回调按钮：官方口径（源码定案）+ 可降级
+* 官方 Node SDK（`tencent-connect/qqbot-nodejs`）：`INTERACTION: 1 << 26`，
+  `INTERACTION_CREATE` 经 **WebSocket 网关**派发 ⇒ **不需要 webhook**
+  （官方 OpenClaw 插件 `tencent-connect/openclaw-qqbot` 亦在同一条连接处理 `interaction`）。
+  客户端那句「请求第三方失败」= 平台没等到我们的回执（没推到 / 推到了没回执）。
+* 新增配置 `keyboard_callback_to_command`（默认关）：把 `type=1` 回调按钮自动降级成
+  `type=2` 指令按钮（补 `enter=true`）—— 平台那条路不通时，单聊里**点一下就自动发送**。
+
+### 四、判定日志（装完一次看清）
+* `额外订阅已生效 ✅ intents=0x…（互动位(1<<26)=✅/❌ / 成员位=✅/❌）`
+* `长连接鉴权 intents=0x…（互动回调位 ✅/❌）`
+* 点击后：`已接上互动回调（INTERACTION_CREATE）…` + `[按钮] 用户点击了：…`
+
+**测试**：`audit_typing_indicator.py` 40 → **47 条**（批次单聊/批次群聊/`is_group_message()`/
+链里真群/多条取最后/端到端批次事件真的发出 `msg_type=6`）；全套件 59 个全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.20</b> — ★★ 「输入中」/流式：单聊判据**多来源兜底**（明明是单聊却说不是单聊）</summary>
 
 ### 现场
