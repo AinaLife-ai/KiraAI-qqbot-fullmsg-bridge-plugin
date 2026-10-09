@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.18
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.19
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -460,6 +460,46 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.19</b> — ★★★ 互动回调（按钮 type=1）**真断点修复**：事件到了却被丢弃</summary>
+
+### 根因（用户点回调按钮没反应 / 客户端提示请求第三方失败）
+botpy 派发给 `on_interaction_create` 的是 **`Interaction` 对象**（见 `botpy/interaction.py`
+与 `botpy/connection.py:165`）：
+
+```
+parse_interaction_create(payload)
+    → Interaction(api, payload["id"], payload["d"])
+    → _dispatch("interaction_create", 对象)
+    → client.on_interaction_create(对象)
+```
+
+而插件当时的解析只认 **dict**（`payload.get("d")`）⇒ **对象形态被静默丢弃**：
+不回执（客户端一直 loading / 报错）、也不转成消息 —— 看起来就像"事件没接进来"。
+（挂载、订阅位那一侧都是好的：handler 有挂、`1<<26` 订阅位与
+`botpy.flags.Intents.interaction` 一致 —— 断的只是**载荷形状**。）
+
+### 修法
+* `_body()` 改成**两种形状都认**：botpy 的 `Interaction` 对象（真派发形状）+ 原始 dict
+  （`{"d": {...}}` 或内层 dict，兼容 webhook/测试）；
+* 回执仍用 **内层 `d.id`**（官方：interaction_id 取自事件 `d.id`，不带前缀）；
+* 形状完全不认识时**响亮一次 WARNING**（原来静默 return —— 正是这次难查的原因）；
+* 回执不可用/失败时也**响亮一次**（回执是官方硬要求，静默失败=用户一直转圈）；
+* 同一 `interaction_id` 只回执一次（官方：只能回应一次）。
+
+### 覆盖（群聊 + 单聊都对）
+| | 事件身份 | 回执 | 转成的消息 |
+|---|---|---|---|
+| 单聊 | `user_openid` | `PUT /interactions/{id}`（botpy `on_interaction_result`） | target=sender=`user_openid` |
+| 群聊 | `group_openid` + `group_member_openid` | 同上 | target=`group_openid`、sender=`group_member_openid` |
+
+**测试**：新增 `tests/audit_interactions.py` **17 条**，用**真 botpy 走真派发**
+（`client.ws_dispatch("interaction_create", 对象)`）：订阅位与 botpy 口径一致、handler 挂载/幂等、
+群聊与单聊的回执（3 秒内、用内层 d.id）+ 事件转发、dict 形状兼容、陌生形状一次性告警、
+同 id 只回执一次、`_ACK_TIMEOUT < 3s`。全套件全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.18</b> — ★★ 指令按钮“点一下就发”+ 回调按钮说明 + 「输入中」日志可查</summary>
 
 ### 一、指令按钮默认 `enter: true`（点一下就发送）
