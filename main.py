@@ -420,6 +420,10 @@ class QQOfficialGroupBridge(BasePlugin):
         #:   官方默认 false（点击只把 @bot data 插进输入框，用户容易以为坏了）。
         #:   仅单聊 + 手机QQ 8983+ 生效；群里/低版本点也只是插进输入框（不会更糟）。
         self.keyboard_auto_enter = bool(basic.get("keyboard_auto_enter", True))
+        #: ★ 2026-10-10：回调按钮（type=1）是否**自动降级**成指令按钮（type=2 + enter）。
+        #:   默认**关**；平台推不了互动事件时打开它，按钮立刻"点一下就发"。
+        self.keyboard_callback_to_command = bool(
+            basic.get("keyboard_callback_to_command", False))
         #: ★★★ 2026-10-10 新增：**语音条超长自动剪裁**（默认开）。
         #:   用户实测：QQ 官方 bot 语音条上限 **5 分钟（300 秒整）**——多 1 秒都失败、
         #:   退回文件卡片。开着它，插件在转语音条（silk）时按上限截断：
@@ -1879,6 +1883,27 @@ class QQOfficialGroupBridge(BasePlugin):
                 send_msg._kira_bridge_orig = orig_send
                 BotWebSocket.send_msg = send_msg
 
+            # ---- ②.5 ★★ 关键补强（2026-10-10）：**连接建立即登记网关**
+            #   botpy 的 `_runner` 里 `BotWebSocket(...)` 是**局部变量**，
+            #   ConnectionSession 不留引用 ⇒ 只有心跳（~45s 一次）才会被我们抓到。
+            #   刚启动时探针还没触发 ⇒ `_request_reconnect` 只能超时，
+            #   留一句"下次连接生效" ⇒ **按钮回调/成员事件的订阅位可能几小时不生效**。
+            #   包一层 `ws_connect` 后：只要连上了，我们立刻能关掉它触发重连+重新鉴权。
+            orig_connect = BotWebSocket.ws_connect
+            if not getattr(orig_connect, "_kira_bridge_reg", False):
+                async def ws_connect(gw, _orig=orig_connect):
+                    try:
+                        gateways.append(weakref.ref(gw))
+                        if len(gateways) > 64:
+                            del gateways[:-32]
+                    except Exception:
+                        pass
+                    return await _orig(gw)
+
+                ws_connect._kira_bridge_reg = True
+                ws_connect._kira_bridge_orig = orig_connect
+                BotWebSocket.ws_connect = ws_connect
+
             # ---- ③ 顺带：新客户端构造/启动时也把 intents 置位，保持状态一致 ----
             orig_start = getattr(botpy.Client, "start", None)
             if callable(orig_start) and not getattr(orig_start, "_kira_bridge_intents", False):
@@ -1917,12 +1942,29 @@ class QQOfficialGroupBridge(BasePlugin):
             bits = self._EXTRA_INTENT_BITS
             before = int(getattr(client, "intents", 0) or 0)
             if before & bits == bits:
+                # ★ 2026-10-10：已经带上就明确说一句 ——
+                #   "互动回调到底订阅上没"是用户最常问的（且无法从别处看出）。
+                if not getattr(self, "_intent_ok_logged", False):
+                    self._intent_ok_logged = True
+                    logger.info(
+                        "[QQBOT-BRIDGE] %s: 额外订阅已生效 ✅ intents=0x%X"
+                        "（互动位(1<<26)=%s / 成员位(1<<24)=%s）—— 互动事件走 **WebSocket 网关**"
+                        "（官方 Node SDK：INTERACTION = 1<<26），**不需要 webhook**；"
+                        "点按钮若仍无「已接上互动回调」日志，就是平台没推",
+                        name, before,
+                        "✅" if before & (1 << 26) else "❌",
+                        "✅" if before & (1 << 24) else "❌",
+                    )
                 return                      # 已经带上（说明我们的补丁在首连就生效了）
             client.intents = before | bits
             self._intents_patched_at = time.time()
             logger.info(
                 "[QQBOT-BRIDGE] %s: 适配器先于插件连接，正在为其开通额外订阅"
-                "（成员进出 / 加群申请 / 按钮回调）…", name,
+                "（成员进出 / 加群申请 / **按钮回调**）… 当前 intents=0x%X，"
+                "互动位(1<<26)=%s，成员位(1<<24)=%s；改好后会请 botpy 重连一次",
+                name, before,
+                "✅" if before & (1 << 26) else "❌ 待补",
+                "✅" if before & (1 << 24) else "❌ 待补",
             )
             self._request_reconnect(name, reason="初始订阅")
         except Exception as exc:
@@ -2285,6 +2327,7 @@ class QQOfficialGroupBridge(BasePlugin):
         try:
             import rich_content as _rc
             _rc.set_auto_enter(self.keyboard_auto_enter)
+            _rc.set_callback_to_command(self.keyboard_callback_to_command)
         except Exception:
             pass
 
@@ -2310,8 +2353,7 @@ class QQOfficialGroupBridge(BasePlugin):
     #: 「事件形状」诊断只打一次（用户实测"明明是单聊却报不是单聊"时，一次定位）
     _c2c_shape_dumped = False
 
-    @staticmethod
-    def _c2c_target_of(event) -> str:
+    def _c2c_target_of(self, event) -> str:
         """这个事件是不是**单聊**？是就返回对方 openid，否则返回空串。
 
         ★ 2026-10-10 加固（用户实测：单聊会话 `qq:dm:...` 却报「不是单聊会话」）：
@@ -2377,6 +2419,28 @@ class QQOfficialGroupBridge(BasePlugin):
             #     若先看 sender 就会把**群**误判成单聊（比"认不出单聊"更糟）。
             if group_id or sid_is_group:
                 return ""
+            # ⓪.5 ★★ 批次事件（KiraMessageBatchEvent）
+            #   实测（2026-10-10 用户日志）：ON_LLM_REQUEST 上拿到的事件是
+            #   `KiraMessageBatchEvent`，**没有 `.message`**，消息在 `event.messages`
+            #   列表里；核心自带 `is_group_message()`（= messages[-1].group is not None）
+            #   —— 这两条都用上，才是批次事件的正确读法。
+            batch_msgs = getattr(event, "messages", None)
+            if message is None and isinstance(batch_msgs, (list, tuple)) and batch_msgs:
+                _is_group_fn = getattr(event, "is_group_message", None)
+                if callable(_is_group_fn):
+                    try:
+                        if _is_group_fn():
+                            return ""            # 核心自己的判据：是群 ⇒ 不可能是单聊
+                    except Exception:
+                        pass
+                for _m in reversed(batch_msgs):
+                    _g = getattr(_m, "group", None)
+                    if _g is not None and _first_str(_g, "group_id", "id"):
+                        return ""                # 链里出现过真群 ⇒ 判为群
+                    _got = _first_str(getattr(_m, "sender", None),
+                                      "user_id", "pid", "user_id_str", "id")
+                    if _got:
+                        return _got
             # ① 原生形状（message.group 为空 或 只是没有 group_id 的空壳）
             if message is not None:
                 got = _first_str(sender, "user_id", "pid", "user_id_str", "id")
@@ -2391,6 +2455,25 @@ class QQOfficialGroupBridge(BasePlugin):
                 got = _first_str(message, "target_id", "user_id", "chat_id")
                 if got:
                     return got
+            # ④ 最后兜底：会话 id 是**裸 openid**（批次事件常见）时，
+            #    用适配器的两张回复表判场景 —— 在 `_direct_reply_ids` 里就是单聊、
+            #    在 `_group_reply_ids` 里就是群。这是最可靠的"事实判据"。
+            if sid and not sid_is_group:
+                try:
+                    _an = _first_str(getattr(event, "adapter", None), "name")
+                    _ad = None
+                    if _an and getattr(self, "ctx", None) is not None:
+                        _ad = self.ctx.adapter_mgr.get_adapter(_an)
+                    if _ad is None:
+                        for _name, _a in (self._find_adapters() or []):
+                            _ad = _a
+                            break
+                    if _ad is not None:
+                        _direct = self._adapter_attr(_ad, "_direct_reply_ids") or {}
+                        if isinstance(_direct, dict) and str(sid) in _direct:
+                            return str(sid)
+                except Exception:
+                    pass
             return ""
         except Exception:
             return ""

@@ -50,6 +50,26 @@ def set_auto_enter(enabled: bool) -> None:
     _AUTO_ENTER = bool(enabled)
 
 
+#: ★ 2026-10-10：回调按钮（`action.type=1`）**可选降级**成指令按钮（`type=2` + enter）。
+#:
+#: 为什么需要：回调按钮要求**平台能把 INTERACTION_CREATE 推给机器人**。
+#: 若平台侧那条路不通（典型表现：客户端点按钮提示「请求第三方失败」），
+#: 按钮就点不动。这个开关把它换成"点一下就自动发送 data"的指令按钮 ——
+#: 立刻可用（单聊点一下即发；群里仍只是插进输入框），且随时可关。
+#: 默认 **关**：尊重模型/用户的原始意图，只在明确需要时才降级。
+_CB_TO_COMMAND = False
+
+
+def set_callback_to_command(enabled: bool) -> None:
+    """插件配置注入（`keyboard_callback_to_command`）；幂等，热改立即生效。"""
+    global _CB_TO_COMMAND
+    _CB_TO_COMMAND = bool(enabled)
+
+
+def callback_to_command_enabled() -> bool:
+    return _CB_TO_COMMAND
+
+
 #: 键盘上限（官方：内联键盘行列超限报 40034029）
 MAX_KEYBOARD_ROWS = 5
 MAX_BUTTONS_PER_ROW = 5
@@ -212,7 +232,7 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
         互动事件推到机器人（长连接订阅了 INTERACTION 就行；若后台把"消息推送方式"
         设成 Webhook 而地址不可达，客户端点按钮会提示「请求第三方失败」）。
     """
-    stats = {"enter_added": 0, "callback": 0}
+    stats = {"enter_added": 0, "callback": 0, "converted": 0}
     try:
         rows = ((payload or {}).get("content") or {}).get("rows") or []
     except Exception:
@@ -233,6 +253,11 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
                 atype = -1
             if atype == 1:
                 stats["callback"] += 1
+                if _CB_TO_COMMAND:
+                    # 降级：回调按钮 → 指令按钮（点一下就发）
+                    action["type"] = 2
+                    action.setdefault("enter", True)
+                    stats["converted"] += 1
                 continue
             if atype == 2 and want and "enter" not in action:
                 action["enter"] = True
