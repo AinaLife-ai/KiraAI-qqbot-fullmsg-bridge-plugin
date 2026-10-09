@@ -1838,6 +1838,23 @@ class QQOfficialGroupBridge(BasePlugin):
                         sess = getattr(gw, "_session", None)
                         if isinstance(sess, dict):
                             sess["intent"] = int(sess.get("intent") or 0) | bits
+                            # ★ 2026-10-10：把**真正发出去的** intents 打一次 ——
+                            #   这是"平台推不推互动事件"的唯一硬证据：
+                            #     这里 ✅ + 点按钮仍无日志 ⇒ 平台没推（去后台看推送方式）；
+                            #     这里 ❌ ⇒ 我们没订阅成功（我们的问题）。
+                            if not flag.get("identify_logged"):
+                                flag["identify_logged"] = True
+                                _iv = int(sess.get("intent") or 0)
+                                logger.info(
+                                    "[QQBOT-BRIDGE] 长连接鉴权 intents=0x%X"
+                                    "（互动回调位 %s / 成员事件位 %s）—— 平台只会推送"
+                                    "**已订阅**的事件；若这里显示 ✅ 而点按钮仍没有"
+                                    "「已接上互动回调」日志，那就是平台没推（去开放平台后台看"
+                                    "「消息推送方式」是不是 Webhook 且地址不可达）",
+                                    _iv,
+                                    "✅" if _iv & (1 << 26) else "❌",
+                                    "✅" if _iv & (1 << 24) else "❌",
+                                )
                     except Exception:
                         pass
                     return await _orig(gw)
@@ -2290,20 +2307,123 @@ class QQOfficialGroupBridge(BasePlugin):
     #: 刷新防抖：官方 SDK 建议在到期前刷新；Hermes 实测用 50 秒
     _TYPING_DEBOUNCE = 50.0
 
+    #: 「事件形状」诊断只打一次（用户实测"明明是单聊却报不是单聊"时，一次定位）
+    _c2c_shape_dumped = False
+
     @staticmethod
     def _c2c_target_of(event) -> str:
         """这个事件是不是**单聊**？是就返回对方 openid，否则返回空串。
 
-        「输入中…」与「流式消息」都只对单聊生效（官方限制），共用这一个判据。
+        ★ 2026-10-10 加固（用户实测：单聊会话 `qq:dm:...` 却报「不是单聊会话」）：
+          原来的判据**只有一条**（`message.group is None` + `sender.user_id`），
+          事件的来源/形状一变（被前置插件重建过、核心换字段、合并/重放路径…）
+          就静默失效 —— 日志里只能说"不是单聊"，查无可查。
+
+        现在**多来源兜底**（按可靠性排序）：
+          ① 原生形状：`message.group` 为空（或只是空壳）⇒ `sender.user_id`；
+             sender 上没有 user_id 时再试 `pid` / `id`；
+          ② **会话 id**：`event.session.session_id`（或 `event.sid` / `message.session_id`）
+             形如 `qq:dm:<openid>` / `qqo:c2c:<openid>:<...>` ⇒ 取标记段后面那段；
+             ⚠ 只有出现 `dm/c2c/direct/private` 标记才认（`qq:gm:<群号>` 绝不误判成群）；
+          ③ `message.target_id` / `message.user_id` / `message.chat_id`。
         """
+        def _first_str(obj, *attrs) -> str:
+            if obj is None:
+                return ""
+            for a in attrs:
+                try:
+                    v = getattr(obj, a, None)
+                except Exception:
+                    v = None
+                if isinstance(v, (str, int)) and str(v):
+                    return str(v)
+            return ""
+
+        def _sid_of() -> str:
+            for holder in (getattr(event, "session", None), event,
+                           getattr(event, "message", None)):
+                if holder is None:
+                    continue
+                got = _first_str(holder, "session_id", "sid", "session_key", "session")
+                if got:
+                    return got
+                sess = getattr(holder, "session", None)
+                inner = _first_str(sess, "session_id", "sid")
+                if inner:
+                    return inner
+            return ""
+
+        def _dm_from_sid(sid: str) -> str:
+            parts = [p for p in str(sid or "").replace("/", ":").split(":") if p]
+            for i, p in enumerate(parts):
+                if p.lower() in ("dm", "c2c", "direct", "private"):
+                    return parts[i + 1] if i + 1 < len(parts) else ""
+            return ""
+
         try:
             message = getattr(event, "message", None)
-            if message is None or getattr(message, "group", None) is not None:
+            sender = getattr(message, "sender", None) if message is not None else None
+            group = getattr(message, "group", None) if message is not None else None
+            group_id = _first_str(group, "group_id", "id") if group is not None else ""
+            sid = _sid_of()
+            sid_is_group = any(
+                p.lower() in ("gm", "group", "guild", "channel")
+                for p in str(sid or "").replace("/", ":").split(":")
+            )
+            # ⓪ 群特征优先：真群（group_id 非空）**或** sid 明确是群
+            #   （`qq:gm:` / `qq:group:` …）⇒ 直接判为群。
+            #   ⚠ 这一条必须在读 sender 之前 —— 事件被重建过（message.group 丢了、
+            #     但 sid 还是 `qq:gm:...`）时，sender 上可能还挂着 id，
+            #     若先看 sender 就会把**群**误判成单聊（比"认不出单聊"更糟）。
+            if group_id or sid_is_group:
                 return ""
-            sender = getattr(message, "sender", None)
-            return str(getattr(sender, "user_id", "") or "")
+            # ① 原生形状（message.group 为空 或 只是没有 group_id 的空壳）
+            if message is not None:
+                got = _first_str(sender, "user_id", "pid", "user_id_str", "id")
+                if got:
+                    return got
+            # ② 会话 id 兜底（`qq:dm:<openid>` / `qqo:c2c:<openid>:...`）
+            got = _dm_from_sid(sid)
+            if got:
+                return got
+            # ③ message 上的直接字段
+            if message is not None:
+                got = _first_str(message, "target_id", "user_id", "chat_id")
+                if got:
+                    return got
+            return ""
         except Exception:
             return ""
+
+    @classmethod
+    def _dump_c2c_shape_once(cls, event, logger_) -> None:
+        """拿不到单聊目标时，**一次性**把现场字段打出来（形状变了也能一次定位）。"""
+        if cls._c2c_shape_dumped:
+            return
+        cls._c2c_shape_dumped = True
+        try:
+            message = getattr(event, "message", None)
+            sender = getattr(message, "sender", None) if message is not None else None
+            group = getattr(message, "group", None) if message is not None else None
+            session = getattr(event, "session", None)
+            logger_.info(
+                "[QQBOT-BRIDGE] 【输入中】诊断（只打一次）：event=%s adapter=%r "
+                "message=%s group=%r group_id=%r sender=%r user_id=%r pid=%r "
+                "session_id=%r message_dirs=%s",
+                type(event).__name__,
+                getattr(getattr(event, "adapter", None), "name", None),
+                type(message).__name__,
+                str(group)[:60] if group is not None else None,
+                getattr(group, "group_id", None) if group is not None else None,
+                type(sender).__name__,
+                getattr(sender, "user_id", None) if sender is not None else None,
+                getattr(sender, "pid", None) if sender is not None else None,
+                getattr(session, "session_id", None) if session is not None else None,
+                [a for a in dir(message) if not a.startswith("_")][:14]
+                if message is not None else [],
+            )
+        except Exception:
+            pass
 
     def _register_c2c_turn(self, event, request, target: str) -> None:
         """把"这一轮属于哪个私聊会话"登记给流式观察者（token 预览要用）。
@@ -2393,9 +2513,17 @@ class QQOfficialGroupBridge(BasePlugin):
         try:
             target = self._c2c_target_of(event)
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
-            if not target or not adapter_name:
-                self._typing_skip("not_c2c",
-                                  "不是单聊会话（官方 msg_type=6 只支持单聊）")
+            if not target:
+                self._typing_skip(
+                    "not_c2c",
+                    "认不出单聊目标（官方 msg_type=6 只支持单聊）—— 已附带现场诊断，"
+                    "请把这条反馈")
+                self._dump_c2c_shape_once(event, logger)
+                return False
+            if not adapter_name:
+                self._typing_skip("no_adapter_name",
+                                  "事件里没有适配器名（adapter.name 为空）")
+                self._dump_c2c_shape_once(event, logger)
                 return False
             adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
             if adapter is None:

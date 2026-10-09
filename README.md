@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.19
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.20
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -460,6 +460,32 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.20</b> — ★★ 「输入中」/流式：单聊判据**多来源兜底**（明明是单聊却说不是单聊）</summary>
+
+### 现场
+用户实测：会话明明是单聊（`qq:dm:9CD5…`），日志却说
+`【输入中】本次未发送：认不出单聊目标（官方 msg_type=6 只支持单聊）`。
+原判据**只有一条**（`message.group is None` + `sender.user_id`）：
+事件来源/形状一变（被前置插件重建过、核心换字段、合并重放路径…）就**静默失效**。
+
+### 修法（按可靠性多来源兜底）
+1. **群特征优先**：`message.group.group_id` 非空、**或会话 id 形如 `qq:gm:`** ⇒ 直接判为群
+   （绝不被 sender 上的 id 带偏 —— 把群误判成单聊比"认不出单聊"更糟）；
+2. sender 字段：`user_id` → `pid` → `user_id_str` → `id`；
+3. **会话 id**：`event.session.session_id`（或 `event.sid` / `message.session_id`）里的
+   `dm / c2c / direct / private` 段后面那一段；
+4. `message.target_id` / `user_id` / `chat_id`。
+
+若仍认不出来，会打**一条带现场字段的诊断**（event/adapter/message/group/sender/session_id/
+message 可用字段清单）—— 一次就能定位，不用再来回猜。
+
+**测试**：`audit_typing_indicator.py` 33 → **40 条**：原生形状、sender 只有 `pid`、
+只有 `session_id=qq:dm:…`、`qqo:c2c:…:msg`、**群聊（sid=qq:gm:…）不被误判**、
+空壳 group、以及"认不出时写一条现场诊断且只写一次"。全套件全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.19</b> — ★★★ 互动回调（按钮 type=1）**真断点修复**：事件到了却被丢弃</summary>
 
 ### 根因（用户点回调按钮没反应 / 客户端提示请求第三方失败）
