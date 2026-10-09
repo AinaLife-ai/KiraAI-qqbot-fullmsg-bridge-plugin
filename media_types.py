@@ -346,6 +346,63 @@ def _image_upload_name(data: bytes, name: Any) -> str:
     return stem + _IMG_EXT.get(fmt, ".png")
 
 
+def to_animated_gif(data: bytes, logger_: Any = None,
+                    max_bytes: int = 20 * 1024 * 1024) -> Optional[bytes]:
+    """动画图片（WebP 等）→ 动画 **GIF**（保动画）。
+
+    ★★★ 依据（2026-10-10 实锤）：**平台收 GIF、不收 WebP** ——
+    用户"GIF 贴纸"其实是 WebP（日志 `file_name: image.webp`，556282 字节），
+    同样字节连分片合并都被 850019 拒；而 KiraAI 原生成功案例发的是**真 GIF**
+    （`test.gif`，动画正常）。⇒ 动图候选链里，"原始 WebP 被拒"之后、
+    退守 APNG/PNG（会变静图）之前 —— 先试 **WebP→GIF**：动画保住，
+    而且平台认 GIF。三条路（元素层 / 安全网 / md）共用本函数。
+
+    实现：Pillow 逐帧读（WebP 多帧支持）→ 每帧转 P 调色板 → GIF(save_all)。
+    失败/超过 max_bytes 返回 None（调用方继续退守，绝不丢消息）。
+    """
+    try:
+        import io
+
+        from PIL import Image as _PILImage
+
+        with _PILImage.open(io.BytesIO(data)) as im:
+            frames = int(getattr(im, "n_frames", 1) or 1)
+            if frames <= 1:
+                return None
+            duration = 100
+            ims = []
+            for idx in range(frames):
+                im.seek(idx)
+                try:
+                    d = int((im.info or {}).get("duration") or 0)
+                    if d:
+                        duration = d
+                except Exception:
+                    pass
+                ims.append(im.convert("RGBA"))
+        out = io.BytesIO()
+        pal = [f.convert("P", palette=_PILImage.ADAPTIVE, colors=255) for f in ims]
+        pal[0].save(out, "GIF", save_all=True, append_images=pal[1:],
+                    duration=duration, loop=0, disposal=2, optimize=True)
+        gif = out.getvalue()
+        if not gif or len(gif) > max_bytes:
+            if logger_ is not None:
+                logger_.info(
+                    "[QQBOT-BRIDGE] WebP→GIF 转档结果为空或过大（%d 字节，上限 %.0fMB）—— 跳过该候选",
+                    len(gif), max_bytes / 1048576.0)
+            return None
+        if logger_ is not None:
+            logger_.info(
+                "[QQBOT-BRIDGE] 动画 WebP 已转成动画 GIF（%d 帧，%d 字节 → %d 字节）——"
+                "平台收 GIF，保动画",
+                frames, len(data), len(gif))
+        return gif
+    except Exception as exc:
+        if logger_ is not None:
+            logger_.debug("[QQBOT-BRIDGE] WebP→GIF 转换失败：%s", exc)
+        return None
+
+
 def is_format_error(exc: BaseException) -> bool:
     text = str(exc)
     if any(code in text for code in _FORMAT_ERROR_CODES):
@@ -471,24 +528,30 @@ def _probe_mark(data: bytes, rejected: bool) -> None:
 
 
 async def _try_send_original(api: Any, target_id: str, is_group: bool,
-                             data: bytes, elem_name: Any, logger: Any):
-    """元素层「原图优先」探测：把动图（gif/webp）**原样**按 file_type=1 试传一次。
+                             data: bytes, elem_name: Any, logger: Any,
+                             kind: str = "原图"):
+    """元素层「动图候选」探测：把这份字节**原样**按 file_type=1 试传一次。
 
-    背景（2026-10-09 用户情报）：QQ 官方 bot 的图片格式**已支持 gif/webp**，
-    所以表情包/动图应当**原样直传**以保住动画；被平台以格式为由拒（850019）
-    才退转档（APNG→PNG）。被拒过的图记 10 分钟，避免每次发送都白撞。
+    :param kind: 日志里怎么称呼这份字节（"原图" / "WebP→GIF" …）。
 
-    返回上传结果；返回 None = "没通过，走转档路径"（被拒/网络错误/被记忆跳过）。
+    背景（2026-10-09 用户情报 + 2026-10-10 修正）：
+    * 平台**收 GIF、不收 WebP**（同字节 WebP 实测 850019；KiraAI 原生真 GIF 成功）；
+    * 所以：GIF 原样直传保动画；WebP 先试原样（万一平台放开）、被拒后转成
+      **动画 GIF** 再试；都不过才退 APNG→PNG（静图）。
+    被拒过的字节记 10 分钟，避免每次发送都白撞。
+
+    返回上传结果；返回 None = "没通过，走下一档"（被拒/网络错误/被记忆跳过）。
 
     ★ 走**安全网内层**（如果挂了）：探测意图就是"原样发"，不需要安全网再加工
-      （否则安全网会把原图转档，元素层会误以为"原图直传成功"——日志和缓存全乱）。
+      （否则安全网会把原图转档，元素层会误以为"原样直传成功"——日志和缓存全乱）。
     """
     if api is None or not data:
         return None
     if _probe_recently_rejected(data):
         if logger is not None:
             logger.info(
-                "[QQBOT-BRIDGE] 这张动图 10 分钟内被平台拒过原图 ⇒ 跳过原图直传，直接转档")
+                "[QQBOT-BRIDGE] 这张图（%s）10 分钟内被平台拒过 ⇒ 跳过「%s」直传，走转档",
+                sniff_image_format(data) or "?", kind)
         return None
     try:
         from botpy.http import Route
@@ -525,22 +588,22 @@ async def _try_send_original(api: Any, target_id: str, is_group: bool,
             _probe_mark(data, True)
             if logger is not None:
                 logger.info(
-                    "[QQBOT-BRIDGE] 动图**原图直传被平台拒**（%s）⇒ 转成 APNG/PNG 保显示；"
-                    "同一张图 10 分钟内不再试原图",
-                    str(exc)[:80])
+                    "[QQBOT-BRIDGE] 动图「%s」直传被平台拒（%s 格式不收：%s）⇒ "
+                    "走下一档转档；同一份字节 10 分钟内不再试",
+                    kind, sniff_image_format(data) or "?", str(exc)[:60])
         else:
             if logger is not None:
                 logger.warning(
-                    "[QQBOT-BRIDGE] 动图原图直传失败（非格式错误：%s: %s）⇒ 继续走转档路径",
-                    type(exc).__name__, str(exc)[:120])
+                    "[QQBOT-BRIDGE] 动图「%s」直传失败（非格式错误：%s: %s）⇒ 继续走转档路径",
+                    kind, type(exc).__name__, str(exc)[:120])
         return None
     _probe_mark(data, False)
     if logger is not None:
         fmt = _animated_format(data) or "动图"
         logger.info(
-            "[QQBOT-BRIDGE] ★ 动图**原图直传成功**（%s，保动画）—— 平台现在收 gif/webp；"
+            "[QQBOT-BRIDGE] ★ 动图「%s」直传成功（%s，保动画）—— 平台收了这份字节；"
             "若客户端里仍显示不动，把 gif_sticker_mode 设为 image 可回退（转静态）",
-            fmt)
+            kind, fmt)
         _fi = result.get("file_info") if isinstance(result, dict) \
             else getattr(result, "file_info", None)
         logger.info(
@@ -894,6 +957,34 @@ async def _guard_upload(route, args, body, kwargs, orig, logger, plugin):
                     _once("img_raw_rej", "info",
                           "媒体安全网：%s 原样直传被平台拒（%s）—— 转档后再试",
                           fmt, str(exc)[:60])
+            # ★★ 平台**收 GIF、不收 WebP**（2026-10-10 实锤）：WebP 被拒后，
+            #   先转成**动画 GIF** 再试（保动画）；都不过才退 APNG/静态 PNG。
+            if fmt == "webp":
+                import base64 as _b
+
+                try:
+                    _anim2 = await asyncio.to_thread(_animated_format, data)
+                except Exception:
+                    _anim2 = ""
+                if _anim2:
+                    _gif2 = await asyncio.to_thread(to_animated_gif, data, logger)
+                    if _gif2 and not _probe_recently_rejected(_gif2):
+                        gb = dict(body)
+                        gb["file_data"] = _b.b64encode(_gif2).decode("ascii")
+                        gb["file_name"] = _image_upload_name(_gif2, "")
+                        try:
+                            result = await orig(route, *args, **{**kwargs, "json": gb})
+                            _probe_mark(_gif2, False)
+                            _once("img_gif_ok", "info",
+                                  "媒体安全网：动画 WebP 转成 GIF 后直传成功（保动画）")
+                            return result
+                        except Exception as exc:
+                            if not is_format_error(exc):
+                                raise
+                            _probe_mark(_gif2, True)
+                            _once("img_gif_rej", "info",
+                                  "媒体安全网：GIF 转档也被平台拒（%s）—— 继续退守 APNG/PNG",
+                                  str(exc)[:60])
             try:
                 new_data, new_name, _note = await asyncio.to_thread(
                     normalize_image_data, data, "image." + (fmt or "bin"), logger,
@@ -1218,6 +1309,18 @@ def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) ->
                             api, target_id, is_group, data, _elem_name, logger)
                         if _probe_res is not None:
                             return _probe_res
+                        # ★★ 平台**收 GIF、不收 WebP**（2026-10-10 实锤）：
+                        #   原始 WebP 被拒后，先转成**动画 GIF** 再试（保动画），
+                        #   都不过才退 APNG/静态 PNG（静图）。
+                        if _fmt == "webp":
+                            _gif_bytes = await asyncio.to_thread(
+                                to_animated_gif, data, logger)
+                            if _gif_bytes:
+                                _probe_res2 = await _try_send_original(
+                                    api, target_id, is_group, _gif_bytes, "",
+                                    logger, kind="WebP→GIF")
+                                if _probe_res2 is not None:
+                                    return _probe_res2
                 # 非动图 / image 模式：走转档（平台历史上只收 png/jpg，GIF 直传=850019）
                 if _img_mode == "file":
                     # 用户明确要求：这类图**原样按文件发**（动图下载后还能动）

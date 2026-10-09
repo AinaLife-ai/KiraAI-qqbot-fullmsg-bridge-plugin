@@ -268,6 +268,58 @@ async def main():
         finally:
             M.set_md_gif_mode("auto")
 
+        print("   [2b-5] ★★★ WebP 被拒 ⇒ **动画 GIF** 候选接手（平台收 GIF、不收 WebP）")
+        M.clear_caches()
+        M.set_md_gif_mode("auto")
+        try:
+            from PIL import Image as _PILW
+
+            _wfr = [_PILW.new("RGB", (8, 8), (200, 30, 30)),
+                    _PILW.new("RGB", (8, 8), (30, 30, 200))]
+            _wbf = _io.BytesIO()
+            _wfr[0].save(_wbf, "WEBP", save_all=True, append_images=_wfr[1:],
+                         duration=100, quality=80)
+            webp_data = _wbf.getvalue()
+        except Exception as exc:
+            webp_data = None
+            print(f"  skip  没有 WebP 支持（{exc}）")
+        if webp_data:
+            class _HTTPRejectWebp(_HTTP):
+                """拒 .webp、收 .gif（按 prepare 的 file_name 判断）。"""
+
+                def __init__(self, parts):
+                    super().__init__(parts)
+                    self.names = []
+
+                async def request(self, route, **kw):
+                    path = getattr(route, "path", "")
+                    body = kw.get("json") or {}
+                    if "upload_prepare" in path:
+                        nm = str(body.get("file_name") or "")
+                        self.names.append(nm)
+                        if nm.endswith(".webp"):
+                            raise RuntimeError("富媒体文件格式不支持")
+                        return {"upload_id": "UP1",
+                                "parts": _parts(int(body.get("file_size") or 1000), 400_000)}
+                    if "/files" in path:
+                        return {"file_info": "FI",
+                                "raw_url": "https://cos.example.com/x.gif?sig=1"}
+                    return {}
+
+            SEEN.clear()
+            cli_w = _Client(gparts)
+            cli_w.api._http = _HTTPRejectWebp(gparts)
+            _w = await M._upload_bytes_to_qq(cli_w, "G1", True, webp_data,
+                                             "meme.webp", logger=_Log())
+            _upw = b"".join(s["data"] for s in SEEN)
+            check("★★★ .webp 被拒后 .gif 候选成功（拿到公网地址）", bool(_w), repr(_w))
+            check("★★★ 上传的是 GIF 魔数（动画转档成功）",
+                  _upw[:6] in (b"GIF87a", b"GIF89a"), _upw[:12].hex())
+            check("★★ prepare 先试 .webp、再换 .gif",
+                  cli_w.api._http.names[:2] == ["meme.webp", "meme.gif"],
+                  str(cli_w.api._http.names[:3]))
+        M.set_md_gif_mode("auto")
+
         print("   [2c-1] url 模式：远程动图**保留原公网地址**（平台自己下载）")
         M.clear_caches()
         remote = "https://example.com/meme.gif"

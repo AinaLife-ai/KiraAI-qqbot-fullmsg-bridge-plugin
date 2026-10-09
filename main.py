@@ -2595,9 +2595,16 @@ class QQOfficialGroupBridge(BasePlugin):
         return self._group_name_for(name, adapter, group_id, client)
 
     def _sticker_count(self) -> int:
-        """框架装了几个表情包（没装/没管理器就返回 0）。"""
+        """框架装了几个表情包（没装/没管理器就返回 0）。
+
+        ★ 2026-10-10（适配 v3.0.0-alpha.3）：核心把 `ctx.sticker_manager` 改名为
+        `ctx.sticker_mgr`（旧名保留为兼容属性）。这里**优先新名、兼容旧名** ——
+        将来核心移除旧别名也不会失联。
+        """
         try:
-            mgr = getattr(self.ctx, "sticker_manager", None)
+            mgr = getattr(self.ctx, "sticker_mgr", None)
+            if mgr is None:
+                mgr = getattr(self.ctx, "sticker_manager", None)
             if mgr is None:
                 return 0
             data = getattr(mgr, "sticker_dict", None)

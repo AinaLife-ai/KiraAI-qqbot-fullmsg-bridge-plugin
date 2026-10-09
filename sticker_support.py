@@ -4,13 +4,14 @@
 
 ### ① 标签**根本没被注册**
 
-`core/plugin/builtin_plugins/sticker/main.py`：
+`core/plugin/builtin_plugins/sticker/main.py`（v3.0.0-alpha.3 写法；更早版本为
+`self.ctx.sticker_manager`，A3 保留了这个旧名兼容别名，本插件两个名字都认）：
 
 ```python
 async def inject_sticker_tag(self, event, _, tag_set):
     supported_elements = event.supported_elements
     if "sticker" in supported_elements:          # ← 门槛
-        sticker_dict = self.ctx.sticker_manager.sticker_dict
+        sticker_dict = self.ctx.sticker_mgr.sticker_dict
         tag_set.register(build_sticker_tag(sticker_dict=sticker_dict))
 ```
 

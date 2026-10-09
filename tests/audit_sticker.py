@@ -243,6 +243,23 @@ async def main():
     installed = p2._ensure_sticker_support(ad, "qqo2")
     check("★ 没有表情包 ⇒ 不安装（返回 False）", installed is False, str(installed))
 
+    print("\n[5g] ★★ v3.0.0-alpha.3 属性名适配：sticker_mgr（新）/ sticker_manager（旧）都认")
+    class _CtxNewName:
+        sticker_mgr = _StickerMgr(2)
+
+    p5 = bridge_main.QQOfficialGroupBridge(
+        _CtxNewName(), {"section_basic": {"enabled": True}})
+    check("★ 新名 ctx.sticker_mgr 被识别（数量=2）",
+          p5._sticker_count() == 2, str(p5._sticker_count()))
+
+    class _CtxOldName:
+        sticker_manager = _StickerMgr(3)
+
+    p6 = bridge_main.QQOfficialGroupBridge(
+        _CtxOldName(), {"section_basic": {"enabled": True}})
+    check("★ 旧名 ctx.sticker_manager（A3 兼容别名）同样识别（数量=3）",
+          p6._sticker_count() == 3, str(p6._sticker_count()))
+
     print("\n[5b] ★★ 关键词可配：sticker_tags 里的每个词都会被声明（第三方用得上）")
     p3 = bridge_main.QQOfficialGroupBridge(
         type("Ctx3", (), {"adapter_mgr": _Mgr(), "sticker_manager": _StickerMgr(1)})(),
@@ -389,6 +406,66 @@ async def main():
         check("★ 转档后文件名同步为 .png",
               str(up_a[-1].get("file_name") or "").endswith(".png"),
               str(up_a[-1].get("file_name")))
+
+        print("\n[5e-2c] ★★★ WebP 被拒 ⇒ 转**动画 GIF** 再发（平台收 GIF、不收 WebP）")
+        webp_b64 = None
+        try:
+            import io as _io2
+
+            from PIL import Image as _PIL2
+
+            _wf = [_PIL2.new("RGB", (10, 10), (200, 30, 30)),
+                   _PIL2.new("RGB", (10, 10), (30, 30, 200))]
+            _wb = _io2.BytesIO()
+            _wf[0].save(_wb, "WEBP", save_all=True, append_images=_wf[1:],
+                        duration=100, quality=80)
+            webp_b64 = base64.b64encode(_wb.getvalue()).decode("ascii")
+        except Exception as exc:
+            print(f"  skip  没有 WebP 支持（{exc}）")
+
+        if webp_b64:
+            _MTG._RAW_IMG_REJECTED.clear()
+
+            class RejectWebpHTTP(HTTP):
+                """拒 WebP、收 GIF（模拟平台真实行为）。"""
+
+                def __init__(self):
+                    super().__init__()
+                    self.n_webp = 0
+                    self.n_gif = 0
+
+                async def request(self, route, **kw):
+                    body = kw.get("json") or {}
+                    if body.get("file_type") == 1:
+                        raw = base64.b64decode(body.get("file_data") or "")
+                        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+                            self.n_webp += 1
+                            raise RuntimeError("富媒体文件格式不支持")
+                        if raw[:6] in (b"GIF87a", b"GIF89a"):
+                            self.n_gif += 1
+                    return await super().request(route, **kw)
+
+            rej_w = RejectWebpHTTP()
+            ad_w = make_adapter(rej_w)
+            p_w = bridge_main.QQOfficialGroupBridge(
+                type("CtxW", (), {"adapter_mgr": type("M", (), {
+                    "get_adapter": lambda self, n: ad_w,
+                    "get_adapters": lambda self: {"qqo": ad_w}})(),
+                    "sticker_manager": _StickerMgr(1)})(),
+                {"section_basic": {"enabled": True}, "section_proactive": {"proactive_enabled": True}})
+            p_w._attach(ad_w, "qqo", {})
+            sent.clear()
+            ch_w = MessageChain([Sticker("21", sticker=webp_b64)])
+            await ad_w.send_group_message("G1", ch_w)
+            up_w = [x["__upload__"] for x in sent if "__upload__" in x]
+            d_w = base64.b64decode(up_w[-1].get("file_data") or "") if up_w else b""
+            check("★★★ WebP 原样先试过（被拒 1 次）", rej_w.n_webp == 1, str(rej_w.n_webp))
+            check("★★★ 转成 GIF 后成功发出（GIF 魔数）",
+                  rej_w.n_gif >= 1 and d_w[:6] in (b"GIF87a", b"GIF89a"),
+                  f"gif={rej_w.n_gif} head={d_w[:12].hex()}")
+            check("★★ 文件名同步为 .gif（与原生路径一致）",
+                  str(up_w[-1].get("file_name") or "").endswith(".gif"),
+                  str(up_w[-1].get("file_name")))
 
         print("\n[5e-3] ★★★ 平台仍拒收（850019）⇒ **自动改按文件发**（原始 GIF 字节，只一次）")
         import media_types as _MT

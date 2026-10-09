@@ -554,7 +554,8 @@ def _make_upload_candidates(data: bytes, name: str, logger: Any):
     """按当前策略给出转存候选链：[(标签, bytes, 文件名), ...]。
 
     * png/jpeg ⇒ 原样一条（零开销）；
-    * 动图（gif/webp 多帧）且 auto ⇒ 原图 → APNG → 静态 PNG（逐级退守）；
+    * 动图（gif/webp 多帧）且 auto ⇒ 原图 →（WebP 则加）**动画 GIF** →
+      APNG → 静态 PNG（逐级退守）；
     * 其它非 png/jpg（webp 静图 / bmp / …）⇒ 一次规范化（静态 PNG / 可转 APNG）。
     """
     try:
@@ -575,6 +576,18 @@ def _make_upload_candidates(data: bytes, name: str, logger: Any):
             ts = _RAW_GIF_REJECTED.get(key, 0.0)
             fresh = (_t.time() - ts) < _RAW_GIF_REJECT_TTL
             cands = [] if fresh else [("原始动图（保动画优先）", data, base_name)]
+            # ★★ 平台收 GIF、不收 WebP（2026-10-10 实锤）：WebP 候选之后先给
+            #   一个**动画 GIF** 候选（保动画），再退 APNG/PNG（静图）。
+            if fmt == "webp":
+                try:
+                    from media_types import to_animated_gif as _to_gif
+
+                    _gif_b = _to_gif(data, logger)
+                except Exception:
+                    _gif_b = None
+                if _gif_b:
+                    _gif_name = os.path.splitext(base_name)[0] + ".gif"
+                    cands.append(("动画 GIF（转档保动画）", _gif_b, _gif_name))
             apng, apng_name, _n1 = normalize_image_data(data, base_name, logger,
                                                         allow_anim=True)
             if apng is not data and not any(apng == c[1] for c in cands):
