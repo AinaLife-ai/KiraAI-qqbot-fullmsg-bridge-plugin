@@ -713,12 +713,28 @@ def _is_silk_bytes(data: bytes) -> bool:
 #: 「媒体层安装失败」提示去重（每个原因打一次 WARNING）
 _INSTALL_FAIL_LOGGED: set = set()
 
-#: ★★★ 媒体包装的「世代戳」——每次插件升级都应修改它。
+#: ★★★ 媒体包装的「世代戳」——**自动取插件版本号**（manifest.json）。
 #: 用途（2026-10-09 实锤）：旧版本装上的包装没有世代信息，而 install() 原来
 #: 看到 `_kira_bridge_ftype` 标记就当作"已安装"⇒ **每次更新都被短路**，
 #: 包装永远停在旧代码（没有日志、行为过时）——即"僵尸包装"。
 #: 有了世代戳，install() 就能识别"标记在、但世代不符"并自动接管换新。
-_WRAPPER_BUILD = "1.6.10"
+#:
+#: ★★ 2026-10-10 改进：**不要手写常量**，直接读 manifest 版本 ——
+#: 手写会在"改了包装行为但忘了改戳"时翻车：v1.6.11 的文件名修复就藏在
+#: 包装闭包里，如果世代没变，老包装会继续生效、修复等于没上（差点踩中）。
+#: 自动取版本号后，**每次发版都必然换新包装**，杜绝这类坑。
+def _load_wrapper_build() -> str:
+    try:
+        import json as _json
+
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest.json")
+        with open(_p, "r", encoding="utf-8") as _f:
+            return str(_json.load(_f).get("version") or "unknown")
+    except Exception:
+        return "unknown"
+
+
+_WRAPPER_BUILD = _load_wrapper_build()
 
 
 def installed_current(holder: Any) -> bool:

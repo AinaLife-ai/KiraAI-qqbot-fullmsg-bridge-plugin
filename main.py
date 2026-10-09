@@ -260,8 +260,15 @@ def _log_banner_once() -> None:
 
         enc = audio_silk._silk_encoder()
         ffm = audio_silk._ffmpeg_exe()
+        try:
+            n_c = len(audio_silk._ffmpeg_candidates())
+        except Exception:
+            n_c = 1 if ffm else 0
         silk_ok = f"✅{enc}" if enc else "❌未安装（语音条会退化成文件卡片）"
-        ff_ok = "✅" if ffm else "❌未安装"
+        # ★ 2026-10-10：横幅直接标出**用的是哪个 ffmpeg**（多少个候选）——
+        #   Windows 上出现过 imageio 自带 ffmpeg 报 0xC0000142 的现场，
+        #   一眼就能知道该换哪个二进制（插件配置 ffmpeg_path / 装系统 ffmpeg）。
+        ff_ok = f"✅{ffm}（候选 {n_c} 个）" if ffm else "❌未安装"
     except Exception:
         silk_ok, ff_ok = "?", "?"
     try:
@@ -364,6 +371,11 @@ class QQOfficialGroupBridge(BasePlugin):
         self.md_gif_mode = str(basic.get("md_gif_mode", "auto") or "auto").strip().lower()
         if self.md_gif_mode not in ("auto", "url", "static"):
             self.md_gif_mode = "auto"
+        #: 自定义 ffmpeg 路径（可选；留空=自动找：配置→环境变量→PATH→imageio 自带）。
+        #: 2026-10-10 加：Windows 上 imageio 自带的 ffmpeg 会报
+        #: `应用程序无法正常启动(0xC0000142)`（DLL 初始化失败）并弹窗卡住 ——
+        #: 给用户一个"填了就优先用"的出口（系统 ffmpeg 更稳）。
+        self.ffmpeg_path = str(basic.get("ffmpeg_path", "") or "").strip()
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -661,6 +673,11 @@ class QQOfficialGroupBridge(BasePlugin):
         # 动图策略同步给 md_media（热改配置也能生效；成本≈0）
         try:
             self._sync_md_gif_mode()
+        except Exception:
+            pass
+        # ffmpeg 自定义路径同步给 audio_silk（同上）
+        try:
+            self._sync_ffmpeg_path()
         except Exception:
             pass
         adapters = self._find_adapters()
@@ -2143,6 +2160,17 @@ class QQOfficialGroupBridge(BasePlugin):
         try:
             import md_media as _mdm
             _mdm.set_md_gif_mode(self.md_gif_mode)
+        except Exception:
+            pass
+
+    def _sync_ffmpeg_path(self) -> None:
+        """把插件配置的 `ffmpeg_path` 同步给 audio_silk（热改配置也能生效）。
+
+        留空 ⇒ 清除自定义路径，回到自动查找（配置→环境变量→PATH→imageio）。
+        """
+        try:
+            import audio_silk as _asilk
+            _asilk.set_ffmpeg_path(self.ffmpeg_path)
         except Exception:
             pass
 

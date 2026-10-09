@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.11
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.12
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -132,6 +132,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `sticker_tags` | **sticker** | **表情包标签关键词**（逗号分隔）：填进来的词会被补进适配器声明的类型清单（框架里的表情包插件正是看到这个词才注册自己的标签），且这些词对应的元素发送时按**图片**发出（`file_type=1`）。内置表情包用 `sticker`；第三方「增强表情包」是 `<sticker_plus>` 标签，填 `sticker` 即可覆盖。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效 |
 | `gif_sticker_mode` | **auto** | **GIF/动图怎么发**：`auto` = 动图（GIF/WebP）**先原样直传**（平台图片格式现已支持 gif/webp，直传才保动画）→ 被平台拒则转 **APNG** → 静态 PNG → 最后自动按文件发（原图/动图都在，点开可看），被拒过的图 10 分钟内不再试原图；`image` = 跳过原图、直接转档（稳定优先）；`file` = GIF **原样按文件发**（保动图，要点开下载）。**png/jpg 三种模式下都一个字节都不动**；超过图片软限制(20MB)直接按文件发 |
 | `md_gif_mode` | **auto** | **markdown 里的动图怎么发**：`auto` = 候选链「**原始动图**（唯一有机会真动；官方文档把 gif 列进了图片格式）→ 被平台拒则 **APNG** → 静态 PNG」，被拒过的原图 10 分钟内不再重试；`url` = 远程动图**保留原公网地址**（让平台自己下载转存，走平台侧管道、绕开上传接口限制；本地动图仍走候选链）；`static` = 跳过原图，直接转存 APNG/静态 PNG（保守档）。只影响 md 里的**动图**，静图不受影响 |
+| `ffmpeg_path` | 空 | **自定义 ffmpeg（可选）**：留空 = 自动查找（插件配置 → `IMAGEIO_FFMPEG_EXE` → 系统 PATH → imageio 自带）。语音转码时若在 Windows 看到 ffmpeg 弹窗错误（如 `应用程序无法正常启动(0xC0000142)`），装一个系统 ffmpeg（`winget install Gyan.FFmpeg`）并把 `ffmpeg.exe` 的完整路径填这里即可优先使用；转换遇"启动类错误/超时"会自动轮换其它候选、单次最多等 120 秒 |
 | `md_drop_reference` | **开** | **markdown 不带引用**：官方 Node SDK 让 markdown 与 `message_reference` **互斥**（markdown 时绝不带引用）；实测两者同发会让 QQ 的 md 渲染不正常（图片不显示、正文异常）。打开后本条是 markdown 就去掉引用，**被动回复锚点 `msg_id` 保留**（配额/时效不变）。关掉则保持框架原样 |
 | `extra_intents` | **开** | 额外订阅「成员事件 1<<24 + 互动回调 1<<26」。官方平台事件订阅是硬要求，不订就收不到；插件会在连接时自动补上订阅位并请一次重连，**需重启 KiraAI** 生效。个别环境被平台拒绝订阅时会自动回退 |
 
@@ -455,6 +456,46 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.12</b> — ★★ 语音转码加固：ffmpeg「0xC0000142 弹窗卡死」对策 + 自定义 ffmpeg 路径；世代戳改为自动取版本号</summary>
+
+### 现场（用户线报）
+
+转码/编辑 5 分钟左右的音频时，Windows 弹出
+`ffmpeg-win-x86_64-v7.1.exe - 应用程序无法正常启动(0xc0000142)`
+（= imageio-ffmpeg 自带的那颗二进制，`STATUS_DLL_INIT_FAILED`），
+且 **Kira 实例的 cmd 窗口随之消失**（进程本身还活着、面板还能用）。
+机制上属于"子进程启动失败 + 控制台纠缠"，我们这边把能切断的链路全部切断。
+
+### 插件侧做了什么（全部自动，无需用户操作）
+
+* **子进程与父控制台彻底解耦**：`CREATE_NO_WINDOW`（Windows）+
+  `stdin=DEVNULL` + `-nostdin` —— ffmpeg 子进程不再和 Kira 的控制台纠缠；
+* **单次超时 300s → 120s**：弹窗卡死时更快退守（被动回复窗口只有 5 分钟，
+  不能被一次卡死拖到过期）；
+* **候选二进制自动轮换**：插件配置 → `IMAGEIO_FFMPEG_EXE` → 系统 PATH →
+  imageio 自带；遇到"启动类错误"（`0xC0000142` / `0xC0000135` / `0xC0000005`…）
+  或超时 ⇒ 杀掉并**换下一个候选**，成功后记住可用的那颗；每次轮换都有日志；
+* **新增配置 `ffmpeg_path`**：装上系统 ffmpeg 后把路径填上即可优先使用
+  （Windows 建议 `winget install Gyan.FFmpeg`）；
+* **启动横幅直接标明用的是哪个 ffmpeg**（含路径与候选数）—— 排查一眼到位。
+
+### 另外一个重要修正：世代戳改为"自动取 manifest 版本号"
+
+手动维护的世代戳会在"改了包装行为但忘了改戳"时翻车 —— v1.6.11 的文件名修复
+就藏在包装闭包里，如果世代没变，老包装会继续生效、**修复等于没上**（本次
+发版前自查发现，已彻底改为自动取版本号：之后每次发版必然换新包装）。
+
+### 测试
+
+`audit_ffmpeg_deps.py` 新增：`-nostdin` / `stdin=DEVNULL` / 120s 超时 /
+Windows `CREATE_NO_WINDOW` / **0xC0000142 自动换候选** / 记住可用二进制 /
+配置优先级 / 清空回退；`audit_media_guard.py` 新增"世代戳 == manifest 版本"断言。
+
+**全套件双世代全绿。**
+
+</details>
+
+<details>
 <summary><b>v1.6.11</b> — ★★★ GIF 原生通道对齐：图片上传**带文件名**（与 KiraAI 原生成功路径一字不差）</summary>
 
 ### 现象

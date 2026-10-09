@@ -145,6 +145,12 @@ async def main():
           M.is_format_error(RuntimeError("富媒体文件格式不支持")) is True)
     check("★ is_format_error：网络抖动不算",
           M.is_format_error(RuntimeError("boom: connection reset")) is False)
+    import json as _json
+
+    _mf = os.path.join(os.path.dirname(os.path.abspath(M.__file__)), "manifest.json")
+    _ver = _json.load(open(_mf, encoding="utf-8"))["version"]
+    check("★ 世代戳 == manifest 版本（自动取，杜绝手写漏改导致修复不生效）",
+          M._WRAPPER_BUILD == _ver, f"{M._WRAPPER_BUILD} vs {_ver}")
 
     class _Holder:
         def __init__(self):

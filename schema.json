@@ -181,6 +181,12 @@
         "default": "auto",
         "hint": "只影响 md（markdown 消息）里的动图（GIF / 动画 WebP）。auto（推荐）：先试把原始动图直接转存（官方文档把 gif 列进了图片支持格式，这是唯一有机会在 md 里真动起来的形态）；被平台以格式为由拒收（实测 850019）就自动退成 APNG（动图版 PNG，平台一定收；客户端是否播放动画取决于客户端），再不行退成静态 PNG——每一步都会写日志说明用了哪条路。url：远程动图保留原始公网地址，让平台自己下载转存（走平台侧下载管道、绕开上传接口的格式限制；本地动图仍走候选链）——如果群里显示不出/不动，改回 auto 或 static。static：跳过原图直传，直接转存成 APNG/静态 PNG（保守档：一定能显示，但动图大概率只有一帧）。静图（png/jpg）不受影响。"
       },
+      "ffmpeg_path": {
+        "name": "自定义 ffmpeg 路径（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空=自动查找（插件配置 → IMAGEIO_FFMPEG_EXE 环境变量 → 系统 PATH → imageio-ffmpeg 自带）。若语音转码时在 Windows 看到「应用程序无法正常启动(0xC0000142)」等 ffmpeg 弹窗错误，建议装一个系统 ffmpeg（winget install Gyan.FFmpeg）并把它（ffmpeg.exe 的完整路径）填到这里，插件会优先使用；转换失败时会自动轮换其它候选二进制，单次最多等 120 秒，不会一直卡着。"
+      },
       "md_drop_reference": {
         "name": "markdown 消息不带引用（推荐开）",
         "type": "switch",
