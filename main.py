@@ -354,6 +354,16 @@ class QQOfficialGroupBridge(BasePlugin):
         #: GIF/动图的发送方式：auto（默认：尽量内嵌显示，被平台拒就按文件发）/
         #: image（只按图片发）/ file（原样按文件发，保留动图）
         self.gif_sticker_mode = str(basic.get("gif_sticker_mode", "auto") or "auto").strip().lower()
+        #: md 里的**动图**怎么发（2026-10-09 新增）：
+        #:   auto（默认）= 先试"原始动图直传"（保动画优先）→ 被平台拒则 APNG → 静态 PNG；
+        #:   url         = 远程动图**保留原公网地址**（平台自己下载转存，绕开上传接口的
+        #:                 png/jpg 限制；本地动图仍走候选链）；
+        #:   static      = 直接走转存+APNG/PNG（保险档：一定显示，但动图大概率变静图）。
+        #: 背景：平台上传接口只收 png/jpg；APNG 在客户端是否动起来不可控，
+        #: 而"原始 GIF"是唯一有机会真动的形态（官方文档把 gif 列进了图片支持格式）。
+        self.md_gif_mode = str(basic.get("md_gif_mode", "auto") or "auto").strip().lower()
+        if self.md_gif_mode not in ("auto", "url", "static"):
+            self.md_gif_mode = "auto"
         # ---- v1.3.3：按"是否需要群管理权限"分成两组 ----
         # 原则（用户约定）：不需要权限的默认开；需要权限的默认关。
         # ⚠ 存量用户不受影响：核心只在「配置里没有这个键」时才填默认值
@@ -404,6 +414,10 @@ class QQOfficialGroupBridge(BasePlugin):
         self._capability_cache: dict = {}
         #: 装过媒体类型修正的宿主对象（还原时要用）
         self._media_types_holders: dict = {}
+        #: 已提示过「媒体层没装上」的适配器（每台只提示一次，见 _warn_media_install_failed）
+        self._media_fail_warned: set = set()
+        #: 已挂过「媒体安全网」的 client（还原时要用；按 id 记）
+        self._media_guards: dict = {}
         #: 声明过 sticker 支持的宿主对象（还原时要用）
         self._sticker_holders: dict = {}
         #: 群名补拉的串行任务（避免一次排队太多撞接口限流）
@@ -644,6 +658,11 @@ class QQOfficialGroupBridge(BasePlugin):
         if not self.enabled:
             self._restore_all()
             return
+        # 动图策略同步给 md_media（热改配置也能生效；成本≈0）
+        try:
+            self._sync_md_gif_mode()
+        except Exception:
+            pass
         adapters = self._find_adapters()
         if not adapters:
             if report:
@@ -773,6 +792,15 @@ class QQOfficialGroupBridge(BasePlugin):
                         changed.append(f"{name}.media_types")
                 except Exception:
                     pass
+            # 媒体安全网（HTTP 层）
+            try:
+                _gc = client if client is not None else adapter.get_client()
+                if _gc is not None and self._media_guards.pop(id(_gc), None) is not None:
+                    from media_types import restore_http_guard as _restore_guard
+                    if _restore_guard(_gc):
+                        changed.append(f"{name}.media_guard")
+            except Exception:
+                pass
             # 互动回调（标记与 qqbot_bridge.attach_client_handler 统一，便于还原）
             current = getattr(client, "on_interaction_create", None)
             if callable(current) and detach_client_handler(client, "on_interaction_create"):
@@ -1103,15 +1131,32 @@ class QQOfficialGroupBridge(BasePlugin):
         #   官方 file_type：1=图片 2=视频 3=语音 4=文件；框架写死「非图即 4」
         #   ⇒ 视频/语音会以**文件卡片**发出（要点开下载），不能内嵌播放。
         #   纯插件侧修正（包 `_upload_file`），不动核心。
+        #
+        # ★ 2026-10-09 加固：多落点安装 + 失败响亮报错 + **HTTP 层安全网**。
+        #   线上出现过「媒体层像没装上、日志里却查不到原因」的状况，三管齐下：
+        #   ① 多落点（能力对象 / `_capabilities` / 适配器本身，见 _media_holder_for）；
+        #   ② 装不上就打 WARNING（每适配器一次），现场一眼可见；
+        #   ③ 另挂 HTTP 层安全网（不依赖 ① 的结果）—— GIF/动图与音频的最后防线。
         try:
             from media_types import install as _install_media_types
-            holder = self._capability_of(adapter)
-            if not hasattr(holder, "_upload_file"):
-                holder = adapter            # 2.x：在适配器实例上
-            if _install_media_types(holder, client, logger, self):
+            holder = self._media_holder_for(adapter)
+            if holder is not None and _install_media_types(holder, client, logger, self):
                 self._media_types_holders[name] = holder
+            else:
+                self._warn_media_install_failed(name, holder, adapter, client)
         except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 安装媒体类型修正失败（不影响其它功能）: %s", exc)
+            logger.warning("[QQBOT-BRIDGE] 安装媒体类型修正异常（不影响其它功能）: %s: %s",
+                           type(exc).__name__, exc)
+        try:
+            from media_types import install_http_guard as _install_guard
+            if _install_guard(client, logger, self):
+                if not self._media_guards:
+                    logger.info(
+                        "[QQBOT-BRIDGE] 媒体安全网已就位（HTTP 层）：即便上面的媒体包装失效，"
+                        "图片（GIF/动图）与音频（语音条）也会在**发出去之前**被正确转换/转换失败可查")
+                self._media_guards[id(client)] = client
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 安装媒体安全网失败（不影响其它功能）: %s", exc)
 
         # ---- L3-C：表情包（`<sticker>` 标签）—— 同样世代无关 ----
         #
@@ -1980,6 +2025,120 @@ class QQOfficialGroupBridge(BasePlugin):
         return cap
 
     # ------------------------------------------------------------------ #
+    # 媒体层：多落点安装 / 发送路径自愈 / 响亮诊断（2026-10-09 加）
+    # ------------------------------------------------------------------ #
+    def _media_holder_for(self, adapter):
+        """找出「真正带 `_upload_file` 的对象」——多落点兜底。
+
+        2026-10-09：线上出现「媒体层像没装上」但**查不到原因**的状况。
+        原来只试 `_capability_of(adapter)` 一处，解析不到就静默失败；
+        现在按顺序试：能力对象 → `adapter._capabilities` 里所有带 `_upload_file`
+        的对象 → 适配器本身。都找不到返回 None（由调用方响亮报错）。
+        """
+        seen = set()
+        cands = []
+        try:
+            cap = self._capability_of(adapter)
+        except Exception:
+            cap = None
+        if cap is not None:
+            cands.append(cap)
+        caps = getattr(adapter, "_capabilities", None)
+        if isinstance(caps, dict):
+            cands.extend(list(caps.values()))
+        caps2 = getattr(adapter, "capabilities", None)
+        if isinstance(caps2, dict):
+            cands.extend(list(caps2.values()))
+        cands.append(adapter)
+        for c in cands:
+            if c is None or id(c) in seen:
+                continue
+            seen.add(id(c))
+            if callable(getattr(c, "_upload_file", None)):
+                return c
+        return None
+
+    def _warn_media_install_failed(self, name: str, holder, adapter, client=None) -> None:
+        """媒体层没装上 ⇒ 响亮提示一次（每个适配器一次）。
+
+        现场对照（用户 2026-10-09 日志）：贴纸的 GIF 原样直传被 850019 拒、
+        语音按 file_type=4 降级成文件卡片，而日志里**一条媒体处理记录都没有**。
+        这条日志就是为了让这种状况**下次一眼可见**。
+        """
+        key = str(name or "?")
+        if key in self._media_fail_warned:
+            return
+        self._media_fail_warned.add(key)
+        try:
+            cap = self._capability_of(adapter)
+        except Exception:
+            cap = None
+        api = None
+        try:
+            api = getattr(client if client is not None else adapter.get_client(), "api", None)
+        except Exception:
+            api = None
+        logger.warning(
+            "[QQBOT-BRIDGE] ⚠ %s：媒体层（file_type 修正）**没有装上** —— holder=%s，"
+            "能力对象=%s，client.api=%s。表现会是：GIF/动图直传被拒（850019）、"
+            "语音/视频变文件卡片。HTTP 层安全网若在仍会兜住图片与语音；"
+            "请把这条日志连同现场反馈（插件会在发送路径上继续重试安装）",
+            key,
+            type(holder).__name__ if holder is not None else "None（找不到带 _upload_file 的对象）",
+            type(cap).__name__ if cap is not None else "None",
+            "有" if api is not None else "无",
+        )
+
+    def _ensure_media_layer(self, adapter, client=None, cap=None) -> bool:
+        """把媒体层（`_upload_file` 包装）**从发送路径上再保一次**。
+
+        为什么放在发送路径：发送路径（`_patch_send_path` 的包装）在线上被证实
+        一定会被调到（它负责「换壳」，贴纸/语音都靠它），所以在这里顺带 ensure，
+        就能保证「媒体层万一没装上/被还原掉 ⇒ 这条消息发出前一定被补上，且留痕」。
+        幂等；已装好时几乎零成本（一次 dict 查 + 一次标记 getattr）。
+        """
+        try:
+            name = str(getattr(getattr(adapter, "info", None), "name", "") or "")
+        except Exception:
+            name = ""
+        if name:
+            # ★ 不能只信 dict 记录 —— 旧实例/错位还原可能已经把包装**拆掉**而
+            #   dict 里还留着记录（热重载场景）。每次都验证一下标记还在不在，
+            #   不在就重装（成本 = 两次 getattr）。
+            holder0 = self._media_types_holders.get(name)
+            if holder0 is not None and getattr(
+                    getattr(holder0, "_upload_file", None), "_kira_bridge_ftype", False):
+                return True
+            if holder0 is not None:
+                self._media_types_holders.pop(name, None)
+        try:
+            holder = cap if cap is not None else self._media_holder_for(adapter)
+            ok = False
+            if holder is not None:
+                from media_types import install as _install_media_types
+                if client is None:
+                    client = adapter.get_client()
+                ok = bool(_install_media_types(holder, client, logger, self))
+                if ok:
+                    self._media_types_holders[name] = holder
+            if not ok:
+                self._warn_media_install_failed(name, holder, adapter, client)
+            return ok
+        except Exception as exc:
+            logger.warning(
+                "[QQBOT-BRIDGE] %s：发送前补装媒体层失败（%s: %s）—— 本条媒体可能以默认方式发送",
+                name or "?", type(exc).__name__, exc)
+            return False
+
+    def _sync_md_gif_mode(self) -> None:
+        """把动图策略同步给 md_media 模块（热改配置也能生效）。"""
+        try:
+            import md_media as _mdm
+            _mdm.set_md_gif_mode(self.md_gif_mode)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
     # 私聊「输入中…」状态（官方能力，KiraAI 核心两代都没有）
     # ------------------------------------------------------------------ #
     #: 官方限制：`input_second` 最大 60 秒（腾讯 Node SDK 默认 30，Hermes 用 60）
@@ -2150,10 +2309,16 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._typing_logged = True
                 logger.info(
                     "[QQBOT-BRIDGE] 已在私聊里发「输入中…」状态（msg_type=6，%d 秒，"
-                    "msg_seq=%s 与框架共用同一条序号）—— 它显示在聊天**顶部标题下方**"
-                    "（「正在输入…」），不是机器人名字下面的「在线」；只在单聊生效，"
-                    "发失败不影响回复",
+                    "msg_seq=%s 与框架共用同一条序号）—— 单聊里对方会看到「输入中/正在输入…」，"
+                    "群里官方不支持；发失败不影响回复",
                     self._TYPING_SECONDS, seq,
+                )
+            else:
+                # ★ 第 2 次起也留痕（DEBUG）——「输入中到底发没发」是用户常问的问题，
+                #   有这行就能对着日志回答，而不是猜（前几次 INFO 见上）。
+                logger.debug(
+                    "[QQBOT-BRIDGE] 输入中状态已发（msg_id=%s…, msg_seq=%s）",
+                    str(msg_id)[:18], seq,
                 )
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 输入中状态发送失败（忽略）: %s", exc)
@@ -2483,6 +2648,14 @@ class QQOfficialGroupBridge(BasePlugin):
             #   **漏掉了 Record / Video**（两代都一样）⇒ 语音/视频根本进不了
             #   发送链，还会被 `_text_content` 填成 `[Unsupported message element]`。
             #   这里临时"换壳"成 File 让核心收下（发完还原），不动核心。
+            #
+            # ★ 2026-10-09 自愈：发送路径**一定会被调到**（换壳就靠它），
+            #   顺带把媒体层（_upload_file 包装）再 ensure 一次 ——
+            #   万一之前没装上/被还原掉，本条消息发出前一定补上，并留下可见日志。
+            try:
+                self._ensure_media_layer(adapter, client, cap)
+            except Exception as _exc:
+                logger.debug("[QQBOT-BRIDGE] 发送前补装媒体层异常（忽略）: %s", _exc)
             from media_coerce import coerce_media_chain, restore_media_chain
             send_message_obj, _swapped = coerce_media_chain(
                 send_message_obj, self.sticker_tags)

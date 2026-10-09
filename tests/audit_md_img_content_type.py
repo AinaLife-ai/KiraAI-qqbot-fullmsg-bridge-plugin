@@ -168,7 +168,7 @@ async def main():
     check("★★ 旧行为（无 Content-Type）≠ 新行为 —— 本测试能抓到该回归",
           not all(s["headers"].get("Content-Type") == "image/png" for s in old))
 
-    print("\n[2b] ★★ md 里的 GIF：也要能内嵌 ⇒ 上传前转 APNG（PNG 魔数 + acTL）")
+    print("\n[2b] ★★★ md 里的动图：候选链「原图 → APNG → 静态 PNG」（2026-10-09）")
     try:
         import io as _io
 
@@ -187,19 +187,153 @@ async def main():
         _r.seed(7)
         gdata = gif + _r.randbytes(900_000)
         gparts = _parts(len(gdata), 400_000)
+
+        class _HTTPRejectGif(_HTTP):
+            """模拟真机：GIF 原图被平台以 850019 拒（按 prepare 的 file_name 判断）。"""
+
+            def __init__(self, parts):
+                super().__init__(parts)
+                self.prepare_names = []
+
+            async def request(self, route, **kw):
+                path = getattr(route, "path", "")
+                body = kw.get("json") or {}
+                if "upload_prepare" in path:
+                    name = str(body.get("file_name") or "")
+                    self.prepare_names.append(name)
+                    if name.endswith(".gif"):
+                        raise RuntimeError(
+                            "400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                    return {"upload_id": "UP1", "parts": self.parts}
+                if "/files" in path:
+                    return {"file_info": "FI",
+                            "raw_url": "https://cos.example.com/x.png?sig=1"}
+                return {}
+
+        print("   [2b-1] 平台收原图 ⇒ 直接用原图（md 里有机会真动）")
         SEEN.clear()
-        graw = await M._upload_bytes_to_qq(_Client(gparts), "G1", True, gdata, "meme.gif",
-                                          logger=_Log())
-        check("★ md 里的 GIF 也能上传成功（拿到公网地址）", bool(graw), repr(graw))
-        _up = b"".join(s["data"] for s in SEEN)
-        check("★★★ 上传的是 **APNG**：头部是 PNG 魔数（不是 GIF）",
-              _up[:8] == b"\x89PNG\r\n\x1a\n", _up[:12].hex())
-        check("★★★ 带 acTL 动画块 ⇒ **md 里的动图有动画**（客户端支持时）",
-              b"acTL" in _up)
-        check("★★ 分片仍带图片 Content-Type（image/png）",
+        log_a = _Log()
+        cli_a = _Client(gparts)
+        _ = await M._upload_bytes_to_qq(cli_a, "G1", True, gdata, "meme.gif", logger=log_a)
+        _up_a = b"".join(s["data"] for s in SEEN)
+        check("★★★ 上传的就是**原始 GIF 字节**（不是转档）",
+              _up_a == gdata and _up_a[:6] in (b"GIF87a", b"GIF89a"), _up_a[:12].hex())
+        check("★ 分片带 image/gif（Content-Type 按字节嗅探）",
+              all(s["headers"].get("Content-Type") == "image/gif" for s in SEEN),
+              str([s["headers"] for s in SEEN]))
+        check("★ 日志说明『原图直传成功』",
+              any("原图直传成功" in m for _lv, m in log_a.lines), str(log_a.lines[-3:]))
+
+        print("   [2b-2] 原图被拒（850019）⇒ 自动退守 APNG")
+        SEEN.clear()
+        log_b = _Log()
+        cli_b = _Client(gparts)
+        cli_b.api._http = _HTTPRejectGif(gparts)
+        graw = await M._upload_bytes_to_qq(cli_b, "G1", True, gdata, "meme.gif", logger=log_b)
+        check("★ 仍拿到公网地址（内容没丢）", bool(graw), repr(graw))
+        check("★★★ 先试了 .gif（被拒），随后 .png 成功",
+              cli_b.api._http.prepare_names[:2] == ["meme.gif", "meme.png"],
+              str(cli_b.api._http.prepare_names))
+        _up_b = b"".join(s["data"] for s in SEEN)
+        check("★★★ 最终上传的是 **APNG**：PNG 魔数 + acTL",
+              _up_b[:8] == b"\x89PNG\r\n\x1a\n" and b"acTL" in _up_b, _up_b[:12].hex())
+        check("★★ 分片带图片 Content-Type",
               all(s["headers"].get("Content-Type", "").startswith("image/") for s in SEEN),
               str([s["headers"] for s in SEEN]))
-        check("★ 上传的字节 != 原始 GIF 字节（确实转换过）", _up != gdata)
+        check("★ 日志说明原图候选被平台拒收",
+              any("被平台拒收" in m for _lv, m in log_b.lines), str(log_b.lines[-4:]))
+
+        print("   [2b-3] 同一条已被拒过的动图 ⇒ 10 分钟内不再白撞（记得住）")
+        SEEN.clear()
+        cli_c = _Client(gparts)
+        cli_c.api._http = _HTTPRejectGif(gparts)
+        _ = await M._upload_bytes_to_qq(cli_c, "G1", True, gdata, "meme.gif", logger=_Log())
+        check("★★ 直接被跳过：第一个 prepare 就是 .png（没有再试 .gif）",
+              cli_c.api._http.prepare_names[:1] == ["meme.png"],
+              str(cli_c.api._http.prepare_names))
+
+        print("   [2b-4] static 模式 ⇒ 不试原图，直接 APNG（保守档）")
+        M.set_md_gif_mode("static")
+        try:
+            SEEN.clear()
+            cli_d = _Client(gparts)
+            cli_d.api._http = _HTTPRejectGif(gparts)
+            _ = await M._upload_bytes_to_qq(cli_d, "G1", True, gdata, "meme.gif", logger=_Log())
+            _up_d = b"".join(s["data"] for s in SEEN)
+            check("★★ static：上传的是 APNG（PNG 魔数 + acTL）",
+                  _up_d[:8] == b"\x89PNG\r\n\x1a\n" and b"acTL" in _up_d, _up_d[:12].hex())
+            check("★★ static：**没试过** .gif（第一个 prepare 就是 .png）",
+                  cli_d.api._http.prepare_names[:1] == ["meme.png"],
+                  str(cli_d.api._http.prepare_names))
+        finally:
+            M.set_md_gif_mode("auto")
+
+        print("   [2c-1] url 模式：远程动图**保留原公网地址**（平台自己下载）")
+        M.clear_caches()
+        remote = "https://example.com/meme.gif"
+        calls = {"upload": 0}
+        _orig_fetch = M._fetch_bytes
+        _orig_resolve = M.resolve_image_url
+        _orig_up = M.upload_remote_to_public_url
+
+        async def _fake_fetch(_url, logger=None, timeout=30.0):
+            return gif
+
+        async def _fake_resolve(_client, _url, logger=None, timeout=12.0):
+            return _url
+
+        async def _record_upload(*_a, **_k):
+            calls["upload"] += 1
+            return "https://cos/should-not-be-used", (6, 6)
+
+        M.set_md_gif_mode("url")
+        M._fetch_bytes = _fake_fetch
+        M.resolve_image_url = _fake_resolve
+        M.upload_remote_to_public_url = _record_upload
+        try:
+            url2, sz2 = await M._resolve_image_url(
+                remote, client=None, target_id="U", is_group=False,
+                adapter=None, logger=_Log(), want_size=True)
+        finally:
+            M._fetch_bytes = _orig_fetch
+            M.resolve_image_url = _orig_resolve
+            M.upload_remote_to_public_url = _orig_up
+            M.set_md_gif_mode("auto")
+        check("★★★ 保留原地址、没有走转存",
+              url2 == remote and calls["upload"] == 0,
+              f"{url2} upload={calls['upload']}")
+        check("★★ 尺寸照样量出来（md 必需 #w #h）",
+              bool(sz2) and sz2[0] > 0, str(sz2))
+
+        print("   [2c-2] url 模式但拉取失败 ⇒ 自动落回候选链（不卡住）")
+        M.clear_caches()
+        calls2 = {"upload": 0}
+        _orig_fetch2 = M._fetch_bytes
+        _orig_up2 = M.upload_remote_to_public_url
+
+        async def _fail_fetch(_url, logger=None, timeout=30.0):
+            return None
+
+        async def _fallback_upload(*_a, **_k):
+            calls2["upload"] += 1
+            return "https://cos/fallback.png", (12, 12)
+
+        M.set_md_gif_mode("url")
+        M._fetch_bytes = _fail_fetch
+        M.upload_remote_to_public_url = _fallback_upload
+        M.resolve_image_url = _fake_resolve
+        try:
+            url3, sz3 = await M._resolve_image_url(
+                "https://example.com/x.gif", client=None, target_id="U",
+                is_group=False, adapter=None, logger=_Log(), want_size=True)
+        finally:
+            M._fetch_bytes = _orig_fetch2
+            M.upload_remote_to_public_url = _orig_up2
+            M.resolve_image_url = _orig_resolve
+            M.set_md_gif_mode("auto")
+        check("★★ 落回转存（upload 恰被调用 1 次）",
+              calls2["upload"] == 1 and url3 == "https://cos/fallback.png",
+              f"{url3} upload={calls2['upload']}")
 
     print("\n[3] 直链自检（观测）被调用")
     check("★ 自检真的跑了（假 URL ⇒ 记一条 warning，不影响发送）",

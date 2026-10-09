@@ -17,6 +17,10 @@ fake.encode=encode
 sys.modules["pilk"]=fake
 
 import audio_silk as A
+# ★ 2026-10-09：把编码器探测**固定到桩 pilk** —— 若开发机真装了 pysilk
+#   （插件 requirements 里就有），优先级会选中它，桩的调用记录全为空 ⇒ 断言失真。
+#   测试制品必须任何机器一致（见 tests/_env.py 的约定）。
+A._ENCODER_CACHE, A._ENCODER_TRIED = "pilk", True
 class L:
     def info(self,*a): print("    INFO:", (a[0]%tuple(a[1:])) if len(a)>1 else a[0])
     def warning(self,*a): print("    WARN:", (a[0]%tuple(a[1:])) if len(a)>1 else a[0])
