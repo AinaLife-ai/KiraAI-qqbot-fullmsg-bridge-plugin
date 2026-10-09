@@ -187,6 +187,83 @@ async def main():
           len(client.api._http.calls) == _calls_before,
           str(client.api._http.calls[_calls_before:]))
 
+    print("\n[9] ★★ 3.0 形状：回复 id 挂在**能力对象**上也要能发（真实适配器/能力对象）")
+    try:
+        from core.adapter.adapter_info import AdapterInfo
+        from core.adapter.capabilities import IMCapability
+        from core.adapter.context import AdapterContext
+        from core.adapter.src.qq_official.qq_official import QQOfficialAdapter
+
+        _info = AdapterInfo(adapter_id="t", enabled=True, name="qqo", platform="QQ Official",
+                            config={"app_id": "a", "app_secret": "b",
+                                    "permission_mode": "deny_list",
+                                    "group_deny_list": [], "user_deny_list": []})
+        real_ad = QQOfficialAdapter(AdapterContext(info=_info, event_queue=asyncio.Queue()))
+        real_http = HTTP()
+        real_ad.client = Client()
+        real_ad.client.api._http = real_http
+        cap = real_ad.get_capability(IMCapability)
+        check("★ 3.0 的回复 id 确实在**能力对象**上（适配器实例上没有）",
+              hasattr(cap, "_direct_reply_ids") and not hasattr(real_ad, "_direct_reply_ids"))
+        cap._direct_reply_ids["U9"] = "MSGID-9"
+        plugin9 = bridge_main.QQOfficialGroupBridge(
+            SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: real_ad)),
+            {"section_basic": {"enabled": True, "typing_enabled": True}})
+        ok9 = plugin9._maybe_send_typing(event(False, "U9"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        check("★★ `_adapter_attr` 会回落到能力对象 ⇒ 真的发出去了", ok9 is True)
+        check("★ 发出的是 msg_type=6",
+              bool(real_http.calls) and real_http.calls[-1]["json"].get("msg_type") == 6,
+              str(real_http.calls[-1:]))
+        seqs = getattr(cap, "_reply_msg_seqs", {})
+        check("★★ msg_seq 接进**框架自己的计数器**并写回（不会与回复撞重复）",
+              seqs.get((False, "U9", "MSGID-9")) == 1, str(dict(seqs)))
+    except Exception as exc:
+        check("★ 3.0 能力对象用例无异常", False, f"{type(exc).__name__}: {exc}")
+
+    print("\n[10] ★★ 额度保护：同一条入站消息最多 typing_max_frames 帧（默认 2）")
+    adapter10 = Adapter(Client(), {"U10": "MSGID-10"})   # 注意：Client() 自己建 HTTP 实例
+    plugin10 = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: adapter10)),
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_max_frames": 2}})
+    got = []
+    for _i in range(3):
+        plugin10._typing_sent_at.clear()          # 模拟"防抖窗口已过"
+        got.append(plugin10._maybe_send_typing(event(False, "U10")))
+        for _t in list(plugin10._typing_tasks):   # 等真正发完（确定性，别靠 sleep 次数）
+            await _t
+    check("★ 前 2 帧放行、第 3 帧被额度挡住（保护被动回复配额）",
+          got == [True, True, False], str(got))
+    _calls10 = adapter10.get_client().api._http.calls
+    check("★ 实际只发了 2 个请求", len(_calls10) == 2, str(len(_calls10)))
+    check("★ 有可见日志说明是帧数上限挡的",
+          "typing_skip_frame_cap" in plugin10._typing_skip_done,
+          str(plugin10._typing_skip_done))
+
+    print("\n[11] ★ 为什么没发：每种原因各写一条可见日志（不再查无可查）")
+    plugin11 = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(
+            get_adapter=lambda n: Adapter(Client(), {}))),
+        {"section_basic": {"enabled": True, "typing_enabled": True}})
+    check("★ 没有入站 msg_id ⇒ 记下 no_msg_id",
+          plugin11._maybe_send_typing(event(False, "NOPE")) is False
+          and "typing_skip_no_msg_id" in plugin11._typing_skip_done,
+          str(plugin11._typing_skip_done))
+    check("★ 群聊事件 ⇒ 记下 not_c2c",
+          plugin11._maybe_send_typing(event(True, "NOPE")) is False
+          and "typing_skip_not_c2c" in plugin11._typing_skip_done,
+          str(plugin11._typing_skip_done))
+    plugin_off2 = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(
+            get_adapter=lambda n: Adapter(Client(), {"X": "M"}))),
+        {"section_basic": {"enabled": True, "typing_enabled": False}})
+    check("★ 配置关掉 ⇒ 记下 disabled",
+          plugin_off2._maybe_send_typing(event(False, "X")) is False
+          and "typing_skip_disabled" in plugin_off2._typing_skip_done,
+          str(plugin_off2._typing_skip_done))
+
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

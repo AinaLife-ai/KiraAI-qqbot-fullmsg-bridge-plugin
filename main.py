@@ -321,6 +321,44 @@ def _identity_path():
             return None
 
 
+def _split_media_and_rest(chain):
+    """把消息链拆成 ``(媒体链, 其余链)``；**没有媒体元素就返回 None**。
+
+    ★ 为什么要拆（2026-10-10 用户要求 + 官方限制）：
+      官方 Node/Python SDK 原话「**仅 markdown 消息支持消息按钮**」。
+      一条消息里既有图片/语音又有键盘时，两者抢同一个 `msg_type`：
+      走富媒体（7）按钮不显示，走 markdown（2）媒体发不出去。
+      ⇒ 自动拆成两条：① 媒体   ② 带按钮的 markdown（正文 + 键盘），
+      由核心分别发送（每条的 `msg_id`/`msg_seq` 由核心统一递增，不会撞重复）。
+
+    返回 ``None`` 表示"不用拆/拆不了"（调用方按原样发一条）。
+    """
+    try:
+        from core.chat.message_elements import File as _File
+        from core.chat.message_elements import Image as _Image
+    except Exception:
+        return None
+    try:
+        from core.chat.message_utils import MessageChain as _MC
+    except Exception:
+        try:
+            from core.chat import MessageChain as _MC
+        except Exception:
+            return None
+    try:
+        items = list(chain)
+    except Exception:
+        return None
+    media = [e for e in items if isinstance(e, (_File, _Image))]
+    if not media:
+        return None
+    rest = [e for e in items if not isinstance(e, (_File, _Image))]
+    try:
+        return _MC(media), _MC(rest)
+    except Exception:
+        return None
+
+
 class QQOfficialGroupBridge(BasePlugin):
     """把 QQ 官方机器人的群/单聊事件对齐成 KiraAI 标准语义。"""
 
@@ -359,6 +397,15 @@ class QQOfficialGroupBridge(BasePlugin):
         self.interaction_enabled = bool(basic.get("interaction_enabled", True))
         #: 私聊「输入中…」状态（官方能力，核心没有；见 _maybe_send_typing）
         self.typing_enabled = bool(basic.get("typing_enabled", True))
+        #: ★ 每条入站消息最多为它花几帧「输入中」（默认 2）。
+        #:   msg_type=6 与真实回复共用「同一 msg_id 最多 4 次被动回复」的额度，
+        #:   默认 2 帧 + 1 条回复 = 3，留 1 个余量（长回复/多段回复要用）。
+        try:
+            self.typing_max_frames = int(basic.get("typing_max_frames", 2) or 2)
+        except Exception:
+            self.typing_max_frames = 2
+        if not (1 <= self.typing_max_frames <= 3):
+            self.typing_max_frames = 2
         #: 私聊流式消息（官方 stream_messages；见 c2c_stream.py）
         self.c2c_stream_enabled = bool(basic.get("c2c_stream_enabled", True))
         #: 表情包标签关键词（逗号分隔；默认 sticker —— 它同时覆盖内置表情包插件
@@ -459,6 +506,13 @@ class QQOfficialGroupBridge(BasePlugin):
         self._reconnect_tasks: list = []
         #: 私聊「输入中」状态：target -> 上次发送时间（防抖，见 _maybe_send_typing）
         self._typing_sent_at: dict = {}
+        #: ★ 配额度保护：(target, 入站 msg_id) -> 已用帧数。
+        #:   msg_type=6 走的是**发消息接口**，与真实回复共用
+        #:   「同一个入站消息最多 4 次被动回复」的额度（官方文档），
+        #:   所以每条消息最多花 typing_max_frames 帧，保证回复永远有额度。
+        self._typing_frames: dict = {}
+        #: 「为什么没发」的诊断只打一次（每种原因一条）
+        self._typing_skip_done: set = set()
         self._typing_tasks: list = []
         self._typing_logged = False
         self._typing_seq = 1000
@@ -2267,6 +2321,32 @@ class QQOfficialGroupBridge(BasePlugin):
             client = None
         self.llm_stream.begin_turn(request, adapter, target, msg_id, client)
 
+    def _typing_skip(self, reason: str, fmt: str = "", *args) -> None:
+        """「输入中状态**为什么没发**」—— 每种原因只打一条 INFO（排查用）。
+
+        ★ 为什么要有它（2026-10-09/10 的教训两次都是同一类）：
+          静默 return False 让用户（和排查的人）**查无可查**：
+          「我明明开了输入中，怎么没反应」。现在每种原因写一次，
+          下一条日志就能定位到底卡在哪一道门。
+
+        原因一览：
+          disabled（配置关）/ not_c2c（不是单聊）/ no_adapter / no_client（没连上）/
+          no_msg_id（没有入站 msg_id）/ debounced（50 秒防抖）/
+          frame_cap（这条消息的输入中帧数已达上限）
+        """
+        key = "typing_skip_" + str(reason)
+        if key in self._typing_skip_done:
+            return
+        try:
+            self._typing_skip_done.add(key)
+        except Exception:
+            pass
+        try:
+            logger.info("[QQBOT-BRIDGE] 输入中状态（msg_type=6）**本次未发送**：%s%s",
+                        (fmt % args) if (fmt and args) else fmt, "")
+        except Exception:
+            pass
+
     def _maybe_send_typing(self, event) -> bool:
         """模型开始思考时，给**私聊**会话发一个「输入中」状态。返回是否已排队。
 
@@ -2291,25 +2371,47 @@ class QQOfficialGroupBridge(BasePlugin):
         用同一个会话 50 秒防抖，避免多步 agent 循环每个 step 都发一次。
         """
         if not self.typing_enabled or not self.enabled:
+            self._typing_skip("disabled", "配置 typing_enabled=关")
             return False
         try:
             target = self._c2c_target_of(event)
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
             if not target or not adapter_name:
-                return False
-            now = time.time()
-            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
+                self._typing_skip("not_c2c",
+                                  "不是单聊会话（官方 msg_type=6 只支持单聊）")
                 return False
             adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
             if adapter is None:
+                self._typing_skip("no_adapter", "适配器 %s 还没就绪", adapter_name)
                 return False
             client = adapter.get_client()
             if client is None:
+                self._typing_skip("no_client", "适配器 %s 还没连上（client 为空）", adapter_name)
                 return False
             reply_ids = self._adapter_attr(adapter, "_direct_reply_ids") or {}
             msg_id = str(reply_ids.get(target) or "")
             if not msg_id:
+                self._typing_skip("no_msg_id",
+                                  "还没有入站 msg_id（被动回复窗口未就绪）——"
+                                  "输入中状态必须挂在一条收到的消息上")
                 return False                      # 没有新鲜的入站 msg_id ⇒ 发了也没用
+            now = time.time()
+            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
+                self._typing_skip("debounced", "同一会话距上次发送不足 %.0f 秒（防抖）",
+                                  self._TYPING_DEBOUNCE)
+                return False
+            # ★ 额度保护（见 `typing_max_frames` 的注释）：同一条入站消息最多花 N 帧
+            frame_key = (target, msg_id)
+            used = int(self._typing_frames.get(frame_key, 0))
+            if used >= self.typing_max_frames:
+                self._typing_skip(
+                    "frame_cap",
+                    "本条入站消息的输入中帧数已达上限 %d（保护被动回复额度："
+                    "同一 msg_id 最多 4 次，留给真实回复）", self.typing_max_frames)
+                return False
+            if len(self._typing_frames) > 64:     # 有界，防长会话里无限增长
+                self._typing_frames.clear()
+            self._typing_frames[frame_key] = used + 1
             self._typing_sent_at[target] = now    # 先占位（并发时不会重复排）
             task = asyncio.ensure_future(
                 self._send_typing(adapter, client, target, msg_id)
@@ -2808,6 +2910,52 @@ class QQOfficialGroupBridge(BasePlugin):
             kb_token = PENDING_KB.set(kb)
             ref_token = QUOTE_REF.set(ref)
             try:
+                # ★★★ 2026-10-10：**富媒体 + 键盘 ⇒ 自动拆成两条发送**
+                #   官方只支持 markdown 消息带按钮，一条消息里"图/语音"与"按钮"
+                #   抢同一个 msg_type ⇒ 必须拆开才能两者都正常：
+                #     ① 媒体那条（不带键盘、不带 markdown）
+                #     ② 正文 + 按钮那条（markdown 消息，由 api 层自动升格）
+                #   两条都由**核心**发送 ⇒ msg_id/msg_seq 走核心自己的计数器递增，
+                #   不会与真实回复或彼此撞重复（官方：同一 msg_id 最多 4 次被动回复）。
+                _split = None
+                if kb and self.keyboard_enabled:
+                    try:
+                        _split = _split_media_and_rest(send_message_obj)
+                    except Exception as _exc:
+                        _split = None
+                        logger.debug("[QQBOT-BRIDGE] 拆媒体+键盘失败（按原样发）: %s", _exc)
+                if _split is not None:
+                    _media_chain, _rest_chain = _split
+                    if not getattr(self, "_kb_split_logged", False):
+                        self._kb_split_logged = True
+                        logger.info(
+                            "[QQBOT-BRIDGE] 本条同时有**富媒体与键盘** ⇒ 已自动拆成两条发送："
+                            "① 图片/语音  ② 带按钮的 markdown 消息（正文+按钮）。"
+                            "官方只支持 markdown 消息带按钮，拆开才能两者都正常")
+                    _t1 = PENDING_MD.set(None)
+                    _t2 = PENDING_KB.set(None)
+                    res_media = None
+                    try:
+                        res_media = await original(target_id, _media_chain, is_group)
+                    except Exception as _exc:
+                        logger.warning(
+                            "[QQBOT-BRIDGE] 拆分后**媒体那条**发送失败（%s: %s）——"
+                            "继续发按钮那条（不重复、不丢消息）",
+                            type(_exc).__name__, str(_exc)[:120])
+                    finally:
+                        PENDING_MD.reset(_t1)
+                        PENDING_KB.reset(_t2)
+                    # 第二条：正文 + 按钮（不带引用，避免两条都挂同一条引用）
+                    _t3 = QUOTE_REF.set(None)
+                    try:
+                        res_kb = await original(target_id, _rest_chain, is_group)
+                    finally:
+                        QUOTE_REF.reset(_t3)
+                    if res_kb is not None and bool(getattr(res_kb, "ok", True)):
+                        return res_kb
+                    if res_media is not None and bool(getattr(res_media, "ok", True)):
+                        return res_media
+                    return res_kb if res_kb is not None else res_media
                 result = await original(target_id, send_message_obj, is_group)
             finally:
                 QUOTE_REF.reset(ref_token)

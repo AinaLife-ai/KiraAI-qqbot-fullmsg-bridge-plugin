@@ -291,9 +291,49 @@ class ApiSendPatcher:
         if keyboard:
             kwargs = dict(kwargs)
             kwargs["keyboard"] = keyboard
+            # ★★★ 官方硬要求：**仅 markdown 消息支持消息按钮**
+            #   （官方 Node/Python SDK 的「发送带有按钮的消息」原话）。
+            #   纯文本（msg_type=0）+ keyboard ⇒ 平台不渲染按钮，
+            #   用户只看到文字（2026-10-10 用户实测截图实证）。
+            #   ⇒ 有键盘但本条不是 markdown 时，**就地升格成 markdown 消息**：
+            #     纯文本本身是合法 markdown，按钮才挂得上去。
+            #     `content` 必须留空（官方：传了 markdown 后 content 必须为空）。
+            _kb_reason = ""
+            if not target_md and not kwargs.get("media") \
+                    and int(kwargs.get("msg_type") or 0) != 7:
+                try:
+                    from rich_content import strip_kb_placeholder as _strip_kb
+
+                    _kb_md = _strip_kb(content if isinstance(content, str) else "")
+                except Exception:
+                    _kb_md = str(content or "").strip()
+                if not _kb_md:
+                    _kb_md = "\u200b"      # 只有键盘、没有正文：不可见占位
+                kwargs["msg_type"] = 2
+                kwargs["markdown"] = {"content": _kb_md}
+                kwargs["content"] = None
+                target_md = _kb_md          # 后面失败回退时也有正文可用
+                if self.plugin.md_drop_reference and kwargs.get("message_reference"):
+                    kwargs.pop("message_reference", None)
+                _kb_reason = "upgraded"
+            elif kwargs.get("media") or int(kwargs.get("msg_type") or 0) == 7:
+                _kb_reason = "with_media"
             if not flags.get("kb_logged"):
                 flags["kb_logged"] = True
-                self.logger.info("[QQBOT-BRIDGE] 首次发送内联键盘（<keyboard> 标签生效）")
+                if _kb_reason == "upgraded":
+                    self.logger.info(
+                        "[QQBOT-BRIDGE] 首次发送内联键盘：本条原本是纯文本，已**自动升格成 "
+                        "markdown 消息**（官方：仅 markdown 消息支持消息按钮）—— "
+                        "正文 %d 字，按钮在下方",
+                        len(target_md or ""))
+                elif _kb_reason == "with_media":
+                    self.logger.warning(
+                        "[QQBOT-BRIDGE] 本条同时有**富媒体与键盘**：官方只支持 markdown "
+                        "消息带按钮（msg_type=7 的富媒体消息按钮可能不显示）。"
+                        "想要按钮稳显示，请让模型把键盘与图片/语音分成两条发")
+                else:
+                    self.logger.info(
+                        "[QQBOT-BRIDGE] 首次发送内联键盘（<keyboard> 标签生效，挂在 markdown 消息上）")
 
         # ③.5 ★ C2C 流式消息（官方 stream_messages）
         #

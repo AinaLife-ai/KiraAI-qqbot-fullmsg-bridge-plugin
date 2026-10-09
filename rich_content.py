@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 try:
     from core.chat.message_elements import BaseMessageElement, ElementType, Text
@@ -39,11 +39,43 @@ MAX_BUTTON_DATA = 100
 MAX_MARKDOWN_CHARS = 4000
 
 
-class MarkdownText(BaseMessageElement):  # type: ignore[misc]
+#: 键盘元素在"纯文本渲染"里的占位：**零宽空格**。
+#:
+#: ★ 为什么必须有它（2026-10-10 踩到）：核心发送前会检查
+#:   `if not content and not media_elements: 报「不能发空消息」` ——
+#:   如果键盘元素渲染成空串，**只有键盘的消息会被核心直接拒发**。
+#:   零宽空格不可见（Python 不把它当空白，strip() 去不掉），
+#:   既能过核心的空检查，用户也看不到任何字符。
+KB_TEXT_PLACEHOLDER = "\u200b"
+
+#: ★★★ 我们的自定义元素都**继承核心的 `Text`**（2026-10-10 修的真 bug）：
+#:
+#:   核心 `_text_content()` 只按 `isinstance(element, Text)` 分支渲染，
+#:   **不认识**我们的元素 ⇒ 落进 `else` 拼出字面量
+#:   `[Unsupported message element]` 发到 QQ ——
+#:   用户截图实证：那条键盘消息在聊天里就是
+#:   「想让香香干嘛……[Unsupported message element]」，按钮也没有。
+#:   继承 `Text` 后：markdown 正文原样渲染、键盘只是一个不可见占位
+#:   ⇒ 即便发送侧补丁没装上，最坏也只是"没有按钮"，**绝不会再出现脏文本**。
+_TEXT_BASE = Text if Text is not None else BaseMessageElement  # type: ignore[misc]
+
+
+def _init_text(element: Any, text: str) -> None:
+    """按核心 `Text` 的形状初始化（拿不到核心时退化成纯属性赋值）。"""
+    try:
+        if Text is not None:
+            Text.__init__(element, text)      # type: ignore[misc]
+    except Exception:
+        pass
+    element.text = text
+
+
+class MarkdownText(_TEXT_BASE):  # type: ignore[misc]
     """一条"要按 markdown 发送"的正文。
 
     它只承载文本；**是否真的走 msg_type=2 由发送侧决定**（见 api_send.py），
-    这样"平台没有 markdown 权限"时可以在最后一刻退回纯文本。
+    这样"平台没有 markdown 权限"时可以在最后一刻退回纯文本
+    （退回纯文本时它仍是一段正常文本，不会变成占位符）。
     """
 
     if ElementType is not None:
@@ -52,14 +84,14 @@ class MarkdownText(BaseMessageElement):  # type: ignore[misc]
         type = None
 
     def __init__(self, text: str):
-        self.text = text
+        _init_text(self, text)
 
     @property
     def repr(self) -> str:
         return f"[Markdown] {self.text}"
 
 
-class KeyboardMarker(BaseMessageElement):  # type: ignore[misc]
+class KeyboardMarker(_TEXT_BASE):  # type: ignore[misc]
     """一条内联键盘（keyboard）载荷，与同一条 `<msg>` 里的文本并列。"""
 
     if ElementType is not None:
@@ -68,11 +100,17 @@ class KeyboardMarker(BaseMessageElement):  # type: ignore[misc]
         type = None
 
     def __init__(self, keyboard: dict):
+        _init_text(self, KB_TEXT_PLACEHOLDER)
         self.keyboard = keyboard
 
     @property
     def repr(self) -> str:
         return "[Keyboard]"
+
+
+def strip_kb_placeholder(text: Any) -> str:
+    """去掉键盘元素留下的零宽占位（发送侧把正文转成 markdown 时用）。"""
+    return str(text or "").replace(KB_TEXT_PLACEHOLDER, "").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -288,4 +326,5 @@ KEYBOARD_TAG_DESCRIPTION = (
     '"action":{"type":2,"data":"/签到","permission":{"type":2}}}]}]}}。'
     "最多 5 行、每行最多 5 个按钮，按钮的 action.data 不超过 100 字符。"
     "必须和 <text> 或 <markdown> 放在同一个 <msg> 里。用户点击后会以消息形式回来。"
+    "★ 可以和图片/语音放在同一条 <msg> 里 —— 系统会自动拆成两条（先媒体、后按钮），两边都正常。"
 )

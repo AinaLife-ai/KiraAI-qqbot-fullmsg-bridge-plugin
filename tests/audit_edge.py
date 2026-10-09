@@ -81,13 +81,25 @@ async def main():
         a2.send_group_message("G1", kb_only),
     )
     calls = [kw for _, kw in a2.client.api.calls]
-    a_call = next((c for c in calls if "A 组内容" in str(
-        (c.get("markdown") or {}).get("content", ""))), None)
-    b_call = next((c for c in calls if "B 组普通文本" in str(c.get("content") or "")), None)
+
+    def _md_of(c):
+        return str((c.get("markdown") or {}).get("content") or "")
+
+    a_call = next((c for c in calls if "A 组内容" in _md_of(c)), None)
+    b_call = next((c for c in calls
+                   if "B 组普通文本" in (str(c.get("content") or "") + _md_of(c))), None)
     check("C2a A 组（只有 markdown）报文正确", a_call is not None)
-    check("C2b B 组（只有键盘）没被 A 组污染成 markdown",
-          b_call is not None and b_call.get("msg_type") != 2, str(b_call)[:120])
-    check("C2c B 组带着自己的键盘", b_call is not None and bool(b_call.get("keyboard")))
+    # ★ 2026-10-10 行为变更（官方原话：仅 markdown 消息支持消息按钮）：
+    #   只有键盘的消息发送时会**自动升格成 markdown**（正文进 markdown.content）。
+    #   本用例的核心意图不变 —— 断言"并发的那条没被污染"：
+    #   B 的正文是 B 自己的、按钮是 B 自己的，且**绝不含 A 的正文**。
+    check("C2b B 组没被 A 组污染（正文是 B 自己的、不含 A 的内容）",
+          b_call is not None and "A 组内容" not in _md_of(b_call)
+          and "B 组普通文本" in _md_of(b_call), str(b_call)[:160])
+    check("C2c B 组带着自己的键盘（按钮 id=b2）",
+          b_call is not None and "b2" in str(b_call.get("keyboard")), str(b_call)[:160])
+    check("C2d B 组因自带键盘升格为 markdown（官方：按钮只支持 markdown 消息）",
+          b_call is not None and b_call.get("msg_type") == 2, str(b_call)[:120])
 
     # ---------------- C3. 脏数据 / 异常 ----------------
     print("\n[C3] 脏数据与异常注入")
