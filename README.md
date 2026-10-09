@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.10
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.11
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -455,6 +455,47 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.11</b> — ★★★ GIF 原生通道对齐：图片上传**带文件名**（与 KiraAI 原生成功路径一字不差）</summary>
+
+### 现象
+
+v1.6.10（僵尸包装修复）之后**语音条已经通了**，但 GIF/WebP 贴纸仍发不出；
+用户实测对照发现：**KiraAI 原生 3.0（不带本插件）发 GIF 成功** —— 说明平台是收 GIF 的。
+
+### 根因（对照实验）
+
+逐字段对照两条路径的上传体，差异只有一处 —— **文件名**：
+
+| 路径 | 元素 | 上传体里的 file_name | 结果 |
+|---|---|---|---|
+| KiraAI 原生（不带本插件） | `Image(image=路径, name="test.gif")`（来自 `<file type="image">`） | **有**（`test.gif`） | ✅ 成功（原生动图） |
+| 本插件贴纸 | `Image(image=base64)`（来自 `<sticker>`） | **没有**（base64 无名字） | ❌ 850019 |
+
+官方「富媒体概述」把 gif/webp/bmp 列为图片支持格式，文件名扩展名是平台识别
+格式的最直接线索；官方 Node SDK 只是"不主动给非 FILE 带名"，并非禁止 ——
+本插件 2026-10-08 的"非 FILE 一律不带名"规则对**语音**是对的
+（语音条修复就靠它），但对**图片**过头了。
+
+### 修复
+
+* `file_type=1`（图片）上传**一律带文件名**：元素自带则沿用；无名字（贴纸的
+  base64）按**字节魔数**补扩展名（`image.gif` / `image.webp` / `image.png` …）；
+* 该规则同步到**三条路**：元素层直传、原图优先探测（`_try_send_original`）、
+  HTTP 安全网（原样发 / 转档后 / 按文件发）；
+* `file_type=3`（语音）**保持不带名**（2026-10-08 的结论不变，语音条已实测通过）；
+  `file_type=4`（文件）保持带名；`file_type=2`（视频）暂不动。
+
+### 测试
+
+* `audit_upload_payload_shape.py`：新增"图片带文件名"三例（GIF 补 `.gif` /
+  PNG 补 `.png` / 自带名字原样沿用），并整篇修订文档说明；
+* `audit_sticker.py`（46 条）/ `audit_media_guard.py`（39 条）：新增文件名断言。
+
+**全套件双世代全绿。**
+
+</details>
+
+<details>
 <summary><b>v1.6.10</b> — ★★★ 根因实锤：「僵尸包装」自 v1.5.0 起从未更新（贴纸/语音媒体问题的总根因）</summary>
 
 ### 0. 一句话

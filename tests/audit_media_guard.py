@@ -239,6 +239,9 @@ async def main():
     check("★★★ 只发了一次且就是**原始 GIF 字节**（没有转档）",
           len(http.calls) == 1 and http.calls[0]["raw"] == gif,
           f"calls={len(http.calls)} head={http.calls[-1]['raw'][:8].hex()}")
+    check("★★ 原样直传**带文件名**（.gif，与原生成功路径一致）",
+          str(http.calls[0]["body"].get("file_name") or "").endswith(".gif"),
+          str(http.calls[0]["body"].get("file_name")))
 
     print("\n[3] 连 APNG 都被拒 ⇒ 原始 GIF 字节改按文件发（保投递）")
     M._RAW_IMG_REJECTED.clear()

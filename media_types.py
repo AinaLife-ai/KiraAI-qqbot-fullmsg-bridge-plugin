@@ -318,6 +318,34 @@ def _animated_format(data: bytes) -> str:
         return ""
 
 
+#: 图片格式 → 上传用文件名的扩展名
+_IMG_EXT = {"gif": ".gif", "webp": ".webp", "png": ".png", "jpeg": ".jpg", "bmp": ".bmp"}
+
+
+def _image_upload_name(data: bytes, name: Any) -> str:
+    """给图片上传挑一个带扩展名的文件名（★★★ 2026-10-10 对齐"原生成功路径"）。
+
+    依据（用户实测对照）：**KiraAI 原生路径（不带本插件）发 GIF 成功** ——
+    它走 `<file type="image">`，元素自带真实文件名（如 `test.gif`），上传体里
+    **必然带 `file_name`**。而本插件的贴纸路径来自 base64、元素没有名字，
+    上传体里**没有 `file_name`** —— 现场 GIF 被拒（850019）、原生路径却成功。
+    ⇒ 与原生路径精确对齐：图片上传一律带一个"体面文件名"：
+      * 元素自带名字且有扩展名 ⇒ 原样用；
+      * 否则按**字节魔数**补扩展名（sticker 的 base64 走这里）。
+    """
+    n = ""
+    try:
+        if name:
+            n = os.path.basename(str(name).split("?")[0])
+    except Exception:
+        n = ""
+    if n and os.path.splitext(n)[1]:
+        return n
+    stem = os.path.splitext(n)[0] if n else "image"
+    fmt = sniff_image_format(data)
+    return stem + _IMG_EXT.get(fmt, ".png")
+
+
 def is_format_error(exc: BaseException) -> bool:
     text = str(exc)
     if any(code in text for code in _FORMAT_ERROR_CODES):
@@ -472,6 +500,8 @@ async def _try_send_original(api: Any, target_id: str, is_group: bool,
         "file_type": FT_IMAGE,
         "file_data": _b.b64encode(data).decode("ascii"),
         "srv_send_msg": False,
+        # ★ 与原生路径一致：图片带文件名（无名字时按魔数补扩展名）
+        "file_name": _image_upload_name(data, elem_name),
     }
     if is_group:
         payload["group_openid"] = target_id
@@ -827,12 +857,19 @@ async def _guard_upload(route, args, body, kwargs, orig, logger, plugin):
             # ★ 原图优先（2026-10-09：平台图片格式已支持 gif/webp）：
             #   先**原样发一次**（保动画）；被格式拒再转档（APNG/PNG）；
             #   再被拒按文件发。被拒过的图 10 分钟内跳过此步（与元素层共用记忆）。
+            #   ★★ 2026-10-10：与"原生成功路径"对齐 —— 原样发时**带文件名**
+            #   （无名字按魔数补扩展名；原生路径的图片上传永远带 file_name）。
             if fmt in ("gif", "webp") and not _probe_recently_rejected(data):
+                body_raw = dict(body)
+                if not body_raw.get("file_name"):
+                    body_raw["file_name"] = _image_upload_name(data, "")
+                kwargs_raw = dict(kwargs)
+                kwargs_raw["json"] = body_raw
                 try:
-                    result = await orig(route, *args, **kwargs)
+                    result = await orig(route, *args, **kwargs_raw)
                     _probe_mark(data, False)
                     _once("img_raw_ok", "info",
-                          "媒体安全网：%s 原样直传成功（平台现在收这种格式）—— 保动画", fmt)
+                          "媒体安全网：%s 原样直传成功（带文件名，与原生路径一致）—— 保动画", fmt)
                     return result
                 except Exception as exc:
                     if not is_format_error(exc):
@@ -852,6 +889,8 @@ async def _guard_upload(route, args, body, kwargs, orig, logger, plugin):
 
                 body2 = dict(body)
                 body2["file_data"] = _b.b64encode(new_data).decode("ascii")
+                if not body2.get("file_name"):
+                    body2["file_name"] = _image_upload_name(new_data, "")
                 kwargs2 = dict(kwargs)
                 kwargs2["json"] = body2
                 try:
@@ -868,7 +907,7 @@ async def _guard_upload(route, args, body, kwargs, orig, logger, plugin):
                     fb["file_type"] = FT_FILE
                     fb["file_data"] = body.get("file_data")
                     if not fb.get("file_name"):
-                        fb["file_name"] = "sticker." + (fmt or "bin")
+                        fb["file_name"] = _image_upload_name(data, "") or "sticker.bin"
                     _once("img_fb", "warning",
                           "媒体安全网：图片规范化后仍被平台拒收（%s）——"
                           "已用**原始动图**改按文件发送（动图下载后仍是动的）",
@@ -1193,34 +1232,34 @@ def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) ->
                         if logger is not None:
                             logger.info(
                                 "[QQBOT-BRIDGE] 该图片超过平台图片软限制（20MB）⇒ 直接按文件发送")
+        # ★★★ 图片补一个"体面文件名"（2026-10-10 对齐原生成功路径）：
+        #   KiraAI 原生（不带本插件）发 GIF 成功 —— 它走 `<file type="image">`，
+        #   上传体**必然带 file_name（test.gif）**；本插件贴纸来自 base64、
+        #   没有名字、上传体里没有 file_name → 现场 GIF 被拒（850019）。
+        if file_type == FT_IMAGE:
+            _up_name = _image_upload_name(data, _up_name)
         _ = _img_mode
         payload: dict = {
             "file_type": file_type,
             "file_data": base64.b64encode(data).decode("ascii"),
             "srv_send_msg": False,
         }
-        # ★★★ `file_name` **只对 file_type=4（文件）发** —— 2026-10-08 定案。
+        # ★★★ `file_name` 的发放规则（2026-10-10 修订版）：
         #
-        #   三家官方/官方推荐实现完全一致（都不给语音带文件名）：
-        #
-        #   ① 腾讯官方 Node SDK（`@tencent-connect/qqbot-nodejs`）
-        #      `src/protocol/api/media.ts`：
-        #          if (fileType === MediaFileType.FILE && opts.fileName) {
-        #              body.file_name = this.sanitize(opts.fileName);
-        #          }
-        #      其 `USAGE.md` 也写明：`fileName: ... // 仅 FILE 类型有效`。
-        #   ② 官方 openclaw-qqbot 走同一个 SDK（上传体里语音没有 file_name）。
-        #   ③ QQ 官方推荐的 Hermes（`gateway/platforms/qqbot/adapter.py`）：
-        #          body = {"file_type": file_type, "srv_send_msg": srv_send_msg}
-        #          ...
-        #          if file_type == MEDIA_TYPE_FILE and file_name:
-        #              body["file_name"] = file_name
-        #
-        #   ⇒ 我们原来给**语音**也带文件名（`jbf_v2.silk`），而用户看到的正是
-        #     **文件卡片 + 那个文件名**。给语音带名字属于超出文档约定的用法，
-        #     按官方口径对齐：非 FILE 一律不带。（图片/视频同理，一并去掉。）
+        #   * `file_type=4`（文件）⇒ 必带（官方文档/三家实现一致，用于显示文件名）；
+        #   * `file_type=3`（语音）⇒ **绝不带**（2026-10-08 定位到的"语音变文件卡片"
+        #     根因就是它；去名后语音条才正常）；
+        #   * `file_type=1`（图片）⇒ **带**（2026-10-10 修订）：
+        #     - 依据一（实锤对照）：KiraAI 原生路径上传图片永远带真实文件名
+        #       （`<file type="image">test.gif` ⇒ `file_name=test.gif`），
+        #       且现场**发 GIF 成功**；本插件贴纸（无文件名）GIF 被拒；
+        #     - 依据二（官方文档口径）：富媒体概述把 gif/webp/bmp 列为图片
+        #       支持格式，文件名扩展名是平台识别格式的最直接线索；
+        #     - 依据三：官方 Node SDK 只是"不主动给非 FILE 带名"（缺少此字段
+        #       时的保守行为），并没有"禁止"——原生路径与官方文档都不冲突。
+        #   * `file_type=2`（视频）⇒ 保持不带（无实证需求，先不动）。
         name = _up_name
-        if file_type == FT_FILE and name:
+        if file_type in (FT_FILE, FT_IMAGE) and name:
             payload["file_name"] = os.path.basename(name.split("?")[0])
         # 一次性诊断：把"我们到底发了什么形状的体"写进日志（不含 file_data）
         _log_upload_shape_once(file_type, payload, logger)
