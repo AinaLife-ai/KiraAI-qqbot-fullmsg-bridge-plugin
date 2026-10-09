@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.16
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.17
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -128,6 +128,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `keyboard_enabled` | 开 | 注册 `<keyboard>` 标签，让模型能在消息下挂内联按钮 |
 | `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
 | `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
+| `typing_max_frames` | 2 | **每条入站消息最多花几帧「输入中」**。官方：同一个入站消息最多 4 次被动回复，`msg_type=6` 也算一次 ⇒ 默认 2 帧（+ 1 条回复 = 3，留余量），填 1 更保守，最多 3 |
 | `c2c_stream_enabled` | 开 | **私聊流式消息**（官方 `stream_messages`）：把模型**正在生成的文字**实时写到那条消息上（约 0.5s 就能看到字，来源是提速器的 token 流）。**一条消息就是一条**：多段回复仍然是多条，绝不合并；没有预览就不接管（报文与从前完全一致）。只对单聊纯文本生效，失败一律回退普通发送 |
 | `sticker_tags` | **sticker** | **表情包标签关键词**（逗号分隔）：填进来的词会被补进适配器声明的类型清单（框架里的表情包插件正是看到这个词才注册自己的标签），且这些词对应的元素发送时按**图片**发出（`file_type=1`）。内置表情包用 `sticker`；第三方「增强表情包」是 `<sticker_plus>` 标签，填 `sticker` 即可覆盖。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效 |
 | `gif_sticker_mode` | **auto** | **GIF/动图怎么发**：`auto` = 动图（GIF/WebP）**先原样直传**（平台图片格式现已支持 gif/webp，直传才保动画）→ 被平台拒则转 **APNG** → 静态 PNG → 最后自动按文件发（原图/动图都在，点开可看），被拒过的图 10 分钟内不再试原图；`image` = 跳过原图、直接转档（稳定优先）；`file` = GIF **原样按文件发**（保动图，要点开下载）。**png/jpg 三种模式下都一个字节都不动**；超过图片软限制(20MB)直接按文件发 |
@@ -456,6 +457,42 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.17</b> — ★★★ 内联键盘修好（自动升格 markdown、不再出现脏占位）+ 私聊「输入中」可诊断 / 额度保护</summary>
+
+### 一、内联键盘：QQ 里只见文字 + [Unsupported message element]、按钮不出现（已修）
+
+两个**独立**问题（用户实测截图 + 官方文档定位）：
+
+1. **脏文本**：核心 `_text_content()` 只按 `isinstance(element, Text)` 渲染，
+   我们的 markdown / 键盘元素落进 `else` 分支 ⇒ 拼出字面量
+   `[Unsupported message element]` 发到 QQ。
+   ⇒ 修：两个元素**继承核心 `Text`**（键盘渲染成**零宽空格**：不可见，
+   又能让"只有键盘"的消息通过核心的「不能发空消息」检查）。
+   即便发送侧补丁没装上，最坏也只是"没有按钮"，**不会再出现脏文本**。
+2. **按钮不渲染**：官方（Node/Python SDK「发送带有按钮的消息」）原话 ——
+   **仅 markdown 消息支持消息按钮**。纯文本 + keyboard ⇒ 平台不渲染按钮。
+   ⇒ 修：发送侧发现"有键盘但本条不是 markdown"时**自动升格成 markdown**
+   （`msg_type=2`、`content` 置空、正文进 `markdown.content`），群聊/单聊都生效；
+   富媒体（msg_type=7）+ 键盘保持原样并发一条 WARNING（官方只支持 markdown 带按钮）。
+
+### 二、私聊「输入中」：机制验证可用 + 可诊断 + 额度保护
+
+* 用**真实 3.0 适配器/能力对象**跑通：`_direct_reply_ids` 在**能力对象**上时也能取到，
+  `msg_type=6` + `input_notify{input_type:1, input_second:60}` 正确发出，
+  `msg_seq` 接进框架计数器并**写回**（不会与真实回复撞重复）。
+* **为什么没发，日志会告诉你**：新增门禁诊断（每种原因各一条 INFO）——
+  `disabled / not_c2c / no_adapter / no_client / no_msg_id / debounced / frame_cap`；
+  启动日志也标出「私聊输入中=开(上限2帧/条)」。
+* **额度保护（新配置）**：`typing_max_frames`（默认 2）。官方「同一个入站消息最多 4 次
+  被动回复」，`msg_type=6` 也算一次 ⇒ 默认最多花 2 帧，把额度留给真实回复。
+
+**测试**：新增 `audit_keyboard_flow.py` **30 条**（两代真实核心 `_text_content` 不再吐占位、
+发送层 6 个场景）；`audit_typing_indicator.py` 扩到 **30 条**（能力对象形状、帧上限、
+门禁诊断、seq 写回）。全套件全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.16</b> — ★★ 语音条超长自动剪裁（默认开）：超过 5 分钟自动剪到 5 分钟，不再退回文件卡片</summary>
 
 ### 背景（用户实测）

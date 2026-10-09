@@ -359,6 +359,15 @@ class QQOfficialGroupBridge(BasePlugin):
         self.interaction_enabled = bool(basic.get("interaction_enabled", True))
         #: 私聊「输入中…」状态（官方能力，核心没有；见 _maybe_send_typing）
         self.typing_enabled = bool(basic.get("typing_enabled", True))
+        #: ★ 每条入站消息最多为它花几帧「输入中」（默认 2）。
+        #:   msg_type=6 与真实回复共用「同一 msg_id 最多 4 次被动回复」的额度，
+        #:   默认 2 帧 + 1 条回复 = 3，留 1 个余量（长回复/多段回复要用）。
+        try:
+            self.typing_max_frames = int(basic.get("typing_max_frames", 2) or 2)
+        except Exception:
+            self.typing_max_frames = 2
+        if not (1 <= self.typing_max_frames <= 3):
+            self.typing_max_frames = 2
         #: 私聊流式消息（官方 stream_messages；见 c2c_stream.py）
         self.c2c_stream_enabled = bool(basic.get("c2c_stream_enabled", True))
         #: 表情包标签关键词（逗号分隔；默认 sticker —— 它同时覆盖内置表情包插件
@@ -459,6 +468,13 @@ class QQOfficialGroupBridge(BasePlugin):
         self._reconnect_tasks: list = []
         #: 私聊「输入中」状态：target -> 上次发送时间（防抖，见 _maybe_send_typing）
         self._typing_sent_at: dict = {}
+        #: ★ 配额度保护：(target, 入站 msg_id) -> 已用帧数。
+        #:   msg_type=6 走的是**发消息接口**，与真实回复共用
+        #:   「同一个入站消息最多 4 次被动回复」的额度（官方文档），
+        #:   所以每条消息最多花 typing_max_frames 帧，保证回复永远有额度。
+        self._typing_frames: dict = {}
+        #: 「为什么没发」的诊断只打一次（每种原因一条）
+        self._typing_skip_done: set = set()
         self._typing_tasks: list = []
         self._typing_logged = False
         self._typing_seq = 1000
@@ -2267,6 +2283,32 @@ class QQOfficialGroupBridge(BasePlugin):
             client = None
         self.llm_stream.begin_turn(request, adapter, target, msg_id, client)
 
+    def _typing_skip(self, reason: str, fmt: str = "", *args) -> None:
+        """「输入中状态**为什么没发**」—— 每种原因只打一条 INFO（排查用）。
+
+        ★ 为什么要有它（2026-10-09/10 的教训两次都是同一类）：
+          静默 return False 让用户（和排查的人）**查无可查**：
+          「我明明开了输入中，怎么没反应」。现在每种原因写一次，
+          下一条日志就能定位到底卡在哪一道门。
+
+        原因一览：
+          disabled（配置关）/ not_c2c（不是单聊）/ no_adapter / no_client（没连上）/
+          no_msg_id（没有入站 msg_id）/ debounced（50 秒防抖）/
+          frame_cap（这条消息的输入中帧数已达上限）
+        """
+        key = "typing_skip_" + str(reason)
+        if key in self._typing_skip_done:
+            return
+        try:
+            self._typing_skip_done.add(key)
+        except Exception:
+            pass
+        try:
+            logger.info("[QQBOT-BRIDGE] 输入中状态（msg_type=6）**本次未发送**：%s%s",
+                        (fmt % args) if (fmt and args) else fmt, "")
+        except Exception:
+            pass
+
     def _maybe_send_typing(self, event) -> bool:
         """模型开始思考时，给**私聊**会话发一个「输入中」状态。返回是否已排队。
 
@@ -2291,25 +2333,47 @@ class QQOfficialGroupBridge(BasePlugin):
         用同一个会话 50 秒防抖，避免多步 agent 循环每个 step 都发一次。
         """
         if not self.typing_enabled or not self.enabled:
+            self._typing_skip("disabled", "配置 typing_enabled=关")
             return False
         try:
             target = self._c2c_target_of(event)
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
             if not target or not adapter_name:
-                return False
-            now = time.time()
-            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
+                self._typing_skip("not_c2c",
+                                  "不是单聊会话（官方 msg_type=6 只支持单聊）")
                 return False
             adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
             if adapter is None:
+                self._typing_skip("no_adapter", "适配器 %s 还没就绪", adapter_name)
                 return False
             client = adapter.get_client()
             if client is None:
+                self._typing_skip("no_client", "适配器 %s 还没连上（client 为空）", adapter_name)
                 return False
             reply_ids = self._adapter_attr(adapter, "_direct_reply_ids") or {}
             msg_id = str(reply_ids.get(target) or "")
             if not msg_id:
+                self._typing_skip("no_msg_id",
+                                  "还没有入站 msg_id（被动回复窗口未就绪）——"
+                                  "输入中状态必须挂在一条收到的消息上")
                 return False                      # 没有新鲜的入站 msg_id ⇒ 发了也没用
+            now = time.time()
+            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
+                self._typing_skip("debounced", "同一会话距上次发送不足 %.0f 秒（防抖）",
+                                  self._TYPING_DEBOUNCE)
+                return False
+            # ★ 额度保护（见 `typing_max_frames` 的注释）：同一条入站消息最多花 N 帧
+            frame_key = (target, msg_id)
+            used = int(self._typing_frames.get(frame_key, 0))
+            if used >= self.typing_max_frames:
+                self._typing_skip(
+                    "frame_cap",
+                    "本条入站消息的输入中帧数已达上限 %d（保护被动回复额度："
+                    "同一 msg_id 最多 4 次，留给真实回复）", self.typing_max_frames)
+                return False
+            if len(self._typing_frames) > 64:     # 有界，防长会话里无限增长
+                self._typing_frames.clear()
+            self._typing_frames[frame_key] = used + 1
             self._typing_sent_at[target] = now    # 先占位（并发时不会重复排）
             task = asyncio.ensure_future(
                 self._send_typing(adapter, client, target, msg_id)
