@@ -306,6 +306,68 @@ async def main():
     finally:
         _lg.removeHandler(_cap)
 
+    print("\n[13] ★★ 单聊判据：多来源兜底（事件形状一变也不能失效）+ 现场诊断")
+    from types import SimpleNamespace as _SN
+
+    _F = bridge_main.QQOfficialGroupBridge._c2c_target_of
+
+    def _ev(message=None, session_id=None, adapter_name="qqo"):
+        ev = _SN(adapter=_SN(name=adapter_name))
+        if message is not None:
+            ev.message = message
+        if session_id is not None:
+            ev.session = _SN(session_id=session_id)
+        return ev
+
+    # ① 原生形状
+    check("① message.group=None + sender.user_id ⇒ 取到 openid",
+          _F(_ev(_SN(group=None, sender=_SN(user_id="OPENID-A")))) == "OPENID-A")
+    # ② sender 只有 pid（核心换过字段名/事件被重建）
+    check("② sender 只有 pid ⇒ 也取得到（兜底字段）",
+          _F(_ev(_SN(group=None, sender=_SN(pid="OPENID-B")))) == "OPENID-B")
+    # ③ 没有 message，只能靠会话 id（qq:dm:<openid>）
+    check("③ 只有 event.session.session_id=qq:dm:<id> ⇒ 从 sid 里取",
+          _F(_ev(None, session_id="qq:dm:OPENID-C")) == "OPENID-C")
+    # ④ 其它 dm 标记写法
+    check("④ qqo:c2c:<id>:<msgid> ⇒ 取第 3 段",
+          _F(_ev(_SN(group=None, sender=_SN()), "qqo:c2c:OPENID-D:MSG1")) == "OPENID-D")
+    # ⑤ ★ 群聊绝不能被误判成单聊（sid 带 gm 标记但 message.group 缺失）
+    check("⑤ 群聊（sid=qq:gm:...）⇒ 仍返回空串（不误判）",
+          _F(_ev(_SN(group=None, sender=_SN(user_id="G1")), "qq:gm:G1")) == "")
+    # ⑥ 群里正常形状 ⇒ 空串
+    check("⑥ message.group.group_id 非空 ⇒ 空串",
+          _F(_ev(_SN(group=_SN(group_id="G1"), sender=_SN(user_id="M1")))) == "")
+
+    # ⑦ 拿不到时写一条**带现场**的诊断（且只写一次）
+    class _Cap2(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.msgs = []
+
+        def emit(self, record):
+            try:
+                self.msgs.append(record.getMessage())
+            except Exception:
+                pass
+
+    _cap2 = _Cap2()
+    bridge_main.QQOfficialGroupBridge._c2c_shape_dumped = False
+    bridge_main.logger.addHandler(_cap2)
+    bridge_main.logger.setLevel(_logging.INFO)
+    try:
+        _p14 = bridge_main.QQOfficialGroupBridge(
+            SimpleNamespace(adapter_mgr=SimpleNamespace(
+                get_adapter=lambda n: Adapter(Client(), {}))),
+            {"section_basic": {"enabled": True, "typing_enabled": True}})
+        _weird = _ev(_SN(group=None, sender=_SN()), session_id="something-else")
+        _p14._maybe_send_typing(_weird)
+        _p14._maybe_send_typing(_weird)
+        _diag = [m for m in _cap2.msgs if "【输入中】诊断" in m]
+        check("★★ 拿不到目标 ⇒ 打一条现场诊断（session_id/字段都在里面）",
+              len(_diag) == 1 and "something-else" in _diag[0], str(_cap2.msgs[-2:]))
+    finally:
+        bridge_main.logger.removeHandler(_cap2)
+
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
