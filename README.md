@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.13
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.14
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -456,6 +456,33 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.14</b> — ★ 兼容 v3.0.0-alpha.3（A3）：全链路复核通过 + sticker_mgr 新属性名优先适配</summary>
+
+### 背景
+
+KiraAI 3.0 进入 **v3.0.0-alpha.3（A3）**：核心把消息管线拆到了
+`core/workflow/src/im/`（`MessageDeliveryService`），并给部分属性改名
+（如 `ctx.sticker_manager` → `ctx.sticker_mgr`）。
+
+### 复核结论（逐项验证）
+
+* **QQ 适配器 / 能力对象 / 消息元素 / 标签 / 表情包注册条件**：A3 全部未变 ✅
+* **发送链**：`capability.send_direct_message` / `send_group_message` 仍是唯一出口
+  （`message_delivery.py`）—— 本插件的全部补丁点（发送包装 / 媒体上传 / HTTP 安全网）
+  原位居中 ✅
+* **兼容委托**：`MessageProcessor.send_message_chain / send_xml_messages /
+  _parse_xml_msg` 与 `ctx.sticker_manager` 旧名别名都保留（核心明确照顾插件生态）✅
+* **全套件双世代（2.x + 3.0）在 A3 代码上全绿（ALL TEST SUITES PASSED）** ✅
+
+### 本版小改
+
+* `ctx.sticker_mgr`（A3 新名）**优先使用**，旧名 `sticker_manager` 兼容回落 ——
+  将来核心移除旧别名也不会失联；
+* 文档同步（sticker_support 注释更新为 A3 写法）。
+
+</details>
+
+<details>
 <summary><b>v1.6.13</b> — ★★★ 真相：平台收 GIF、不收 WebP —— 动图新增「WebP→动画 GIF」通道</summary>
 
 ### 真相（用户日志实锤）

@@ -243,6 +243,23 @@ async def main():
     installed = p2._ensure_sticker_support(ad, "qqo2")
     check("★ 没有表情包 ⇒ 不安装（返回 False）", installed is False, str(installed))
 
+    print("\n[5g] ★★ v3.0.0-alpha.3 属性名适配：sticker_mgr（新）/ sticker_manager（旧）都认")
+    class _CtxNewName:
+        sticker_mgr = _StickerMgr(2)
+
+    p5 = bridge_main.QQOfficialGroupBridge(
+        _CtxNewName(), {"section_basic": {"enabled": True}})
+    check("★ 新名 ctx.sticker_mgr 被识别（数量=2）",
+          p5._sticker_count() == 2, str(p5._sticker_count()))
+
+    class _CtxOldName:
+        sticker_manager = _StickerMgr(3)
+
+    p6 = bridge_main.QQOfficialGroupBridge(
+        _CtxOldName(), {"section_basic": {"enabled": True}})
+    check("★ 旧名 ctx.sticker_manager（A3 兼容别名）同样识别（数量=3）",
+          p6._sticker_count() == 3, str(p6._sticker_count()))
+
     print("\n[5b] ★★ 关键词可配：sticker_tags 里的每个词都会被声明（第三方用得上）")
     p3 = bridge_main.QQOfficialGroupBridge(
         type("Ctx3", (), {"adapter_mgr": _Mgr(), "sticker_manager": _StickerMgr(1)})(),
