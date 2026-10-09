@@ -203,7 +203,7 @@ async def main():
                     self.prepare_names.append(name)
                     if name.endswith(".gif"):
                         raise RuntimeError(
-                            "400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                            "富媒体文件格式不支持")
                     return {"upload_id": "UP1", "parts": self.parts}
                 if "/files" in path:
                     return {"file_info": "FI",

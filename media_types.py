@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -276,6 +277,16 @@ def normalize_image_data(data: bytes, name: str = "", logger_: Any = None, *,
 #: 平台"文件格式不支持"类错误（图片被拒时可据此改成按文件发）
 _FORMAT_ERROR_CODES = ("850019", "850031")
 
+#: 格式类错误的**文字特征**（★★★ 2026-10-09 实锤的坑）：
+#: qq-botpy 抛出的 `ServerError` 里**只有 message（"富媒体文件格式不支持"），
+#: 没有错误码**（码只出现在 botpy 自己的日志行里）⇒ 只按码匹配的话，
+#: `is_format_error` 对真实现场**永远返回 False**：
+#:   * md 候选链不降级（原图被拒 ⇒ 直接放弃，而不是换 APNG/PNG）；
+#:   * 安全网的"原图被拒 ⇒ 转档"分支进不去；
+#:   * 重试逻辑把格式拒收当网络故障反复重试。
+#: 所以文字特征必须一起匹配。
+_FORMAT_ERROR_TEXT = ("格式不支持", "format not support", "unsupported format")
+
 #: 动图转 APNG 前的体量预判上限（帧数 × 单帧像素）：
 #: 超过就不试 APNG 了（试也大概率超体积上限，还白等几十秒）。
 #: 3000 万 ≈ 60 帧 720×720 / 120 帧 500×500。
@@ -309,7 +320,10 @@ def _animated_format(data: bytes) -> str:
 
 def is_format_error(exc: BaseException) -> bool:
     text = str(exc)
-    return any(code in text for code in _FORMAT_ERROR_CODES)
+    if any(code in text for code in _FORMAT_ERROR_CODES):
+        return True
+    low = text.lower()
+    return any(marker in text or marker in low for marker in _FORMAT_ERROR_TEXT)
 
 
 #: 只提示一次：模型把音频用 `<file>`（而非 `<file type="record">`）发出来
@@ -616,6 +630,16 @@ async def _retry_as_silk(api, target_id, media_element, is_group, exc, logger_):
 #: 安全网提示只打一次的键
 _HTTP_GUARD_LOGGED: set = set()
 
+#: ★ 发送路径与安全网之间的「这条消息含语音条（<record>）」信号（2026-10-09）。
+#:
+#: 用途：线上出现过"媒体包装没装上"的最坏情况 —— 此时 `<record>` 语音会被
+#: 核心按 file_type=4 发成文件卡片，而安全网单看请求体**分不清**"用户故意发文件"
+#: 和"本该是语音条"。发送路径（换壳处，实测一定会跑到）在调用前把这个
+#: contextvar 置 True，安全网看到「file_type=4 + 音频内容 + 本信号」就知道
+#: 这条本该是语音条 ⇒ 就地转 silk 并按 file_type=3 重发（救援）。
+#: asyncio 任务内 contextvar 自动隔离，跨会话并发互不影响。
+PENDING_RECORD = contextvars.ContextVar("qqbot_bridge_pending_record", default=False)
+
 #: silk 魔数（与 audio_silk.SILK_MAGIC 同一事实；本模块内自用一份，避免循环依赖）
 _SILK_MAGIC = b"#!SILK_V3"
 
@@ -658,6 +682,20 @@ def _is_silk_bytes(data: bytes) -> bool:
 
 #: 「媒体层安装失败」提示去重（每个原因打一次 WARNING）
 _INSTALL_FAIL_LOGGED: set = set()
+
+#: ★★★ 媒体包装的「世代戳」——每次插件升级都应修改它。
+#: 用途（2026-10-09 实锤）：旧版本装上的包装没有世代信息，而 install() 原来
+#: 看到 `_kira_bridge_ftype` 标记就当作"已安装"⇒ **每次更新都被短路**，
+#: 包装永远停在旧代码（没有日志、行为过时）——即"僵尸包装"。
+#: 有了世代戳，install() 就能识别"标记在、但世代不符"并自动接管换新。
+_WRAPPER_BUILD = "1.6.10"
+
+
+def installed_current(holder: Any) -> bool:
+    """这个 holder 上的媒体包装是不是**本世代**的？（给自愈层做快速检查用）"""
+    cur = getattr(holder, "_upload_file", None)
+    return bool(getattr(cur, "_kira_bridge_ftype", False)
+                and getattr(cur, "_kira_bridge_build", "") == _WRAPPER_BUILD)
 
 
 def _install_fail(reason: str, logger: Any) -> None:
@@ -879,18 +917,66 @@ async def _guard_upload(route, args, body, kwargs, orig, logger, plugin):
                 _once("voice_exc", "warning",
                       "媒体安全网：音频转 silk 出错（%s）—— 原样发送", str(exc)[:120])
 
-    # ---- 诊断：音频被以「文件」通道上传（多半是 file_type 修正没生效）----
+    # ---- 语音救援：核心把它当「文件」发了，但发送路径标了"这条含 <record>" ----
     if file_type == FT_FILE and data:
         global _HTTP_AUDIO_FILE_HINTED
         fmt = _sniff_audio_format(data)
+        if fmt and PENDING_RECORD.get(False):
+            try:
+                if fmt.startswith("silk"):
+                    body2 = dict(body)
+                    body2["file_type"] = FT_RECORD
+                    body2.pop("file_name", None)
+                    kwargs2 = dict(kwargs)
+                    kwargs2["json"] = body2
+                    result = await orig(route, *args, **kwargs2)
+                    _once("voice_rescue_silk", "info",
+                          "媒体安全网：本条是 <record> 语音（内容已是 silk）却走了文件通道 ——"
+                          "已改按语音条发送（file_type=3）")
+                    return result
+                from audio_silk import convert_to_silk_forced
+                import tempfile
+                import os as _os
+
+                def _write_tmp2() -> str:
+                    fd, p = tempfile.mkstemp(prefix="qqbot_guard_", suffix=".bin")
+                    with _os.fdopen(fd, "wb") as f:
+                        f.write(data)
+                    return p
+
+                tmp2 = await asyncio.to_thread(_write_tmp2)
+                silk2 = await convert_to_silk_forced(tmp2, logger_=logger)
+                if silk2:
+                    with open(silk2, "rb") as f:
+                        silk_data2 = await asyncio.to_thread(f.read)
+                    import base64 as _b2
+
+                    body2 = dict(body)
+                    body2["file_type"] = FT_RECORD
+                    body2["file_data"] = _b2.b64encode(silk_data2).decode("ascii")
+                    body2.pop("file_name", None)
+                    kwargs2 = dict(kwargs)
+                    kwargs2["json"] = body2
+                    result = await orig(route, *args, **kwargs2)
+                    _once("voice_rescue", "info",
+                          "媒体安全网：本条 <record> 语音走了文件通道（file_type=4，%s）——"
+                          "已就地转 silk 并按语音条发送（file_type=3）；"
+                          "若经常看到本行，请把启动日志里「媒体层」相关行一起反馈", fmt)
+                    return result
+                _once("voice_rescue_fail", "warning",
+                      "媒体安全网：<record> 语音走了文件通道、且转 silk 失败（缺编码器/ffmpeg？）——"
+                      "本条只能按文件发。修复：pip install silk-python imageio-ffmpeg")
+            except Exception as exc:
+                _once("voice_rescue_exc", "warning",
+                      "媒体安全网：语音救援出错（%s）—— 原样发送", str(exc)[:120])
         if fmt and not _HTTP_AUDIO_FILE_HINTED:
             _HTTP_AUDIO_FILE_HINTED = True
             if logger is not None:
                 logger.info(
                     "[QQBOT-BRIDGE] 提示：有一条**音频**在按「文件」通道上传（file_type=4，%s）——"
-                    "如果这条本该是语音条，说明媒体的 file_type 修正这次没生效；"
-                    "请把本条前后的日志一起反馈（安全网不会把文件通道的音频改成语音，"
-                    "因为分辨不出「用户故意要发文件」的情况）",
+                    "本次没有触发「语音救援」（没有收到 <record> 信号，或救援转码失败）。"
+                    "如果这条本该是语音条，请把本条前后的日志一起反馈 ——"
+                    "没有信号时安全网不会把文件通道的音频改成语音（分辨不出「故意要发文件」的情况）",
                     fmt,
                 )
     return await orig(route, *args, **kwargs)
@@ -906,6 +992,15 @@ def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) ->
     ★ 2026-10-09：**每一条失败路径都要响亮**（原来全部静默 return False ——
       线上"媒体层像没装上"时日志里一点线索都没有）。失败原因按 key 去重，
       每个原因只打一次 WARNING。
+
+    ★★★ 2026-10-09 当日晚间实锤的**「僵尸包装」**（一整天排查的最终根因）：
+      旧版本（v1.5.0 起）装上的包装**没有世代标记**，而这里原来看到
+      `_kira_bridge_ftype` 标记就 return True（"已安装"）——
+      ⇒ 从此**每一次更新都被短路**，那层永远停在旧代码：
+        没有逐条日志、不认识后来的换壳标记、GIF 原样传（850019）、
+        语音永远按 file_type=4 发（文件卡片）。
+      修法：给包装盖**世代戳**（`_WRAPPER_BUILD`）；标记存在但世代不符 ⇒
+      剥到它最初的核函数、**重新包一层新的**（自动"接管"，留一条 INFO）。
     """
     if holder is None or client is None:
         _install_fail(f"holder/client 为空（holder={holder!r}）", logger)
@@ -917,8 +1012,25 @@ def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) ->
             f"能力对象可能没解析到（3.0 在能力对象上、2.x 在适配器实例上）",
             logger)
         return False
+    _stale = False
     if getattr(current, "_kira_bridge_ftype", False):
-        return True
+        _old_build = getattr(current, "_kira_bridge_build", "")
+        if _old_build == _WRAPPER_BUILD:
+            return True
+        # —— 僵尸包装：剥到核函数，重包新版 ——
+        _stale = True
+        _base = getattr(current, "_kira_bridge_orig", None)
+        if callable(_base):
+            current = _base
+        if logger is not None:
+            logger.info(
+                "[QQBOT-BRIDGE] ★ 检测到**旧版本留下的媒体包装**（世代=%s，本版=%s）——"
+                "它从装上那天起就再没被更新过（旧 install 的「已安装」短路缺陷），"
+                "现场表现就是：GIF 直传被拒 / 语音按文件发 / 一条媒体日志都没有。"
+                "已自动剥壳并用本版重新包装",
+                _old_build or "无（v1.6.9 之前）",
+                _WRAPPER_BUILD,
+            )
 
     api = getattr(client, "api", None)
     if api is None:
@@ -1193,6 +1305,7 @@ def install(holder: Any, client: Any, logger: Any = None, plugin: Any = None) ->
 
 
     setattr(_upload_file, "_kira_bridge_ftype", True)
+    setattr(_upload_file, "_kira_bridge_build", _WRAPPER_BUILD)
     setattr(_upload_file, "_kira_bridge_orig", current)
     try:
         holder._upload_file = _upload_file

@@ -362,7 +362,7 @@ async def main():
                     if raw[:6] in (b"GIF87a", b"GIF89a"):
                         self.n_gif += 1
                         raise RuntimeError(
-                            "400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                            "富媒体文件格式不支持")
                 return await super().request(route, **kw)
 
         rej_gif = RejectGifHTTP()
@@ -402,7 +402,7 @@ async def main():
                 if body.get("file_type") == 1:
                     self.n_img += 1
                     self.attempts.append(body)     # 记下这次尝试再拒
-                    raise RuntimeError("400, {'code': 850019, 'message': '富媒体文件格式不支持'}")
+                    raise RuntimeError("富媒体文件格式不支持")
                 return await super().request(route, **kw)
 
         rej = RejectHTTP()
