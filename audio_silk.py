@@ -49,7 +49,9 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["convert_to_silk_forced", "is_silk_path", "silk_magic_ok", "reset_encoder_cache", "reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache"]
+__all__ = ["convert_to_silk_forced", "is_silk_path", "silk_magic_ok", "reset_encoder_cache",
+           "reset_ffmpeg_cache", "to_silk_if_needed", "silk_available", "clear_cache",
+           "configure_trim", "voice_limit", "probe_duration_sync"]
 
 #: silk 文件以这个魔数开头（`#!SILK_V3`）
 SILK_MAGIC = b"#!SILK_V3"
@@ -66,6 +68,113 @@ _CACHE_MAX = 32
 
 #: 单个音频的上限（官方语音软限制 20MB；给源文件留些余量）
 _MAX_SOURCE_BYTES = 60 * 1024 * 1024
+
+# --------------------------------------------------------------------------- #
+# ★★★ 语音条时长上限（2026-10-10 用户情报 + 平台实测）
+# --------------------------------------------------------------------------- #
+#
+# 用户实测：**QQ 官方 bot 的语音条最大 5 分钟（300 秒）—— 5:00 整可以，
+# 多 1 秒都失败**，失败后退回文件卡片（至少还能收到，不算丢）。
+#
+# ⇒ 本模块在**转 silk 的同一个 ffmpeg 调用**里加 `-t <上限>`：
+#   * 不超长的音频：`-t` 是个 no-op（零成本、零额外进程）；
+#   * 超长的音频：ffmpeg 只解码前 N 秒（比解完再切还快），产物天然 ≤ 上限；
+#   * 已经在是 silk 的源：先解码量长度（实测 10 秒音频解码 13ms），
+#     真超长才截断 PCM 重编码 —— 常规短语音**不付这笔钱**（见尺寸筛）。
+#
+# 上限值由插件配置注入（`voice_auto_trim` / `voice_max_seconds`），
+# 也可以在调用点显式传 `max_seconds=`（显式优先）。
+_MAX_SECONDS: Optional[float] = None
+
+#: silk 尺寸筛：低于「上限秒数 × 这个速率」的 silk 不可能超长（保守取 500 B/s），
+#: 直接放过、不必解码。实测 silk ≈ 1.7 KB/s（10 秒 17KB），所以 500 很保守。
+_SILK_MIN_BYTES_PER_SEC = 500
+
+#: 语音条统一采样率（silk 宽带；与 `_convert_sync` 的 -ar 一致）
+_SILK_RATE = 24000
+
+#: 时长探测缓存：(路径,大小,mtime) → 秒（None = 探测失败）
+_DUR_CACHE: dict = {}
+
+
+def configure_trim(max_seconds: Any) -> None:
+    """注入语音条时长上限（秒）。``None`` / ``<=0`` / 非法 ⇒ 关闭剪裁。
+
+    幂等；插件启动与热重载时各调一次即可（改配置立即生效）。
+    """
+    global _MAX_SECONDS
+    try:
+        val = float(max_seconds) if max_seconds not in (None, "", False) else None
+        _MAX_SECONDS = val if (val and 1.0 <= val <= 3600.0) else None
+    except Exception:
+        _MAX_SECONDS = None
+
+
+def voice_limit() -> Optional[float]:
+    """当前生效的语音条上限（秒）；``None`` = 不剪裁。"""
+    return _MAX_SECONDS
+
+
+def _effective_cap(max_seconds: Any) -> Optional[float]:
+    """算出生效的上限：**显式参数优先**，没给才用模块默认。
+
+    ``max_seconds=0`` / 负数 ⇒ 显式关闭剪裁（覆盖模块默认）。
+    """
+    if max_seconds is None:
+        return _MAX_SECONDS
+    try:
+        val = float(max_seconds)
+    except Exception:
+        return None
+    if val <= 0:
+        return None
+    return val if 1.0 <= val <= 3600.0 else None
+
+
+def _fmt_secs(seconds: Any) -> str:
+    """秒 → ``m:ss``（日志用）。"""
+    try:
+        s = max(0.0, float(seconds))
+    except Exception:
+        return "?"
+    return f"{int(s // 60)}:{int(s % 60):02d}"
+
+
+def probe_duration_sync(path: str, timeout: int = 10) -> Optional[float]:
+    """用 ffmpeg 头解析读音频时长（秒）；读不到返回 ``None``。
+
+    * **只解析文件头**（不给输出文件 ⇒ ffmpeg 立刻带着 "Duration: …" 退出），
+      不解码整条音频，所以很快（一次进程启动，通常几十到几百毫秒）；
+    * 结果按 (路径,大小,mtime) 缓存；
+    * **只在真的要剪裁时才调用**（为了日志能写清"原本多长 → 剪到多长"），
+      常规短语音走不到这里 ⇒ 热路径零成本。
+    """
+    key = _digest(path)
+    if key in _DUR_CACHE:
+        return _DUR_CACHE[key]
+    dur: Optional[float] = None
+    try:
+        import re as _re
+
+        for ffmpeg in _ffmpeg_candidates():
+            try:
+                proc = subprocess.run(
+                    [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-i", path],
+                    capture_output=True, timeout=timeout, **_ffmpeg_spawn_kwargs())
+                err = (proc.stderr or b"").decode(errors="replace")
+                m = _re.search(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)", err)
+                if m:
+                    dur = (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                           + float(m.group(3)))
+                    break
+            except Exception:
+                continue
+    except Exception:
+        dur = None
+    if len(_DUR_CACHE) > 128:
+        _DUR_CACHE.clear()
+    _DUR_CACHE[key] = dur
+    return dur
 
 
 def _digest(path: str) -> str:
@@ -377,30 +486,38 @@ def _fix_tencent_header(silk_path: str, logger_: Any = None) -> bool:
         return False
 
 
-async def convert_to_silk_forced(path: str, logger_: Any = None) -> Optional[str]:
+async def convert_to_silk_forced(path: str, logger_: Any = None,
+                                 max_seconds: Any = None) -> Optional[str]:
     """**强制**把音频转成 silk（不管它现在是什么格式），返回新路径或 None。
 
     与 `to_silk_if_needed` 的区别：后者对"已经是 silk"会原样返回，
     而这个是"**我要一份 silk**"—— 给"mp3/ogg 原样发被平台拒了、需要重试"用。
 
+    ``max_seconds``：语音条上限（秒）；给了就保证产物**不超过**它
+    （超长部分剪掉并写日志）。``None`` ⇒ 用模块默认（`configure_trim` 注入）。
+
     ⚠ **不阻塞**：转码走 `asyncio.to_thread`（`_convert_sync` 里是 subprocess +
       pilk/pysilk 的同步调用），事件循环不受影响。
     """
+    cap = _effective_cap(max_seconds)
     if not path or not os.path.isfile(path):
         return None
     if silk_magic_ok(path):
-        return path if _fix_tencent_header(path, logger_) else None
+        if not _fix_tencent_header(path, logger_):
+            return None
+        # ★ 已经是 silk 也要过上限：外部工具（silk-wasm 等）产出的长语音会超 5 分钟
+        return await asyncio.to_thread(_silk_with_cap, path, cap, logger_)
     if not silk_available():
         return None
-    # 已有缓存就直接用（避免重复转）
-    key = _digest(path)
+    # 已有缓存就直接用（避免重复转）；★ 上限不同 ⇒ 产物不同 ⇒ key 带上上限
+    key = _digest(path) + (f"|cap{cap:.3f}" if cap else "")
     hit = _CACHE.get(key)
     if hit and os.path.exists(hit[0]):
         return hit[0]
     out_dir = None
     try:
         out_dir = tempfile.mkdtemp(prefix="qqbot_silk_")
-        silk = await asyncio.to_thread(_convert_sync, path, out_dir)
+        silk = await asyncio.to_thread(_convert_sync, path, out_dir, cap)
         if not silk:
             _rm_tree(out_dir)
             return None
@@ -415,7 +532,101 @@ async def convert_to_silk_forced(path: str, logger_: Any = None) -> Optional[str
         return None
 
 
-def _convert_sync(src: str, out_dir: str) -> Optional[str]:
+def _truncate_silk(path: str, cap: float, logger_: Any):
+    """**已经（合法）silk 的文件**超长时：解码量长度，真超长就截断 PCM 重编码。
+
+    返回 ``(新 silk 路径, 临时目录)``；不需要剪 / 剪不了 ⇒ ``None``。
+
+    ## 成本（**为什么热路径不付这笔钱**）
+
+    * 先过**尺寸筛**：``size <= cap × 500 B/s`` 的 silk 不可能超长 ⇒ 直接放过。
+      实测 silk ≈ 1.7 KB/s（10 秒 = 17KB），500 是保守下限 ⇒ 60 秒以内的
+      语音（QQ 语音消息的最长档）全部走筛子，**不解码、零成本**；
+    * 只有大文件才解码量长度（实测 **10 秒音频解码 13ms**，纯 C，很快）；
+    * 真超长才重编码（PCM 截断到整数秒 ⇒ 产物时长**精确** = 上限）。
+
+    fail-open：任何异常都放过原文件（绝不因为剪裁把一条语音搞丢）。
+    """
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        return None
+    if size <= cap * _SILK_MIN_BYTES_PER_SEC:
+        return None                       # 便宜筛：这么点字节不可能超过 cap 秒
+    # ★ 量过的长度也要缓存：大而不超长的 silk（1.5–5 分钟档）重复发送时
+    #   不必每次都解码（实测 10 秒音频 13ms，5 分钟级就是几百毫秒）
+    mkey = "silk|" + _digest(path)
+    measured = _DUR_CACHE.get(mkey)
+    if measured is not None and measured <= cap:
+        return None                       # 上次量过：没超 ⇒ 直接放过
+    encoder = _silk_encoder()
+    if encoder not in ("pysilk", "pilk"):
+        return None                       # 没有能解码的后端 ⇒ 放过
+    out_dir = None
+    try:
+        import pysilk
+
+        out_dir = tempfile.mkdtemp(prefix="qqbot_silkcut_")
+        pcm_path = os.path.join(out_dir, "cut.pcm")
+        with open(path, "rb") as fi, open(pcm_path, "wb") as fo:
+            pysilk.decode(fi, fo, _SILK_RATE)
+        got = os.path.getsize(pcm_path)
+        cap_bytes = int(cap * _SILK_RATE) * 2
+        _DUR_CACHE[mkey] = got / (_SILK_RATE * 2)      # ★ 记住这次量到的长度
+        if len(_DUR_CACHE) > 256:                      # 有界，防长会话里无限增长
+            _DUR_CACHE.clear()
+        if got <= cap_bytes:
+            _rm_tree(out_dir)
+            return None                   # 量完发现没超 ⇒ 原样用（也不会留临时目录）
+        keep = cap_bytes - (cap_bytes % 2)
+        with open(pcm_path, "r+b") as f:
+            f.truncate(keep)
+        silk_path = os.path.join(out_dir, "cut.silk")
+        if not _encode_silk(encoder, pcm_path, silk_path, _SILK_RATE):
+            _rm_tree(out_dir)
+            return None
+        if not _fix_tencent_header(silk_path, logger_):
+            _rm_tree(out_dir)
+            return None
+        if logger_ is not None:
+            logger_.info(
+                "[QQBOT-BRIDGE] 语音超长：已自动剪裁（原 %s → %s）——"
+                "平台语音条上限 5 分钟（超 1 秒都会失败并退回文件卡片），多出的部分已丢弃。"
+                "（voice_max_seconds 可调上限；voice_auto_trim=false 可关）",
+                _fmt_secs(got / (_SILK_RATE * 2)), _fmt_secs(keep / (_SILK_RATE * 2)),
+            )
+        return silk_path, out_dir
+    except Exception as exc:
+        if out_dir:
+            _rm_tree(out_dir)
+        if logger_ is not None:
+            logger_.debug("[QQBOT-BRIDGE] silk 剪裁失败（放过原文件）：%s", exc)
+        return None
+
+
+def _silk_with_cap(path: str, cap: Optional[float], logger_: Any) -> Optional[str]:
+    """已合法 silk：``cap`` 生效且确实超长 ⇒ 返回剪裁后的新路径，否则返回**原路径**。
+
+    带缓存（``_CACHE``，与转码产物同一张表、同一套淘汰/清理逻辑）：
+    同一份超长音频重复发送时**不重复解码/重编码**。
+    """
+    if not cap:
+        return path
+    key = _digest(path) + f"|trim{cap:.3f}"
+    hit = _CACHE.get(key)
+    if hit and os.path.exists(hit[0]):
+        return hit[0]
+    made = _truncate_silk(path, cap, logger_)
+    if not made:
+        return path
+    silk_path, out_dir = made
+    _prune_cache()
+    _CACHE[key] = (silk_path, out_dir)
+    return silk_path
+
+
+def _convert_sync(src: str, out_dir: str,
+                  max_seconds: Any = None) -> Optional[str]:
     """同步转码：`src`（任意音频）→ silk 文件路径；失败返回 None。
 
     链路：**ffmpeg 解码成 PCM → silk 编码器编成 silk**。
@@ -457,13 +668,22 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
 
     # ① 解码成 PCM。采样率必须和后面 pilk 的 pcm_rate 一致。
     #    24000 是 SILK 宽带模式（QQ/微信语音常用），单声道。
-    rate = 24000
+    #
+    #    ★★ 2026-10-10：带上 `-t <语音条上限>` —— 超长音频**只解码前 N 秒**
+    #      （用户实测：平台语音条上限 5 分钟，超 1 秒都失败、退回文件卡片）。
+    #      没超时 `-t` 是 no-op（零成本）；超了就是免费截断（比解完再切还快）。
+    rate = _SILK_RATE
+    cap = _effective_cap(max_seconds)
+    cap_clip = ["-t", f"{cap:.3f}"] if cap else []
+    #: 命中上限（= 源比上限长）的判据：PCM 长度顶到上限（容差一个帧的量级）
+    cap_bytes = int(cap * rate) * 2 if cap else None
     proc = None
     ok_decode = False
     for i, ffmpeg in enumerate(cands):
         cmd = [
             ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
             "-i", src,
+            *cap_clip,
             "-f", "s16le", "-acodec", "pcm_s16le",
             "-ac", "1", "-ar", str(rate),
             pcm_path,
@@ -516,6 +736,25 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
             len(cands), ("：" + _err) if _err else "")
         return None
 
+    # ★★ 命中上限 ⇒ 源比上限长：ffmpeg 已按 `-t` 截断（只解码了前 N 秒）。
+    #   写清"原本多长 → 剪成多长"（原时长要单独探一次头，**只在真的剪裁时**才付这点成本）。
+    if cap and cap_bytes:
+        try:
+            _got = os.path.getsize(pcm_path)
+        except Exception:
+            _got = 0
+        if _got and _got >= max(0, cap_bytes - 4096):
+            _src_len = probe_duration_sync(src)
+            # ★ 源正好等于上限（或只差一个帧）⇒ 其实没剪掉什么，不谎报"已剪裁"；
+            #   探测不到长度（None）时照常写日志（无法证伪，如实带个 "?"）。
+            if _src_len is None or _src_len > cap + 0.05:
+                logger.info(
+                    "[QQBOT-BRIDGE] 语音超长：已自动剪裁（原 %s → %s）——"
+                    "平台语音条上限 5 分钟（超 1 秒都会失败并退回文件卡片），多出的部分已丢弃。"
+                    "（voice_max_seconds 可调上限；voice_auto_trim=false 可关）",
+                    _fmt_secs(_src_len) if _src_len else "?", _fmt_secs(cap),
+                )
+
     # ② PCM → silk（采样率必须与上面 ffmpeg 的 -ar 一致）
     #
     #   后端形态不同，统一交给 `_encode_silk`：
@@ -546,12 +785,16 @@ def _convert_sync(src: str, out_dir: str) -> Optional[str]:
     return silk_path
 
 
-async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
+async def to_silk_if_needed(path: str, logger_: Any = None,
+                            max_seconds: Any = None) -> Optional[str]:
     """把音频转成 silk 文件路径；**已经是 silk 则原样返回**。
 
-    返回 None 表示"转不了"（缺依赖 / 解码失败 / 源文件异常），
+    ``max_seconds``：语音条上限（秒）。超长的音频会被自动剪裁到上限
+    （见 `_convert_sync` / `_truncate_silk`）；``None`` ⇒ 用模块默认。
+    返回 ``None`` 表示"转不了"（缺依赖 / 解码失败 / 源文件异常），
     调用方**应按原文件发送**（退化成文件），不要丢消息。
     """
+    cap = _effective_cap(max_seconds)
     if not path or not os.path.isfile(path):
         return None
     if silk_magic_ok(path):
@@ -569,7 +812,8 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
                     os.path.basename(path),
                 )
             return None
-        return path
+        # ★ 已是合法 silk，但**也可能超长**（外部工具产出的长语音）⇒ 过一遍上限
+        return await asyncio.to_thread(_silk_with_cap, path, cap, logger_)
     # ★ 扩展名写着 .silk、内容却不是 silk（2026-10-08 线上第三种形态）：
     #   **多半只是把 ogg/mp3 改了个名**。这种情况绝不能原样发 ——
     #   QQ 会（不报错地）把它降级成**文件卡片**。下面按普通音频重新编码。
@@ -596,7 +840,7 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
     except Exception:
         return None
 
-    key = _digest(path)
+    key = _digest(path) + (f"|cap{cap:.3f}" if cap else "")
     hit = _CACHE.get(key)
     if hit and os.path.exists(hit[0]):
         return hit[0]
@@ -614,7 +858,7 @@ async def to_silk_if_needed(path: str, logger_: Any = None) -> Optional[str]:
     out_dir = None
     try:
         out_dir = tempfile.mkdtemp(prefix="qqbot_silk_")
-        silk = await asyncio.to_thread(_convert_sync, path, out_dir)
+        silk = await asyncio.to_thread(_convert_sync, path, out_dir, cap)
         if not silk:
             _rm_tree(out_dir)              # ★ 失败也要清，否则临时目录越积越多
             return None
@@ -678,5 +922,6 @@ def clear_cache() -> None:
         if entry and len(entry) > 1:
             _rm_tree(entry[1])
     _CACHE.clear()
+    _DUR_CACHE.clear()                    # ★ 时长/量长缓存一并清（测试与还原用）
     reset_ffmpeg_cache()
     reset_encoder_cache()
