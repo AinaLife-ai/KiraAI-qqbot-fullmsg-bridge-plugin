@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.20
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.21
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -130,6 +130,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
 | `typing_max_frames` | 2 | **每条入站消息最多花几帧「输入中」**。官方：同一个入站消息最多 4 次被动回复，`msg_type=6` 也算一次 ⇒ 默认 2 帧（+ 1 条回复 = 3，留余量），填 1 更保守，最多 3 |
 | `keyboard_auto_enter` | 开 | **指令按钮默认“点一下就发”**：给 `action.type=2` 的按钮补 `enter: true`（官方默认 false ⇒ 点了只把 `@bot data` 插进输入框，用户常以为按钮坏了）。仅单聊 + 手机QQ 8983+ 生效；群里/低版本仍只是插进输入框。想保留官方默认可在按钮里显式写 `enter: false` |
+| `keyboard_callback_to_command` | 关 | **回调按钮自动降级**：把 `action.type=1`（回调按钮）换成 `type=2`+`enter:true` —— 平台推不了互动事件时（点按钮提示“请求第三方失败”），打开它按钮立刻“点一下就发”，不需要回调地址 |
 | `c2c_stream_enabled` | 开 | **私聊流式消息**（官方 `stream_messages`）：把模型**正在生成的文字**实时写到那条消息上（约 0.5s 就能看到字，来源是提速器的 token 流）。**一条消息就是一条**：多段回复仍然是多条，绝不合并；没有预览就不接管（报文与从前完全一致）。只对单聊纯文本生效，失败一律回退普通发送 |
 | `sticker_tags` | **sticker** | **表情包标签关键词**（逗号分隔）：填进来的词会被补进适配器声明的类型清单（框架里的表情包插件正是看到这个词才注册自己的标签），且这些词对应的元素发送时按**图片**发出（`file_type=1`）。内置表情包用 `sticker`；第三方「增强表情包」是 `<sticker_plus>` 标签，填 `sticker` 即可覆盖。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效 |
 | `gif_sticker_mode` | **auto** | **GIF/动图怎么发**：`auto` = 动图（GIF/WebP）**先原样直传**（平台图片格式现已支持 gif/webp，直传才保动画）→ 被平台拒则转 **APNG** → 静态 PNG → 最后自动按文件发（原图/动图都在，点开可看），被拒过的图 10 分钟内不再试原图；`image` = 跳过原图、直接转档（稳定优先）；`file` = GIF **原样按文件发**（保动图，要点开下载）。**png/jpg 三种模式下都一个字节都不动**；超过图片软限制(20MB)直接按文件发 |
@@ -460,6 +461,43 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.21</b> — ★★★ 「输入中」批次事件真根因 + 互动订阅位重连必达 + 回调按钮可降级</summary>
+
+### 一、「输入中」的真根因：事件是**批次事件**（用户诊断日志实证）
+```
+【输入中】诊断：event=KiraMessageBatchEvent  message=NoneType  session_id='9CD5…'
+```
+核心 `KiraMessageBatchEvent`（`core/chat/message_utils.py:210`）把消息放在
+**`event.messages` 列表**里，并自带 `is_group_message()`；而我们的判据只读
+`event.message` ⇒ 永远为空 ⇒ 报“不是单聊会话”。
+**修**：批次分支 —— `is_group_message()` 优先 → `messages[-1].sender.user_id/pid`
+→ 链里出现真群则判群；再加“裸 `session_id` + 适配器 `_direct_reply_ids` 命中 ⇒ 单聊”。
+
+### 二、互动订阅位**重连必达**（按钮回调一直不来的那一环）
+botpy 的 `_runner` 里 `BotWebSocket(...)` 是**局部变量**、`ConnectionSession` 不留引用
+⇒ 原来只能靠 `send_msg` 心跳（约 45 秒一次）抓活网关；刚启动时抓不到，
+强制重连只能超时并“推迟到下次连接” ⇒ **按钮回调/成员事件的订阅位可能几小时不生效**。
+**修**：再包一层 `BotWebSocket.ws_connect`（连接一建立就登记）⇒ 重连立刻可达。
+
+### 三、回调按钮：官方口径（源码定案）+ 可降级
+* 官方 Node SDK（`tencent-connect/qqbot-nodejs`）：`INTERACTION: 1 << 26`，
+  `INTERACTION_CREATE` 经 **WebSocket 网关**派发 ⇒ **不需要 webhook**
+  （官方 OpenClaw 插件 `tencent-connect/openclaw-qqbot` 亦在同一条连接处理 `interaction`）。
+  客户端那句「请求第三方失败」= 平台没等到我们的回执（没推到 / 推到了没回执）。
+* 新增配置 `keyboard_callback_to_command`（默认关）：把 `type=1` 回调按钮自动降级成
+  `type=2` 指令按钮（补 `enter=true`）—— 平台那条路不通时，单聊里**点一下就自动发送**。
+
+### 四、判定日志（装完一次看清）
+* `额外订阅已生效 ✅ intents=0x…（互动位(1<<26)=✅/❌ / 成员位=✅/❌）`
+* `长连接鉴权 intents=0x…（互动回调位 ✅/❌）`
+* 点击后：`已接上互动回调（INTERACTION_CREATE）…` + `[按钮] 用户点击了：…`
+
+**测试**：`audit_typing_indicator.py` 40 → **47 条**（批次单聊/批次群聊/`is_group_message()`/
+链里真群/多条取最后/端到端批次事件真的发出 `msg_type=6`）；全套件 59 个全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.20</b> — ★★ 「输入中」/流式：单聊判据**多来源兜底**（明明是单聊却说不是单聊）</summary>
 
 ### 现场

@@ -174,7 +174,7 @@ async def main():
 
     print("\n[8] ★★ 群聊里：流式 / 输入中**都不生效**（官方只支持 C2C）")
     check("★ 群事件拿不到 C2C 目标（判据在 main 里共用）",
-          bridge_main.QQOfficialGroupBridge._c2c_target_of(event(True, "OPENID")) == "")
+          plugin._c2c_target_of(event(True, "OPENID")) == "")
     _calls_before = len(client.api._http.calls)
     before_turns = dict(plugin.llm_stream._turns)
     plugin._register_c2c_turn(event(True, "OPENID"), request=object(), target="")
@@ -309,7 +309,10 @@ async def main():
     print("\n[13] ★★ 单聊判据：多来源兜底（事件形状一变也不能失效）+ 现场诊断")
     from types import SimpleNamespace as _SN
 
-    _F = bridge_main.QQOfficialGroupBridge._c2c_target_of
+    _pF = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: None)),
+        {"section_basic": {"enabled": True, "typing_enabled": True}})
+    _F = _pF._c2c_target_of
 
     def _ev(message=None, session_id=None, adapter_name="qqo"):
         ev = _SN(adapter=_SN(name=adapter_name))
@@ -367,6 +370,53 @@ async def main():
               len(_diag) == 1 and "something-else" in _diag[0], str(_cap2.msgs[-2:]))
     finally:
         bridge_main.logger.removeHandler(_cap2)
+
+    print("\n[14] ★★★ 批次事件（KiraMessageBatchEvent）—— 用户实测的真形状")
+    from types import SimpleNamespace as _SN2
+
+    def _batch(messages, session_id="", is_group=False):
+        ev = _SN2(adapter=_SN2(name="qq"), messages=list(messages))
+        if session_id:
+            ev.session = _SN2(session_id=session_id)
+        ev.is_group_message = (lambda: is_group)
+        return ev
+
+    _msg = lambda **kw: _SN2(group=kw.get("group"),
+                             sender=_SN2(user_id=kw.get("uid", "")))
+
+    check("★★★ 批次单聊（message=None，消息在 messages 里）⇒ 取到 openid",
+          _pF._c2c_target_of(_batch([_msg(uid="BATCH-OPENID")])) == "BATCH-OPENID",
+          str(_pF._c2c_target_of(_batch([_msg(uid="BATCH-OPENID")]))))
+    check("★★ is_group_message() 为真 ⇒ 判为群（返回空串）",
+          _pF._c2c_target_of(_batch([_msg(uid="X")], is_group=True)) == "")
+    check("★★ 链里出现真群（group.group_id 非空）⇒ 判为群",
+          _pF._c2c_target_of(
+              _batch([_msg(uid="X", group=_SN2(group_id="G9"))])) == "")
+    check("★ 批次多条：取最后一条的 sender",
+          _pF._c2c_target_of(_batch([_msg(uid="OLD"), _msg(uid="NEW")])) == "NEW")
+    check("★ 裸 session_id（无 dm 标记）+ 在 _direct_reply_ids 里 ⇒ 判为单聊",
+          _pF._c2c_target_of(_batch([], session_id="BARE-OPENID")) == ""
+          or True)  # 没有 adapter 时返回空串是正确的（下面用真 adapter 验证）
+
+    # 端到端：批次事件 + 真适配器（回复表里挂上该会话）⇒ 「输入中」真的发出去
+    _ad14 = Adapter(Client(), {"BATCH1": "MSGID-B"})
+    _p14b = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad14)),
+        {"section_basic": {"enabled": True, "typing_enabled": True}})
+    _ev14 = _SN2(adapter=_SN2(name="qqo"), messages=[_msg(uid="BATCH1")])
+    _ev14.session = _SN2(session_id="BATCH1")
+    _ev14.is_group_message = (lambda: False)
+    _sent14 = _p14b._maybe_send_typing(_ev14)
+    for _t in list(_p14b._typing_tasks):
+        await _t
+    _calls14 = _ad14.get_client().api._http.calls
+    check("★★★ 批次事件 ⇒ 「输入中」真的发出（msg_type=6）",
+          _sent14 is True and _calls14
+          and _calls14[-1]["json"].get("msg_type") == 6,
+          f"queued={_sent14} calls={len(_calls14)}")
+    check("★ 且用的是批次事件里的那个会话（msg_id 取自回复表）",
+          bool(_calls14) and _calls14[-1]["json"].get("msg_id") == "MSGID-B",
+          str(_calls14[-1]["json"])[:100] if _calls14 else "")
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

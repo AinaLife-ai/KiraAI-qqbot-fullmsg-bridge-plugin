@@ -224,6 +224,12 @@
         "type": "switch",
         "default": true,
         "hint": "官方默认：指令按钮（action.type=2）点击后只把 @bot data 插进输入框，要用户自己再按一次发送——很多人会以为按钮坏了。打开本项，插件会给这类按钮补上 action.enter=true：点一下直接发送（仅单聊 + 手机QQ 8983+ 生效；群里或低版本客户端点，仍然只是插进输入框，与官方默认一致，不会更糟）。想让某个按钮保持官方默认，可在它里面显式写 enter=false。"
+      },
+      "keyboard_callback_to_command": {
+        "name": "回调按钮自动降级成指令按钮（平台推不了互动事件时用）",
+        "type": "switch",
+        "default": false,
+        "hint": "默认关。回调按钮（action.type=1）要求平台能把 INTERACTION_CREATE 事件推给机器人；若平台侧那条路不通（典型表现：客户端点按钮提示请求第三方失败），按钮就点不动。打开本项后，插件把这类按钮自动换成指令按钮（action.type=2 并补 enter=true）：单聊里点一下就自动发送，群里仍是插进输入框；不需要任何回调地址。等平台的互动推送恢复后关掉即可。"
       }
     }
   },
