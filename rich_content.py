@@ -326,4 +326,5 @@ KEYBOARD_TAG_DESCRIPTION = (
     '"action":{"type":2,"data":"/签到","permission":{"type":2}}}]}]}}。'
     "最多 5 行、每行最多 5 个按钮，按钮的 action.data 不超过 100 字符。"
     "必须和 <text> 或 <markdown> 放在同一个 <msg> 里。用户点击后会以消息形式回来。"
+    "★ 可以和图片/语音放在同一条 <msg> 里 —— 系统会自动拆成两条（先媒体、后按钮），两边都正常。"
 )

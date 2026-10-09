@@ -321,6 +321,44 @@ def _identity_path():
             return None
 
 
+def _split_media_and_rest(chain):
+    """把消息链拆成 ``(媒体链, 其余链)``；**没有媒体元素就返回 None**。
+
+    ★ 为什么要拆（2026-10-10 用户要求 + 官方限制）：
+      官方 Node/Python SDK 原话「**仅 markdown 消息支持消息按钮**」。
+      一条消息里既有图片/语音又有键盘时，两者抢同一个 `msg_type`：
+      走富媒体（7）按钮不显示，走 markdown（2）媒体发不出去。
+      ⇒ 自动拆成两条：① 媒体   ② 带按钮的 markdown（正文 + 键盘），
+      由核心分别发送（每条的 `msg_id`/`msg_seq` 由核心统一递增，不会撞重复）。
+
+    返回 ``None`` 表示"不用拆/拆不了"（调用方按原样发一条）。
+    """
+    try:
+        from core.chat.message_elements import File as _File
+        from core.chat.message_elements import Image as _Image
+    except Exception:
+        return None
+    try:
+        from core.chat.message_utils import MessageChain as _MC
+    except Exception:
+        try:
+            from core.chat import MessageChain as _MC
+        except Exception:
+            return None
+    try:
+        items = list(chain)
+    except Exception:
+        return None
+    media = [e for e in items if isinstance(e, (_File, _Image))]
+    if not media:
+        return None
+    rest = [e for e in items if not isinstance(e, (_File, _Image))]
+    try:
+        return _MC(media), _MC(rest)
+    except Exception:
+        return None
+
+
 class QQOfficialGroupBridge(BasePlugin):
     """把 QQ 官方机器人的群/单聊事件对齐成 KiraAI 标准语义。"""
 
@@ -2872,6 +2910,52 @@ class QQOfficialGroupBridge(BasePlugin):
             kb_token = PENDING_KB.set(kb)
             ref_token = QUOTE_REF.set(ref)
             try:
+                # ★★★ 2026-10-10：**富媒体 + 键盘 ⇒ 自动拆成两条发送**
+                #   官方只支持 markdown 消息带按钮，一条消息里"图/语音"与"按钮"
+                #   抢同一个 msg_type ⇒ 必须拆开才能两者都正常：
+                #     ① 媒体那条（不带键盘、不带 markdown）
+                #     ② 正文 + 按钮那条（markdown 消息，由 api 层自动升格）
+                #   两条都由**核心**发送 ⇒ msg_id/msg_seq 走核心自己的计数器递增，
+                #   不会与真实回复或彼此撞重复（官方：同一 msg_id 最多 4 次被动回复）。
+                _split = None
+                if kb and self.keyboard_enabled:
+                    try:
+                        _split = _split_media_and_rest(send_message_obj)
+                    except Exception as _exc:
+                        _split = None
+                        logger.debug("[QQBOT-BRIDGE] 拆媒体+键盘失败（按原样发）: %s", _exc)
+                if _split is not None:
+                    _media_chain, _rest_chain = _split
+                    if not getattr(self, "_kb_split_logged", False):
+                        self._kb_split_logged = True
+                        logger.info(
+                            "[QQBOT-BRIDGE] 本条同时有**富媒体与键盘** ⇒ 已自动拆成两条发送："
+                            "① 图片/语音  ② 带按钮的 markdown 消息（正文+按钮）。"
+                            "官方只支持 markdown 消息带按钮，拆开才能两者都正常")
+                    _t1 = PENDING_MD.set(None)
+                    _t2 = PENDING_KB.set(None)
+                    res_media = None
+                    try:
+                        res_media = await original(target_id, _media_chain, is_group)
+                    except Exception as _exc:
+                        logger.warning(
+                            "[QQBOT-BRIDGE] 拆分后**媒体那条**发送失败（%s: %s）——"
+                            "继续发按钮那条（不重复、不丢消息）",
+                            type(_exc).__name__, str(_exc)[:120])
+                    finally:
+                        PENDING_MD.reset(_t1)
+                        PENDING_KB.reset(_t2)
+                    # 第二条：正文 + 按钮（不带引用，避免两条都挂同一条引用）
+                    _t3 = QUOTE_REF.set(None)
+                    try:
+                        res_kb = await original(target_id, _rest_chain, is_group)
+                    finally:
+                        QUOTE_REF.reset(_t3)
+                    if res_kb is not None and bool(getattr(res_kb, "ok", True)):
+                        return res_kb
+                    if res_media is not None and bool(getattr(res_media, "ok", True)):
+                        return res_media
+                    return res_kb if res_kb is not None else res_media
                 result = await original(target_id, send_message_obj, is_group)
             finally:
                 QUOTE_REF.reset(ref_token)

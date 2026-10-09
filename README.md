@@ -473,7 +473,9 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
    **仅 markdown 消息支持消息按钮**。纯文本 + keyboard ⇒ 平台不渲染按钮。
    ⇒ 修：发送侧发现"有键盘但本条不是 markdown"时**自动升格成 markdown**
    （`msg_type=2`、`content` 置空、正文进 `markdown.content`），群聊/单聊都生效；
-   富媒体（msg_type=7）+ 键盘保持原样并发一条 WARNING（官方只支持 markdown 带按钮）。
+   **富媒体 + 键盘 ⇒ 自动拆成两条**：① 图片/语音一条 ② 带按钮的 markdown 一条
+   （`msg_id`/`msg_seq` 由核心统一递增，不撞重复；媒体那条失败只记 WARNING，
+   按钮条照发 —— 不重复、不丢消息），两者都能正常工作。
 
 ### 二、私聊「输入中」：机制验证可用 + 可诊断 + 额度保护
 

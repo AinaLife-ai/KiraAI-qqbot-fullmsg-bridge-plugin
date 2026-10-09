@@ -270,5 +270,119 @@ check("★ 最终发出的是纯文本（msg_type=0）",
 check("★ 回退时不再带 keyboard（键盘依赖 markdown 消息）",
       not sent.get("keyboard"), str(sent.get("keyboard")))
 
+print("\n═══ C. 富媒体 + 键盘 ⇒ 自动拆成两条（3.0 真实核心 + 真实发送路径）═══")
+try:
+    _CORE3 = str(_CORE_ROOT("3"))
+    if not os.path.isdir(_CORE3):
+        print("  skip  3.0 核心不可用")
+    else:
+        for _m in [m for m in list(sys.modules) if m.split(".")[0] == "core"]:
+            sys.modules.pop(_m, None)
+        for _m in ("main", "rich_content", "api_send", "smoke_v3"):
+            sys.modules.pop(_m, None)
+        sys.path.insert(0, _CORE3)
+        sys.path.insert(0, os.path.join(BR, "tests"))
+        import smoke_v3 as T                      # noqa: E402
+        import main as bridge_main                # noqa: E402
+        from core.chat.message_elements import Image as CoreImage  # noqa: E402
+        from core.chat.message_elements import Text as CoreText    # noqa: E402
+        from core.chat.message_utils import MessageChain as CoreChain  # noqa: E402
+
+        _png = "/tmp/kb_split.png"
+        from PIL import Image as _PIL
+
+        _PIL.new("RGB", (8, 8), (200, 30, 30)).save(_png)
+
+        async def _real_send(build_chain):
+            a = T.make_adapter()
+            a.client.api._http = T.FakeHTTP({"/files": {"file_info": "FI"}})
+            # 造一条"刚收到的群消息" ⇒ 有被动回复锚点（msg_id/msg_seq 才会带上）
+            try:
+                from core.adapter.capabilities import IMCapability
+
+                a.get_capability(IMCapability)._group_reply_ids["G1"] = "MSGID-IN"
+            except Exception:
+                try:
+                    a._group_reply_ids["G1"] = "MSGID-IN"
+                except Exception:
+                    pass
+            p = T.make_plugin(a)
+            await p._tick()
+            await a.send_group_message("G1", build_chain())
+            return [kw for _kind, kw in a.client.api.calls]
+
+        _KB2 = {"content": {"rows": [{"buttons": [
+            {"id": "b9", "render_data": {"label": "拆出来的按钮", "style": 1},
+             "action": {"type": 2, "data": "/x", "permission": {"type": 2}}}]}]}}
+
+        # C1: 图 + 正文 + 键盘 ⇒ 应当拆成两条
+        _calls = asyncio.run(_real_send(lambda: CoreChain([
+            CoreText("看这张图"),
+            CoreImage(image=_png, mime="image/png", name="kb_split.png"),
+            bridge_main.KeyboardMarker(_KB2)])))
+        check("★★ 拆成了两条消息", len(_calls) == 2, f"实际 {len(_calls)} 条：{_calls}")
+        if len(_calls) == 2:
+            _m1, _m2 = _calls
+            check("★★ 第 1 条 = 媒体消息（带 media、不带键盘）",
+                  bool(_m1.get("media")) and not _m1.get("keyboard")
+                  and int(_m1.get("msg_type") or 0) == 7,
+                  str({k: v for k, v in _m1.items() if k != "media"})[:120])
+            check("★★ 第 2 条 = markdown + 键盘（按钮挂得上）",
+                  int(_m2.get("msg_type") or 0) == 2 and bool(_m2.get("keyboard"))
+                  and (_m2.get("markdown") or {}).get("content") == "看这张图",
+                  str(_m2)[:160])
+            check("★ 顺序：媒体在前、按钮条在后", True)
+            check("★★ 两条都是同一条被动回复，msg_seq 由核心递增（1 → 2，不撞重复）",
+                  _m1.get("msg_id") == "MSGID-IN" and _m2.get("msg_id") == "MSGID-IN"
+                  and _m1.get("msg_seq") == 1 and _m2.get("msg_seq") == 2,
+                  f"{_m1.get('msg_id')}/{_m1.get('msg_seq')} vs "
+                  f"{_m2.get('msg_id')}/{_m2.get('msg_seq')}")
+            check("★ 按钮条不带引用（不在两条上重复挂引用）",
+                  not _m2.get("message_reference"),
+                  str(_m2.get("message_reference")))
+            check("★★ 第二条里没有脏占位文本",
+                  "[Unsupported message element]" not in str(_m2),
+                  str(_m2)[:160])
+
+        # C2: 只有媒体（无键盘）⇒ 不拆，仍然一条
+        _calls2 = asyncio.run(_real_send(lambda: CoreChain([
+            CoreText("只发图"),
+            CoreImage(image=_png, mime="image/png", name="kb_split.png")])))
+        check("★ 无键盘 ⇒ 不拆（仍然一条媒体消息）",
+              len(_calls2) == 1 and bool(_calls2[0].get("media")), f"{len(_calls2)} 条")
+
+        # C3: 只有键盘（无媒体）⇒ 一条，且升格成 markdown
+        _calls3 = asyncio.run(_real_send(lambda: CoreChain([
+            CoreText("只有按钮"),
+            bridge_main.KeyboardMarker(_KB2)])))
+        check("★ 无媒体 ⇒ 一条、升格 markdown 且带按钮",
+              len(_calls3) == 1 and int(_calls3[0].get("msg_type") or 0) == 2
+              and bool(_calls3[0].get("keyboard")), f"{len(_calls3)} 条")
+except Exception as exc:
+    import traceback
+
+    traceback.print_exc()
+    check("★ 拆分用例无异常", False, f"{type(exc).__name__}: {exc}")
+
+print("\n═══ D. 结构自检：类没被意外截断、助手在模块级 ═══")
+try:
+    import ast as _ast
+
+    _src = open(os.path.join(BR, "main.py"), encoding="utf-8").read()
+    _tree = _ast.parse(_src)
+    _cls = next(n for n in _tree.body
+                if isinstance(n, _ast.ClassDef) and n.name == "QQOfficialGroupBridge")
+    _methods = {m.name for m in _cls.body
+                if isinstance(m, (_ast.FunctionDef, _ast.AsyncFunctionDef))}
+    check("★ `_split_media_and_rest` 在**模块级**（不在类体里）",
+          any(isinstance(n, _ast.FunctionDef) and n.name == "_split_media_and_rest"
+              for n in _tree.body) and "_split_media_and_rest" not in _methods)
+    check("★ 关键方法都仍在类上（类体没被补丁截断）",
+          {"_patch_text_content", "_patch_send_path", "_maybe_send_typing",
+           "_send_typing", "_typing_skip"} <= _methods,
+          str(sorted(_methods)[:6]))
+except Exception as exc:
+    check("★ 结构自检无异常", False, f"{type(exc).__name__}: {exc}")
+
 print(f"\n结果：{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
