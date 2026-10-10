@@ -691,9 +691,16 @@ class ButtonPolicyStore:
         # ★ 派生"真正生效的截止状态"（2026-10-11 用户问：满额了为什么还显示进行中？）
         #   scope=each 时"满额"记在**逐按钮桶**上，策略级 closed 仍是 False ⇒ 必须派生。
         _scope = str(pol.get("scope") or "each")
-        _any_closed = any(bool(b.get("closed")) for b in btn_bits)
-        _all_closed = bool(btn_bits) and all(bool(b.get("closed")) for b in btn_bits)
-        if _scope == "each" and btn_bits:
+        # ★ 必须按**声明的按钮清单**算，而不是"已经有桶的按钮" ——
+        #   否则一排两按钮里只点满一个，另一个还没桶 ⇒ 被误判成"全部截止"（用户实测）。
+        _ids = [str(x) for x in (pol.get("button_ids") or [])] or \
+               [str(x) for x in (pol.get("buttons") or {})] or \
+               [str(x) for x in (pol.get("btn") or {})]
+        _buckets = pol.get("btn") or {}
+        _closed_cnt = sum(1 for bid in _ids if (_buckets.get(bid) or {}).get("closed"))
+        _all_closed = bool(_ids) and _closed_cnt == len(_ids)
+        _any_closed = _closed_cnt > 0
+        if _scope == "each" and _ids:
             _eff_closed = bool(pol.get("closed")) or _all_closed
             _partial = _any_closed and not _all_closed
             _eff_reason = (pol.get("closed_reason") or "") if pol.get("closed") else (
@@ -702,6 +709,12 @@ class ButtonPolicyStore:
             _eff_closed = bool(pol.get("closed"))
             _partial = False
             _eff_reason = pol.get("closed_reason") or ""
+        # ★ 到点但巡检还没跑到时，查账也必须认「已过期」（用户实测：别的类型也一样）
+        _until_s = float(pol.get("until") or 0)
+        if _until_s and time.time() > _until_s and not _eff_closed:
+            _eff_closed = True
+            _partial = False
+            _eff_reason = _eff_reason or "expired"
         return {
             "scope": str(pol.get("scope") or "each"),
             "buttons": btn_bits,

@@ -585,6 +585,35 @@ try:
     _s3 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
     check("S13-5 加名额后回到「进行中」（但超额历史仍在）",
           "进行中" in _s3 and "超额未计入 2 次" in _s3, _s3[:180])
+    # ---- 其他类型：部分截止（一排两按钮，各自额度）与 过期（ttl） ----
+    T13b, bm13b, a13b, p13b = make_env()
+    run_async(p13b._tick())
+    send_kb(T13b, bm13b, a13b, p13b, "GRP", {"max": "1", "label": "两按钮"},
+            [{"id": "b1", "render_data": {"label": "A", "style": 1},
+              "action": {"type": 1, "data": "a"}},
+             {"id": "b2", "render_data": {"label": "B", "style": 1},
+              "action": {"type": 1, "data": "b"}}])
+    _tool13b = BT.QQButtonTool(ctx=Ctx(p13b))
+    _ev13b = Ev("qq:gm:GRP", p13b)
+    clicks(bm13b, p13b, a13b, "GRP", [("P1@b1", "a")])          # 只把 A 点满
+    _sp = run_async(_tool13b.execute(_ev13b, action="stats", label="两按钮"))
+    check("S13-7 ★ 一排按钮里只满了一个 ⇒ 显示「部分截止」",
+          "部分截止" in _sp and "进行中" not in _sp, _sp[:170])
+
+    T13c, bm13c, a13c, p13c = make_env()
+    run_async(p13c._tick())
+    send_kb(T13c, bm13c, a13c, p13c, "GRP", {"ttl": "60", "label": "限时账"},
+            [{"id": "b1", "render_data": {"label": "抢", "style": 1},
+              "action": {"type": 1, "data": "g"}}])
+    clicks(bm13c, p13c, a13c, "GRP", [("T1", "g")])
+    for _pl in p13c.button_policies._pol.values():
+        if _pl.get("label") == "限时账":
+            _pl["until"] = time.time() - 1
+    _tool13c = BT.QQButtonTool(ctx=Ctx(p13c))
+    _se = run_async(_tool13c.execute(_ev13b.__class__("qq:gm:GRP", p13c), action="stats", label="限时账"))
+    check("S13-8 ★ 到点后显示「已过期（已截止）」（不是永远的进行中）",
+          "已截止" in _se and ("过期" in _se), _se[:170])
+
     _o_reset = run_async(_tool13.execute(_ev13, action="reset", label="上限测试"))
     _s4 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
     check("S13-6 重开一轮后计数与超额一起清零", "进行中" in _s4 and "超额未计入" not in _s4,
