@@ -26,6 +26,19 @@ except Exception:  # pragma: no cover
 
     logger = _logging.getLogger("qqbot_bridge")  # type: ignore
 
+# ★★ 2026-10-11 线上实测（bot 说「手边没有那个工具」）：
+#   核心 `ToolSet.add()` 的判定是
+#       if isinstance(tool, type): tool_inst = tool()
+#       elif isinstance(tool, BaseTool): tool_inst = tool
+#       else: continue          ← **静默丢弃**
+#   ⇒ 工具类**必须继承** `core.utils.tool_utils.BaseTool`，否则永远进不了模型。
+try:
+    from core.utils.tool_utils import BaseTool
+except Exception:  # pragma: no cover
+    class BaseTool:  # type: ignore
+        def __init__(self, *a, **kw):
+            pass
+
 PLUGIN_ID = "qqbot-fullmsg-bridge"
 
 _SELECTORS = {
@@ -35,15 +48,22 @@ _SELECTORS = {
 }
 
 
-class _ButtonToolBase:
-    """共享：拿到插件实例 + 账本 + 定位某一本账。"""
+class _ButtonToolBase(BaseTool):
+    """共享：拿到插件实例 + 账本 + 定位某一本账。
+
+    ★ 必须继承 `BaseTool`（核心 `ToolSet.add` 只认它；否则静默丢弃）。
+    """
 
     name = ""
     description = ""
     parameters: Dict[str, Any] = {}
 
-    def __init__(self, ctx=None, **kwargs):
-        self.ctx = ctx
+    def __init__(self, *args, ctx=None, **kwargs):
+        try:
+            super().__init__(*args, ctx=ctx, **kwargs)
+        except Exception:
+            self.ctx = ctx
+        self.ctx = ctx if ctx is not None else getattr(self, "ctx", None)
         for k, v in (kwargs or {}).items():
             setattr(self, k, v)
 

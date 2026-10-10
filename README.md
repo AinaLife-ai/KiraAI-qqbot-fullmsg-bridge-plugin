@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.35
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.36
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -603,6 +603,30 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.36</b> — 🚑 修「查账工具没进模型」（bot 说「手边没有那个工具」）</summary>
+
+**现象**（用户线上）：策略行为完全正常（第 1 次转达、第 2 次「最后一个名额」带汇总、
+之后「原因=full」不再转达），但让 bot 用 `qq_button_stats` 查账时它回答「手边没有那个工具」。
+
+**根因**：核心 `ToolSet.add()` 只认两种对象 ——
+`isinstance(tool, type)` 实例化，或 `isinstance(tool, BaseTool)` 收下，**其余 `continue` 静默丢弃**。
+我们的查账工具当时是**裸类**（没继承 `core.utils.tool_utils.BaseTool`）⇒ 注入被静默跳过。
+（既有测试用的是"什么都能塞"的 FakeToolSet，所以没测出来。）
+
+**修复**：
+1. `button_tools._ButtonToolBase` 改为继承 `BaseTool`（带 stub 兜底，2.x/3.0 通用）；
+2. 注入处加**落地校验**：加完回查 `name in tool_set`，没进去直接 **WARNING**
+   （"按钮查账工具没能进模型…模型会说「手边没有那个工具」"）；成功则 INFO 打一行。
+
+**守卫测试**（`audit_button_scenarios.py` S10，全部用**真实**对象）：
+* S10-1 四个工具都是 `BaseTool` 子类；
+* S10-2 用**真实 `ToolSet.add`** 断言四个工具真的进去了（线上就是这里丢的）；
+* S10-3 `get_schema()` 三要素齐全；
+* S10-4 走**插件真实注入路径** `inject_tools_and_tags(event, request, 真 TagSet)` 断言注入成功。
+
+</details>
+
+<details>
 <summary><b>v1.6.35</b> — 真实场景端到端测试（25 项）+ 抓到并修掉 extend/reset 的真 bug</summary>
 
 ### 新增：真实场景测试 `tests/audit_button_scenarios.py`（走完整链路，25 项全过）
