@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.30
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.35
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -129,6 +129,15 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `interaction_enabled` | 开 | 接收按钮点击（INTERACTION_CREATE）：**3 秒内回执** + 转成消息给模型 |
 | `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
 | `typing_max_frames` | 2 | **每条入站消息最多花几帧「输入中」**。官方：同一个入站消息最多 4 次被动回复，`msg_type=6` 也算一次 ⇒ 默认 2 帧（+ 1 条回复 = 3，留余量），填 1 更保守，最多 3 |
+| `button_policy_enabled` | 开 | 按钮策略总开关（限次/限人/截止/计数）|
+| `button_deliver_default` | `all` | 默认告知方式：all=每次有效点击都转（默认，与旧版一致）；last=只在截止那次转；off=都不转 |
+| `button_hard_default` | 开 | 默认硬拦截：超额/过期/重复的点击不再转给模型 |
+| `button_notify_default` | 关 | 截止时是否给用户发一条提示（机械文案，默认不发）|
+| `button_notify_text` | 空 | 自定义提示文案（可用 keyboard 标签的 notify_text 逐条覆盖）|
+| `button_default_ttl` | 0 | 默认有效期秒数（0=不限）|
+| `button_default_once` | 关 | 模型没写 once 时，是否默认每人一次 |
+| `button_policy_token` | 关 | 是否给 action.data 加追踪前缀（一般不必）|
+| `button_max_entries` | 500 | 按钮账本上限 |
 | `keyboard_auto_enter` | 开 | **指令按钮默认“点一下就发”**：给 `action.type=2` 的按钮补 `enter: true`（官方默认 false ⇒ 点了只把 `@bot data` 插进输入框，用户常以为按钮坏了）。仅单聊 + 手机QQ 8983+ 生效；群里/低版本仍只是插进输入框。想保留官方默认可在按钮里显式写 `enter: false` |
 | `keyboard_callback_to_command` | 关 | **回调按钮自动降级**：把 `action.type=1`（回调按钮）换成 `type=2`+`enter:true` —— 平台推不了互动事件时（点按钮提示“请求第三方失败”），打开它按钮立刻“点一下就发”，不需要回调地址 |
 | `typing_delay_seconds` | 2 | **「输入中」延时几秒再显示**：不能用户一发消息就冒出「正在输入…」（同 QQ增强 的默认值 2 秒）；填 0 = 立刻。模型开始跑时若还没到点会直接发；机器人要发消息时会取消这条待发的 |
@@ -461,6 +470,74 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 
 ## 更新日志
 
+## 🎛 按钮策略：限次 / 限人 / 截止 / 计数 / 查账（v1.6.32）
+
+> 官方 `action.click_limit` **已弃用**（默认不限）⇒ 平台不提供任何次数/时间限制。
+> 但**每次点击都会推给我们**，所以这套能力只能在插件侧做 —— 也只有插件侧做得成。
+
+### 模型怎么用（写属性就行，零配置）
+
+```xml
+<keyboard max="3" once="1" ttl="600" label="报名" notify_text="报名满啦喵">
+  {"content":{"rows":[{"buttons":[{"id":"b1","render_data":{"label":"报名","style":1},
+   "action":{"type":1,"data":"join","permission":{"type":2}}}]}]}}
+</keyboard>
+```
+
+| 属性 | 含义 |
+|---|---|
+| max | 全局最多接受几次（名额）|
+| per | 每人最多几次 |
+| `once="1"` | 每人只能点一次 |
+| ttl | 从发出起多少秒后截止 |
+| `until="22:30"` | 绝对截止时间（早于当前时间算次日；也支持 ISO 串）|
+| cooldown | 同一人多少秒内的连点只算一次（防连点，且**不计入**次数）|
+| label | 给这次活动起个名字（查账/汇总用）|
+| deliver | `last`（默认，见下）/ `all`（每次有效点击都告诉模型）/ `off`（都不告诉）|
+| hard | `1` 硬拦截（默认，取配置）；`0` 软判定（仍转给模型，正文标注判定）|
+| `notify` / `notify_text` | 截止时给**用户**发一句提示（默认不发；机械文案一向不推荐）|
+| scope | each（默认：**每个按钮各算各的**，一排里「取消」不吃「报名」的名额）/ all（整条键盘共用额度）|
+
+**逐按钮精细策略**写在按钮的 `kirai` 字段里（同一排按钮可以有不同规则）：
+
+```json
+{"id":"b2","render_data":{"label":"候补"},"action":{"type":1,"data":"wait"},
+ "kirai":{"max":2,"per":1,"label":"候补位"}}
+```
+
+### 默认行为：**转达方式＝原来正常的方式** + **硬模式**
+
+* **默认 `deliver=all`**：每次**有效**点击都会转给模型（与旧版完全一致，模型照常接话）；
+* **硬模式（默认开）**：**超过上限 / 已过期 / 重复（once、per、连点保护）**的点击
+  **不再转给模型** —— 这就是「bot 收到的点击有上限」；
+  模型需要时用 `qq_button_stats` 查账（谁点了、剩几个、超额几次都能查）；
+* 触发**截止的那一次**照常转达，并**额外带上汇总**（谁点的、共几次、按钮已截止）；
+* `deliver=last`：只在截止那一次转（更安静，适合只关心「满了/结束了」的场景）；
+* `deliver=off`：一次都不转，纯记账（模型自己查账）；
+* 选了 `last` 但没设任何全局结束点（无 `max`、无 `ttl/until`）时，**自动退化成 `all`** ——
+  否则模型永远收不到消息。
+
+### 模型可以查账、也可以自己管
+
+| 工具 | 作用 |
+|---|---|
+| qq_button_stats | **查对应账**：谁点了、各几次、还剩几个名额、是否已截止、什么时候截止 |
+| qq_button_close | 立刻截止（"报名结束"）|
+| qq_button_reset | 清空计数、重开一轮 |
+| qq_button_extend | 加名额 / 延长时间（"大家太热情，再加三个位置"）|
+
+### 安全与兼容（都做了硬验证）
+
+* **官方兼容性**：所有策略字段在**发送前**被剥离，并做一次**深度清理兜底** ——
+  测试会**深度扫描出站键盘**，断言只含官方字段（防 `40034029 键盘参数错误`）；
+* **不擅改模型载荷**：样式、permission、group_id、modal、click_limit 等一律原样透传；
+* **通信/记账**：消息路径**零 I/O**（内存字典 O(1) 判定，20 万次判定 ≈ 0.5s），
+  落盘由 15s 巡检在**线程**里做，原子替换；
+* **不阻塞**：判定/静默/查账全是内存操作；截止提示 3s 超时且失败只记日志；
+* **可与其它插件共存**：不改核心、不装全局补丁，只在自己收发路径上工作
+  （accelerator / xml_tag_fixer / 队列合并等插件的用例照跑）；
+* **2.x 与 3.0 通用**：策略模块零核心依赖，双世代全套件都绿。
+
 ## 🧭 四个出口疑问（官方口径 + 本插件实现，2026-10-10 逐条核实）
 
 ### 1) 昵称通讯录是持久化的吗？关插件/重启会丢吗？——**不会丢 ✓**
@@ -526,6 +603,87 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.35</b> — 真实场景端到端测试（25 项）+ 抓到并修掉 extend/reset 的真 bug</summary>
+
+### 新增：真实场景测试 `tests/audit_button_scenarios.py`（走完整链路，25 项全过）
+| 场景 | 覆盖 |
+|---|---|
+| S1 群聊「报名」限 3 人 | 前 3 次都转达、第 3 次带「最后一个名额」汇总、第 4/5 人不转、查账 3/3+名单、加名额后又能点 |
+| S2 限时（ttl） | 到点后点击不转、巡检发「已截止」带名单、不重复通知 |
+| S3 每人一次 | 硬模式拦第二次；软模式仍转达并注明「已点过、未计入」 |
+| S4 一排两按钮（scope=each） | 「取消」被点不吃「报名」名额；查账给逐按钮明细 |
+| S5 连点保护 | 5 秒内连点 5 次只算 1 次；冷却过后可再点 |
+| S6 私聊按钮 | 判定正常、策略记为单聊、截止通知按单聊投递 |
+| S7 图+正文+键盘+策略 | 拆两条、策略只登记一次、媒体那条不带策略、出站键盘零私有键 |
+| S8 重启 | 账本落盘→加载：计数/名单/会话类型/适配器都在，继续点仍然正确 |
+
+### 抓到并修复的真 bug
+`extend`（加名额/延时）与 `reset`（重开一轮）只清了**汇总层**计数，
+没清 **scope=each 的逐按钮桶** ⇒ 加了名额之后按钮仍停在「已满」状态、点不动。
+（场景 S1-8 复现 → 已修 → 断言常驻回归。）
+
+### 对照插件源码**实跑**（不再是 skip）
+已把 `accelerator / xml_tag_fixer / session_merger / sustained_chat`
+四个合作插件的源码拉到本机并跑通共存核对（`audit_hooks` 17/17）：
+accelerator 抢发经过 adapter 层（我们能提取标签）、补丁目标不重叠；
+xml_tag_fixer 只改 `resp.text_response`、`after_xml_parse` 只拆 Record、tag_set 只读；
+session_merger `after_xml_parse` 仅 debug、不 monkeypatch 适配器；
+sustained_chat 不 patch 核心发送链。
+
+</details>
+
+<details>
+<summary><b>v1.6.34</b> — 完整审计后的修复：软模式真 bug / 逐按钮限额 / 通知回对会话 / 载荷零污染</summary>
+
+1. **软模式（hard=0）形同虚设**（真 bug）⇒ 改为：硬模式只转被接受的；软模式**全转**（带判定注记）；off 仍不转；
+2. **逐按钮限额**（`scope=each` 默认）：一排按钮互不吃名额；`scope=all` 可整条共用；查账给逐按钮明细；
+3. **截止通知回到正确会话**（真 bug）：记录 `is_group` 与适配器名，私聊不再按群发；
+4. **策略不污染载荷**：声明挂在元素属性 + contextvar 传递 ⇒ payload 零私有键（新增深扫守卫）；
+5. **账本裁剪**：先清已截止/过期的旧账，不动进行中的。
+
+</details>
+
+<details>
+<summary><b>v1.6.33</b> — 更正默认告知方式：<b>deliver=all</b>（原来正常的方式）；硬模式只管「超过上限/过期」</summary>
+
+* 用户澄清：要的不是「中途点击不打扰」，而是**默认照旧每次点击都转达**；
+  **硬模式只负责「超过上限 / 过期 / 重复之后不再转」**；
+* `button_deliver_default` 默认 `last` → **`all`**；`last` / `off` 保留供用户自选；
+* 触发截止的那一次照常转达，并额外带汇总；超额/过期仍硬拦截（默认开）；
+* 其余不变（声明剥离、官方字段深扫、查账工具、双世代全绿）。
+
+</details>
+
+<details>
+<summary><b>v1.6.32</b> — 按钮策略：限次/限人/截止/计数/查账（插件侧，官方 click_limit 已弃用）</summary>
+
+* **声明**：`<keyboard max="3" once="1" ttl="600" until="22:30" cooldown="30" label="报名">`
+  + 逐按钮 `kirai`；发送前**剥离**（出站报文深度扫描只有官方字段）；
+* **默认硬模式 + 安静模式**：`deliver=last` ⇒ 中途点击不打扰模型，
+  只有**触发截止的那一次**带汇总转给模型；超额/过期/重复**不再转**；
+* **机械文案默认不发**（单独开关 + 可自定义文案，逐条可用 `notify_text` 覆盖）；
+* **查账工具**：`qq_button_stats` / `qq_button_close` / `qq_button_reset` / `qq_button_extend`
+  —— 模型能查"谁点了、各几次、剩几个、是否截止"，也能自己截止/重开/加名额；
+* **截止通知**：到点且有人参与的按钮会给模型一条「已截止」；没人点过的**静默关闭**；
+* **账本**：原子落盘（`plugins/<插件ID>/button_policies.json`）、LRU 500、消息路径零 I/O；
+* **测试**：新增 `audit_button_policy.py`（63 条）+ `audit_keyboard_flow` 追加全链路段
+  （含**官方字段深度扫描**与"第 1 次不打扰 / 第 2 次截止转达 / 第 3 次硬拦截"）。
+
+</details>
+
+<details>
+<summary><b>v1.6.31</b> — 自检升级：内存 + 磁盘两边都看，不一致直接点破</summary>
+
+* 启动横幅的「身份改写」自检改为**双源**：
+  * **内存里的函数**（真正在跑的那份，`inspect.getsource`）；
+  * **磁盘上的 main.py**（你刚装进去的那份）；
+  * 两者不一致 ⇒ 明确写出该做什么（典型：`磁盘已是新版，但内存里还在跑旧代码 ⇒ 禁用再启用插件`），
+    这正是「更新了却没变化」的现场；
+* 顺带把内存侧取类的方式做稳（`globals()` 取不到时扫 `sys.modules`）。
+
+</details>
+
+<details>
 <summary><b>v1.6.30</b> — 四问落地：补丁彻底还原（不用再开关适配器）+ 陈旧模块检测 + 点击者真名尽力查 + 按钮权限/上限口径</summary>
 
 * **修「更新必须开关适配器/重载插件」根因**：`terminate()` 彻底还原补丁

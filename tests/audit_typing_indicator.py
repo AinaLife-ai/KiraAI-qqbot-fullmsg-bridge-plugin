@@ -774,6 +774,9 @@ async def main():
             _ok_new, _bad_new = _m29._identity_src_ok(
                 'x = f"{_nick} 点击了"' + "\n" + 'y = f"未知用户({sender_id})"')
             check("★★ 正向判据：含改写片段必须为真（✅）", _ok_new is True and not _bad_new, str(_bad_new))
+            _sc_now = _m29._identity_code_selfcheck()
+            check("★★ 双源自检：内存与磁盘一致时必须为 ✅ 且写明",
+                  str(_sc_now).startswith("✅") and "磁盘" in str(_sc_now), str(_sc_now))
             check("★★ 自检作用于本仓库 main.py 时必须合格",
                   str(_m29._identity_src_ok(open(_BR() + "/main.py", encoding="utf-8").read())[0]) == "True", "")
         except Exception as _e29:

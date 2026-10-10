@@ -220,7 +220,6 @@ class InteractionBridge:
         button_id = str(resolved.get("button_id") or "").strip()
 
         desc = button_data or button_id or "（未命名按钮）"
-        text = f"[按钮] 用户点击了：{desc}"
 
         group_openid = str(body.get("group_openid") or "")
         member_openid = str(body.get("group_member_openid") or "")
@@ -236,6 +235,41 @@ class InteractionBridge:
                     "[QQBOT-BRIDGE] 互动事件缺少会话标识（group_openid/user_openid 都没有），"
                     "无法转成消息：keys=%s", list(body)[:12],
                 )
+            return
+
+        # ★★ v1.6.32：按钮策略判定（限次/限人/截止/计数）—— 全内存 O(1)，不阻塞。
+        _pol = {"policy": None, "verdict": None, "data": button_data,
+                "deliver": True, "note": ""}
+        try:
+            _pol = self.plugin.evaluate_button_click(
+                message_id=str(resolved.get("message_id") or ""),
+                target_id=target_id, button_id=button_id,
+                data=button_data, uid=sender_id,
+            )
+            desc = _pol.get("data") or button_id or "（未命名按钮）"
+        except Exception as exc:                     # noqa: BLE001
+            self.logger.debug("[QQBOT-BRIDGE] 按钮策略判定失败（按未设策略处理）: %s", exc)
+        text = f"[按钮] 用户点击了：{desc}" + str(_pol.get("note") or "")
+
+        if _pol.get("policy") is not None and not _pol.get("deliver"):
+            # 硬拦截：这次点击**不打扰模型**（默认硬模式 + deliver=last 的中间次数）
+            _v = _pol.get("verdict") or {}
+            if not getattr(self, "_policy_quiet_logged", False):
+                self._policy_quiet_logged = True
+                self.logger.info(
+                    "[QQBOT-BRIDGE] 按钮策略生效：本次点击按策略**未转给模型**"
+                    "（deliver=%s；原因=%s）——模型需要时可以用 qq_button_stats 查账",
+                    _v.get("deliver", "-"), _v.get("reason", "-"))
+            # 可选：给用户一句提示（默认关；机械文案一向不推荐，开了才发）
+            if _v.get("notify"):
+                _txt = str(_v.get("notify_text") or "").strip()
+                try:
+                    if _txt:
+                        await self.plugin.send_passive_notice(
+                            client, is_group=is_group, target_id=target_id,
+                            text=_txt, msg_id=str(interaction_id or ""))
+                except Exception as exc:             # noqa: BLE001
+                    self.logger.debug("[QQBOT-BRIDGE] 截止提示发送失败（忽略）: %s", exc)
             return
 
         # ★ 2026-10-10：发布前**尽力**把「这人是谁 / 这是哪个群」补全。

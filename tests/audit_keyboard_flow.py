@@ -586,5 +586,232 @@ check("★★ 非官方 style(9)：统计到 bad_style，且**原值不动**（�
 check("★ 源码里有一次性告警（提示模型/用户官方只有 0/1/3/4）",
       "不是官方值" in open(os.path.join(BR, "main.py"), encoding="utf-8").read())
 
+# --------------------------------------------------------------------------- #
+# [G] 按钮策略**全链路**（v1.6.32）：声明 → 发送 → 登记 → 点击判定 → 官方字段零污染
+# --------------------------------------------------------------------------- #
+print("\n[G] 按钮策略全链路（声明/剥离/登记/判定/官方兼容）")
+try:
+    import smoke_v3 as T3                                      # noqa: E402
+    import main as _bm                                          # noqa: E402
+    from core.chat.message_utils import MessageChain as _C3     # noqa: E402
+    from core.chat.message_elements import Text as _T3          # noqa: E402
+
+    _OFF_G = {"id", "content", "rows", "buttons", "render_data", "label",
+              "visited_label", "style", "action", "type", "data", "permission",
+              "specify_user_ids", "specify_role_ids", "enter", "reply", "anchor",
+              "click_limit", "unsupport_tips", "at_bot_show_channel_list",
+              "group_id", "modal", "confirm_text", "cancel_text"}
+
+    def _deep_d(obj, out):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                out.add(k)
+                _deep_d(v, out)
+        elif isinstance(obj, list):
+            for v in obj:
+                _deep_d(v, out)
+
+    # ---- G1. 标签处理：属性 + JSON kirai ⇒ 剥离干净、声明被藏起来 ----
+    _tag = _bm.KeyboardTag()
+    _kb_raw = _json.dumps({"content": {"rows": [{"buttons": [
+        {"id": "b1", "render_data": {"label": "报名", "style": 1},
+         "action": {"type": 1, "data": "join", "permission": {"type": 2}},
+         "kirai": {"per": 1}},
+    ]}]}}, ensure_ascii=False)
+    _loop_g = asyncio.new_event_loop()
+    try:
+        _els = _loop_g.run_until_complete(_tag.handle(_kb_raw, max="2", once="1",
+                                                      label="报名", ttl="300"))
+    finally:
+        _loop_g.close()
+    _pl = getattr(_els[0], "keyboard", {}) if _els else {}
+    _spec_g = getattr(_els[0], "kirai_spec", {}) if _els else {}
+    check("★★ 标签属性 + JSON kirai 都被采集到声明里",
+          _spec_g.get("max") == 2 and _spec_g.get("once") is True
+          and _spec_g.get("label") == "报名" and _spec_g.get("ttl") == 300
+          and (_spec_g.get("buttons") or {}).get("b1", {}).get("per") == 1, str(_spec_g)[:160])
+    # ★ 审计加强：策略**根本不在载荷里**（挂在元素属性上）⇒ 载荷绝对干净，
+    #   任何路径（含第三方插件"抢先发"）拿到的都只有官方字段。
+    _pk_g = set()
+    _deep_d(_pl, _pk_g)
+    check("★★★ 载荷**零污染**：键盘 payload 里连一个私有键都没有",
+          not (_pk_g - _OFF_G) and "__kirai__" not in _json.dumps(_pl, ensure_ascii=False),
+          str(sorted(_pk_g - _OFF_G)))
+
+    # ---- G2. 真实发送：出站 keyboard **只含官方字段** + 策略已登记 ----
+    async def _real_policy_send():
+        a = T3.make_adapter()
+        a.client.api._http = T3.FakeHTTP({"/files": {"file_info": "FI"}})
+        try:
+            from core.adapter.capabilities import IMCapability
+
+            a.get_capability(IMCapability)._group_reply_ids["GP"] = "MSGID-IN"
+        except Exception:
+            try:
+                a._group_reply_ids["GP"] = "MSGID-IN"
+            except Exception:
+                pass
+        p = T3.make_plugin(a)
+        await p._tick()
+        await a.send_group_message("GP", _C3([
+            _T3("来报名"),
+            _els[0],                          # ← 标签产出的元素（策略挂在它的属性上）
+        ]))
+        return p, [kw for _kind, kw in a.client.api.calls]
+
+    _p3, _calls3 = asyncio.run(_real_policy_send())
+    _kbs = [c.get("keyboard") for c in _calls3 if c.get("keyboard")]
+    check("★★ 带策略的键盘照常发出（没被策略层挡掉）", bool(_kbs), str(len(_calls3)))
+    _keys_g = set()
+    if _kbs:
+        _deep_d(_kbs[0], _keys_g)
+    _extra_g = _keys_g - _OFF_G
+    check("★★★ 官方兼容性：出站键盘**深度扫描只剩官方字段**（防 40034029）",
+          bool(_kbs) and not _extra_g, str(sorted(_extra_g)))
+    _n_pol = len(getattr(_p3.button_policies, "_pol", {}) or {})
+    check("★★ 发送即登记：账本里多了一条策略", _n_pol == 1, f"实际 {_n_pol} 条")
+    _pol_g = list((getattr(_p3.button_policies, "_pol", {}) or {}).values())[0] if _n_pol else {}
+    check("★ 策略参数正确落账（max=2 / once / label=报名）",
+          _pol_g.get("max") == 2 and _pol_g.get("once") is True
+          and _pol_g.get("label") == "报名", str({k: _pol_g.get(k) for k in ("max", "once", "label")}))
+    check("★ 账本按**原始会话 id** 记账（点击端才匹配得上）",
+          _pol_g.get("sid") == "GP", str(_pol_g.get("sid")))
+
+    # ---- G3. 点击判定：默认 last ⇒ 中途不打扰、截止那次带汇总 ----
+    async def _clicks():
+        from interactions import InteractionBridge as _IB3
+
+        waits = []
+
+        async def _ack3(_iid, _code):
+            waits.append(_iid)
+
+        caps = []
+        _p3.publish_synthetic_event = lambda **kw: caps.append(kw) or True
+        br = _IB3(_p3, __import__("logging").getLogger("plugin"))
+        client = _p3._find_adapters()[0][1].get_client()
+        # 桩客户端默认没有 on_interaction_result（真 botpy 有）⇒ 补上以验证回执链路
+        try:
+            client.api.on_interaction_result = _ack3
+        except Exception:
+            pass
+
+        def _body(uid, data):
+            return {"id": f"IT-{uid}", "type": 11,
+                    "data": {"resolved": {"button_id": "b1", "button_data": data}},
+                    "group_openid": "GP", "group_member_openid": uid}
+
+        await br._on_interaction(client, _body("U1", "join"))
+        n_after_1 = len(caps)
+        await br._on_interaction(client, _body("U2", "join"))
+        n_after_2 = len(caps)
+        await br._on_interaction(client, _body("U3", "join"))
+        n_after_3 = len(caps)
+        return caps, n_after_1, n_after_2, n_after_3, len(waits)
+
+    _caps3, _n1, _n2, _n3, _acks3 = asyncio.run(_clicks())
+    check("★★ 默认 deliver=all：第 1 次点击照常转给模型（与旧版一致）",
+          _n1 == 1, f"publish 次数={_n1}")
+    check("★★ 第 2 次（最后一个名额）也转（截止那次还带汇总）", _n2 == 2, f"{_n1}→{_n2}")
+    check("★★ 满额后的第 3 次**不再转**（硬拦截默认开 ＝ bot 收到的点击有上限）",
+          _n3 == 2, f"{_n2}→{_n3}")
+    _txt_g = str((_caps3[-1] if _caps3 else {}).get("text") or "")
+    check("★★ 截止那次带汇总（谁点的 + 计数 + 已截止）",
+          "最后一个名额" in _txt_g or "已截止" in _txt_g, _txt_g[:160])
+    check("★ 回执仍照发（官方 3 秒硬要求不受策略影响）", _acks3 == 3, str(_acks3))
+
+    # ---- G3b. 软模式（hard=0）必须把"被拒绝的点击"也转给模型 ----
+    async def _soft():
+        from interactions import InteractionBridge as _IB4
+
+        async def _ack4(_i, _c):
+            return None
+
+        a = T3.make_adapter()
+        a.client.api._http = T3.FakeHTTP({"/files": {"file_info": "FI"}})
+        try:
+            from core.adapter.capabilities import IMCapability
+
+            a.get_capability(IMCapability)._group_reply_ids["GS"] = "MSG-IN"
+        except Exception:
+            pass
+        p = T3.make_plugin(a)
+        await p._tick()
+        client = a.get_client()
+        try:
+            client.api.on_interaction_result = _ack4
+        except Exception:
+            pass
+        kb, spec = _bm.button_policy.split_keyboard_declaration(
+            {"content": {"rows": [{"buttons": [
+                {"id": "q1", "render_data": {"label": "抢"},
+                 "action": {"type": 1, "data": "go"}}]}]}},
+            {"max": "1", "hard": "0", "deliver": "all", "label": "软测"})
+        m = _bm.KeyboardMarker(kb)
+        m.kirai_spec = spec
+        await a.send_group_message("GS", _C3([_T3("来"), m]))
+        caps = []
+        p.publish_synthetic_event = lambda **kw: caps.append(kw) or True
+        br = _IB4(p, __import__("logging").getLogger("plugin"))
+        body = lambda uid: {"id": f"IT-{uid}", "type": 11,
+                            "data": {"resolved": {"button_id": "q1", "button_data": "go"}},
+                            "group_openid": "GS", "group_member_openid": uid}
+        await br._on_interaction(client, body("S1"))     # 名额 1 用掉
+        await br._on_interaction(client, body("S2"))     # 超额
+        await br._on_interaction(client, body("S3"))     # 超额
+        return caps
+
+    _caps_soft = asyncio.run(_soft())
+    _n_soft = len(_caps_soft)
+    check("★★★ 软模式（hard=0）：超额点击**仍然转给模型**并带判定注记",
+          _n_soft == 3 and "名额已满" in str((_caps_soft[-1] if _caps_soft else {}).get("text")),
+          f"转达 {_n_soft} 次；末条={str((_caps_soft[-1] if _caps_soft else {}).get('text'))[:90]}")
+
+    # ---- G3c. 截止通知必须回**正确会话类型**（审计修正：原来固定 group） ----
+    try:
+        import time as _t6
+
+        _pol_dm = _p3.button_policies.register("DM-USER", {"ttl": 1, "label": "私聊限时"},
+                                               is_group=False, adapter="qqo")
+        _p3.button_policies.decide(_pol_dm, "U9")
+        check("截止通知：没到点不发", _p3.policy_close_notices() == [], "")
+        _pol_dm["until"] = _t6.time() - 1
+        _pol_dm["notified"] = False
+        _nt = _p3.policy_close_notices()
+        check("★★ 截止通知带正确会话类型（私聊 ⇒ is_group=False）且带适配器名",
+              len(_nt) == 1 and _nt[0]["is_group"] is False and _nt[0]["adapter"] == "qqo",
+              str(_nt[:1])[:170])
+    except Exception as _e6b:
+        check("截止通知用例", False, f"{type(_e6b).__name__}: {_e6b}")
+
+    # ---- G4. 查账工具：能量到这本账 ----
+    try:
+        import button_tools as _BT3
+
+        class _Ev:
+            session = type("S", (), {"session_id": "qq:gm:GP", "session_type": "gm"})()
+
+            class ctx:                                       # noqa: N801
+                @staticmethod
+                def get_plugin_inst(_pid):
+                    return _p3
+
+        _ev = _Ev()
+        _tool = _BT3.QQButtonStatsTool(ctx=_Ev.ctx)
+        _out = asyncio.run(_tool.execute(_ev))
+        check('★★ 查账工具：能按会话定位到这本账（不再"乱猜"）',
+              "已点" in _out and "报名" in _out, str(_out)[:160])
+        check("★★ 查账内容含参与者与状态", ("U1" in _out or "未知用户" in _out)
+              and ("已截止" in _out or "剩 0" in _out), str(_out)[:200])
+    except Exception as _e_tool:
+        check("查账工具用例", False, f"{type(_e_tool).__name__}: {_e_tool}")
+
+    # ---- G5. 2.x 侧同样可用（策略层不依赖世代） ----
+    check("★ 策略模块无核心依赖（2.x/3.0 通用）",
+          "import core" not in open(os.path.join(BR, "button_policy.py"),
+                                    encoding="utf-8").read(), "")
+except Exception as _e_g:
+    check("按钮策略全链路段执行", False, f"{type(_e_g).__name__}: {_e_g}")
+
 print(f"\n结果：{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
