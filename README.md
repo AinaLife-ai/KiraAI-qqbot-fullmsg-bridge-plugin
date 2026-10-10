@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.37
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.38
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,20 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.38</b> — `<markdown>` 标签描述也瘦身（461 → 371 字符，能力与引导零丢失）</summary>
+
+* 删掉重复表述（音视频那段的"直链"说了两遍）、压缩场景枚举；
+* **逐项核对 23 个要点全部保留**：能力清单（标题/加粗/斜体/删除线/链接/图片/有序无序列表/
+  代码块/块引用/分割线）、适用场景、必须用 `<markdown>` 包裹、别写 `<text>`、别转义、
+  平台不支持任何 HTML 标签（audio/video/img/div）、音视频给**可点击直链**、
+  图片 `![描述](地址)` 自动转公网、不要手写 `qqbot-at-user` 之类的 @ 标记；
+* 至此我们插件占用的**静态前缀**（每轮都进提示词）合计：
+  **4704 → 2455 字符**（工具 824 + keyboard 1260 + markdown 371），
+  **省 2249 字符 ≈ 1120 tokens/轮**。
+
+</details>
+
+<details>
 <summary><b>v1.6.37</b> — 四个按钮工具**合并成一个** `qq_button`（省 56% schema 体积）+ 描述精简</summary>
 
 * **合并**：`qq_button_stats / close / reset / extend` → **`qq_button`**，用 `action` 传参
