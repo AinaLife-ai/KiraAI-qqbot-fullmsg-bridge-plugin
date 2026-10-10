@@ -543,6 +543,14 @@ class ButtonPolicyStore:
         pol["closed_at"] = 0.0
         pol["notified"] = False
         pol["created"] = now if now is not None else time.time()
+        # ★ 场景测试抓到的 bug：scope=each 时计数在**逐按钮桶**里，
+        #   只清汇总层 ⇒ 重开后按钮依然是"已满"状态（点了不动）。
+        for bucket in (pol.get("btn") or {}).values():
+            bucket["total"] = 0
+            bucket["users"] = {}
+            bucket["closed"] = False
+            bucket["closed_reason"] = ""
+            bucket["closed_at"] = 0.0
         self._dirty = True
         return True
 
@@ -558,12 +566,20 @@ class ButtonPolicyStore:
             if int(pol["max"]) > int(pol.get("total") or 0):
                 pol["closed"] = False
                 pol["closed_reason"] = ""
+            # ★ 同上的 bug：逐按钮桶里"已满"的标记要一起清，否则加了名额也点不动
+            for bucket in (pol.get("btn") or {}).values():
+                if int(pol["max"]) > int(bucket.get("total") or 0):
+                    bucket["closed"] = False
+                    bucket["closed_reason"] = ""
         if minutes:
             base = float(pol.get("until") or 0) or now
             pol["until"] = max(base, now) + int(minutes) * 60.0
             if float(pol["until"]) > now:
                 pol["closed"] = False
                 pol["closed_reason"] = ""
+                for bucket in (pol.get("btn") or {}).values():
+                    bucket["closed"] = False
+                    bucket["closed_reason"] = ""
             pol["notified"] = False
         self._dirty = True
         return True

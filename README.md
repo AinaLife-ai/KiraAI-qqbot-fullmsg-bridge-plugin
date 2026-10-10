@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.34
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.35
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -603,6 +603,36 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.35</b> — 真实场景端到端测试（25 项）+ 抓到并修掉 extend/reset 的真 bug</summary>
+
+### 新增：真实场景测试 `tests/audit_button_scenarios.py`（走完整链路，25 项全过）
+| 场景 | 覆盖 |
+|---|---|
+| S1 群聊「报名」限 3 人 | 前 3 次都转达、第 3 次带「最后一个名额」汇总、第 4/5 人不转、查账 3/3+名单、加名额后又能点 |
+| S2 限时（ttl） | 到点后点击不转、巡检发「已截止」带名单、不重复通知 |
+| S3 每人一次 | 硬模式拦第二次；软模式仍转达并注明「已点过、未计入」 |
+| S4 一排两按钮（scope=each） | 「取消」被点不吃「报名」名额；查账给逐按钮明细 |
+| S5 连点保护 | 5 秒内连点 5 次只算 1 次；冷却过后可再点 |
+| S6 私聊按钮 | 判定正常、策略记为单聊、截止通知按单聊投递 |
+| S7 图+正文+键盘+策略 | 拆两条、策略只登记一次、媒体那条不带策略、出站键盘零私有键 |
+| S8 重启 | 账本落盘→加载：计数/名单/会话类型/适配器都在，继续点仍然正确 |
+
+### 抓到并修复的真 bug
+`extend`（加名额/延时）与 `reset`（重开一轮）只清了**汇总层**计数，
+没清 **scope=each 的逐按钮桶** ⇒ 加了名额之后按钮仍停在「已满」状态、点不动。
+（场景 S1-8 复现 → 已修 → 断言常驻回归。）
+
+### 对照插件源码**实跑**（不再是 skip）
+已把 `accelerator / xml_tag_fixer / session_merger / sustained_chat`
+四个合作插件的源码拉到本机并跑通共存核对（`audit_hooks` 17/17）：
+accelerator 抢发经过 adapter 层（我们能提取标签）、补丁目标不重叠；
+xml_tag_fixer 只改 `resp.text_response`、`after_xml_parse` 只拆 Record、tag_set 只读；
+session_merger `after_xml_parse` 仅 debug、不 monkeypatch 适配器；
+sustained_chat 不 patch 核心发送链。
+
+</details>
+
+<details>
 <summary><b>v1.6.34</b> — 完整审计后的修复：软模式真 bug / 逐按钮限额 / 通知回对会话 / 载荷零污染</summary>
 
 1. **软模式（hard=0）形同虚设**（真 bug）⇒ 改为：硬模式只转被接受的；软模式**全转**（带判定注记）；off 仍不转；
