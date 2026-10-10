@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.38
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.39
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,19 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.39</b> — 代际接线对齐审计 + 昵称学习补到 3.0 + 会话双标识（名称 + openid）</summary>
+
+* **修真缺口**：昵称学习器原来只挂在 2.x 的消息接管路径 ⇒ 3.0 上通讯录一直没人喂
+  （线上表现为按钮点击/查账全显示「未知用户」）⇒ 改走两代通用的 `on_llm_request`；
+* **新增 `tests/audit_generation_parity.py`**（16 项 × 两代各跑一遍）：
+  两代都必须有的 8 项能力 + 代际专属规则 + **不重复接管核心**的结构性不变量；
+* **会话区分而非隔离**：账本记名称 + openid **双标识**（`[绿岛酒吧 · D593FBB0]`），
+  支持 `scope=all` 跨会话查询、`session=<openid前缀>` 点名（防重名/防查不到）；
+* 顺带修了自己新代码里写死适配器名的问题（被自家守卫测试拦下）。
+
+</details>
+
+<details>
 <summary><b>v1.6.38</b> — `<markdown>` 标签描述也瘦身（461 → 371 字符，能力与引导零丢失）</summary>
 
 * 删掉重复表述（音视频那段的"直链"说了两遍）、压缩场景枚举；

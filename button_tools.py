@@ -70,6 +70,9 @@ class QQButtonTool(BaseTool):
             "add_slots": {"type": "integer", "description": "extend: 加几个名额"},
             "minutes": {"type": "integer", "description": "extend: 延时分钟"},
             "reason": {"type": "string", "description": "close: 原因（可省）"},
+            "scope": {"type": "string", "enum": ["session", "all"],
+                      "description": "查找范围：session=当前会话（默认）；all=所有会话"},
+            "session": {"type": "string", "description": "目标会话 openid 前缀（防重名时点名）"},
         },
         "required": ["action"],
     }
@@ -119,13 +122,16 @@ class QQButtonTool(BaseTool):
         return out
 
     def _locate(self, event, *, button_id: str = "", message_id: str = "",
-                label: str = "") -> Tuple[Optional[Any], List[Any], str]:
+                label: str = "", scope: str = "session",
+                sid_prefix: str = "") -> Tuple[Optional[Any], List[Any], str]:
+        """定位一本账。`scope=all` 时可跨会话（候选会带会话标签，便于区分）。"""
         plugin, store = self._store(event)
         if store is None:
             return None, [], "按钮账本未启用（或插件未加载）。"
+        _scope = str(scope or "session").lower()
         for sid in self._sids(event):
             hit, cands = store.find(sid, button_id=button_id, message_id=message_id,
-                                    label=label)
+                                    label=label, scope=_scope, sid_prefix=sid_prefix)
             if hit is not None:
                 return hit, cands, ""
             if cands:
@@ -137,17 +143,28 @@ class QQButtonTool(BaseTool):
                 break
         if recent:
             return None, recent, "当前会话下没找到匹配的按钮账本，这是最近的几条："
+        if _scope == "all":
+            _all = []
+            try:
+                _all = store.list_for("", all_sessions=True)[:8]
+            except Exception:
+                _all = []
+            if _all:
+                return None, _all, "当前会话没有；这是**其它会话**里的按钮账本（看方括号里的会话名）："
         return None, [], "当前会话下没有按钮账本（这个会话还没发过带策略的按钮？）"
 
     @staticmethod
     def _candidate_text(cands: List[Any], head: str = "") -> str:
         import time as _t
 
-        lines = [head or "命中不唯一，从下面挑一个（下次带上 label 或 message_id）："]
+        lines = [head or "命中不唯一，从下面挑一个（下次带上 label / message_id / scope=all）："]
         for p in cands:
             lab = p.get("label") or "（无名字）"
+            sess = str(p.get("session") or "").strip() or (str(p.get("sid") or "")[:12] + "…")
             when = _t.strftime("%m-%d %H:%M", _t.localtime(float(p.get("created") or 0)))
-            lines.append(f"- {lab}｜已点 {int(p.get('total') or 0)} 次"
+            _sid_short = str(p.get("sid") or "")[:8]
+            _sess2 = f"{sess} · {_sid_short}" if sess and _sid_short else (sess or _sid_short)
+            lines.append(f"- [{_sess2}] {lab}｜已点 {int(p.get('total') or 0)} 次"
                          f"｜{'已截止' if p.get('closed') else '进行中'}｜{when}")
         return "\n".join(lines)
 
@@ -155,17 +172,17 @@ class QQButtonTool(BaseTool):
     async def execute(self, event, *args, action: str = "stats", label: str = "",
                       button_id: str = "", message_id: str = "", limit: int = 20,
                       add_slots: int = 0, minutes: int = 0, reason: str = "",
-                      **kwargs) -> str:
+                      scope: str = "session", session: str = "", **kwargs) -> str:
         act = str(action or "stats").strip().lower()
         if act not in ("stats", "close", "reset", "extend"):
             return f"未知 action={action}（可用：stats / close / reset / extend）"
         try:
             if act == "stats":
                 return self._stats(event, label=label, button_id=button_id,
-                                   message_id=message_id, limit=limit)
+                                   message_id=message_id, limit=limit, scope=scope, sid_prefix=session)
             if act == "close":
                 return self._close(event, label=label, button_id=button_id,
-                                   message_id=message_id, reason=reason)
+                                   message_id=message_id, reason=reason, scope=scope, sid_prefix=session)
             if act == "reset":
                 return self._reset(event, label=label, button_id=button_id,
                                    message_id=message_id)
@@ -176,12 +193,14 @@ class QQButtonTool(BaseTool):
             return f"执行失败：{type(exc).__name__}: {exc}"
 
     # ------------------------------------------------------------------ #
-    def _stats(self, event, *, label, button_id, message_id, limit) -> str:
+    def _stats(self, event, *, label, button_id, message_id, limit, scope="session",
+               sid_prefix="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "查账失败：按钮账本未启用。"
         hit, cands, head = self._locate(event, button_id=button_id,
-                                        message_id=message_id, label=label)
+                                        message_id=message_id, label=label, scope=scope,
+                sid_prefix=sid_prefix)
         if hit is None:
             return self._candidate_text(cands, head) if cands else head
         import button_policy as BP
@@ -196,36 +215,42 @@ class QQButtonTool(BaseTool):
 
         return BP.render_stats_text(store.stats(hit, limit=lim), name_of=_name)
 
-    def _close(self, event, *, label, button_id, message_id, reason) -> str:
+    def _close(self, event, *, label, button_id, message_id, reason, scope="session",
+               sid_prefix="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "截止失败：按钮账本未启用。"
         hit, cands, head = self._locate(event, button_id=button_id,
-                                        message_id=message_id, label=label)
+                                        message_id=message_id, label=label, scope=scope,
+                sid_prefix=sid_prefix)
         if hit is None:
             return self._candidate_text(cands, head) if cands else head
         store.close(hit["key"], str(reason or "manual"))
         return (f"已截止「{hit.get('label') or hit['key']}」：共被点 "
                 f"{int(hit.get('total') or 0)} 次、{len(hit.get('users') or {})} 人参与。")
 
-    def _reset(self, event, *, label, button_id, message_id) -> str:
+    def _reset(self, event, *, label, button_id, message_id, scope="session",
+               sid_prefix="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "重置失败：按钮账本未启用。"
         hit, cands, head = self._locate(event, button_id=button_id,
-                                        message_id=message_id, label=label)
+                                        message_id=message_id, label=label, scope=scope,
+                sid_prefix=sid_prefix)
         if hit is None:
             return self._candidate_text(cands, head) if cands else head
         old = int(hit.get("total") or 0)
         store.reset(hit["key"])
         return f"已重置「{hit.get('label') or hit['key']}」（原计数 {old} 已清空，按钮重新可用）。"
 
-    def _extend(self, event, *, label, button_id, message_id, add_slots, minutes) -> str:
+    def _extend(self, event, *, label, button_id, message_id, add_slots, minutes,
+                scope="session", sid_prefix="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "调整失败：按钮账本未启用。"
         hit, cands, head = self._locate(event, button_id=button_id,
-                                        message_id=message_id, label=label)
+                                        message_id=message_id, label=label, scope=scope,
+                sid_prefix=sid_prefix)
         if hit is None:
             return self._candidate_text(cands, head) if cands else head
         if not add_slots and not minutes:

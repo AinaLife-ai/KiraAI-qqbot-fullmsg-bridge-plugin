@@ -125,7 +125,7 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "audit_llm_stream_bridge.py", "audit_sticker.py",
           "audit_media_guard.py", "audit_voice_trim.py", "audit_keyboard_flow.py",
           "audit_interactions.py", "audit_wiring.py", "audit_button_policy.py",
-          "audit_button_scenarios.py"]
+          "audit_button_scenarios.py", "audit_generation_parity.py"]
 
 rc = 0
 for suite in SUITES:

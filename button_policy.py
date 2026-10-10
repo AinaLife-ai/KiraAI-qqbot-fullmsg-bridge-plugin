@@ -244,7 +244,8 @@ class ButtonPolicyStore:
     def register(self, sid: str, spec: Optional[Dict[str, Any]], *,
                  now: Optional[float] = None, token: bool = False,
                  button_ids: Optional[List[str]] = None,
-                 is_group: bool = True, adapter: str = "") -> Optional[dict]:
+                 is_group: bool = True, adapter: str = "",
+                 session_label: str = "") -> Optional[dict]:
         """为一条**即将发出的**消息登记策略。没声明就返回 None（零开销路径）。"""
         if not spec:
             return None
@@ -297,6 +298,8 @@ class ButtonPolicyStore:
             "buttons": merged.get("buttons") or {},
             #: 本条消息里**所有**按钮 id（兜底匹配用；含没写逐按钮策略的）
             "button_ids": [str(b) for b in (button_ids or []) if str(b)],
+            #: 会话标签（群名 / "私聊"）—— 查账时展示，用来**区分**不同会话
+            "session": str(session_label or ""),
             "total": 0,
             "users": {},
             "msgs": [],
@@ -393,7 +396,8 @@ class ButtonPolicyStore:
         verdict: Dict[str, Any] = {
             "accepted": False, "reason": "ok", "closing": False, "hard": bool(pol.get("hard")),
             "notify": bool(pol.get("notify")), "notify_text": pol.get("notify_text") or "",
-            "label": pol.get("label") or "", "total": pol.get("total", 0),
+            "label": pol.get("label") or "",
+            "session": pol.get("session") or "", "total": pol.get("total", 0),
             "remaining": None, "user_count": 0, "closed": bool(pol.get("closed")),
             "deliver": self._effective_deliver(pol),
         }
@@ -588,11 +592,11 @@ class ButtonPolicyStore:
     # 查账
     # ------------------------------------------------------------------ #
     def list_for(self, sid: str, *, active_only: bool = False,
-                 now: Optional[float] = None) -> List[dict]:
+                 now: Optional[float] = None, all_sessions: bool = False) -> List[dict]:
         now = now if now is not None else time.time()
         out = []
         for pol in self._pol.values():
-            if pol.get("sid") != sid:
+            if not all_sessions and pol.get("sid") != sid:
                 continue
             if active_only and (pol.get("closed") or
                                 (float(pol.get("until") or 0) and now > float(pol["until"]))):
@@ -602,10 +606,16 @@ class ButtonPolicyStore:
         return out
 
     def find(self, sid: str, button_id: str = "", message_id: str = "",
-             label: str = "", *, now: Optional[float] = None) -> Tuple[Optional[dict], List[dict]]:
-        """按"当前会话 + 按钮/消息/名字"定位**对应那一本账**。
+             label: str = "", *, now: Optional[float] = None,
+             scope: str = "session", sid_prefix: str = "") -> Tuple[Optional[dict], List[dict]]:
+        """按"会话 + 按钮/消息/名字"定位**对应那一本账**。
 
         返回 ``(命中, 候选列表)``：唯一命中就给策略；否则给候选让模型自己挑。
+
+        ★ 会话是**区分**而非隔离（2026-10-11 用户澄清）：
+          * `scope="session"`（默认）：优先在当前会话里找（最常见、最不容易搞错）；
+          * `scope="all"`：跨会话查找 —— **当前会话的排前面**，其余带上会话标签，
+            模型一眼能看出"这本账属于哪个群/哪次私聊"。
         """
         now = now if now is not None else time.time()
         if message_id:
@@ -613,6 +623,15 @@ class ButtonPolicyStore:
             if key and key in self._pol:
                 return self._pol[key], []
         cands = self.list_for(sid, now=now)
+        _pfx = str(sid_prefix or "").strip()
+        if _pfx:
+            # 明确按会话 openid 点名（防重名/跨会话）⇒ 在所有会话里按前缀精确挑
+            _all = self.list_for("", now=now, all_sessions=True)
+            cands = [p for p in _all if str(p.get("sid") or "").startswith(_pfx)] or _all
+        elif str(scope or "session").lower() == "all":
+            _seen = {p.get("key") for p in cands}
+            cands = cands + [p for p in self.list_for("", now=now, all_sessions=True)
+                             if p.get("key") not in _seen]
         if button_id:
             _hit = [p for p in cands
                     if button_id in (p.get("buttons") or {})
@@ -644,6 +663,7 @@ class ButtonPolicyStore:
             "scope": str(pol.get("scope") or "each"),
             "buttons": btn_bits,
             "key": pol.get("key"), "sid": pol.get("sid"), "label": pol.get("label") or "",
+            "session": pol.get("session") or "",
             "total": int(pol.get("total") or 0),
             "remaining": max(0, mx - int(pol.get("total") or 0)) if mx else None,
             "max": mx or None, "per": int(pol.get("per") or 0) or None,
@@ -921,7 +941,18 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
     """把 `stats()` 的字典渲染成一段给模型看的**紧凑**中文。"""
     now = now if now is not None else time.time()
     label = st.get("label") or st.get("key") or "按钮"
-    head = f"【按钮账】{label}（{st.get('key')}）"
+    # ★ 会话**双标识**：名称（人看）+ openid 前 8 位（防重名、bot 也能点名）
+    _sess = str(st.get("session") or "").strip()
+    _sid_short = str(st.get("sid") or "")[:8]
+    if _sess and _sid_short:
+        _prefix = f"[{_sess} · {_sid_short}] "
+    elif _sid_short:
+        _prefix = f"[{_sid_short}] "
+    elif _sess:
+        _prefix = f"[{_sess}] "
+    else:
+        _prefix = ""
+    head = f"【按钮账】{_prefix}{label}（{st.get('key')}）"
     bits = [f"已点 {st.get('total', 0)} 次"]
     if st.get("max"):
         bits.append(f"名额 {st['total']}/{st['max']}，剩 {st.get('remaining', 0)}")
