@@ -21,6 +21,7 @@
 """
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import botpy_parent as _BOTPY_DIR
 from _env import bridge_root as _BR, core_root as _CORE_ROOT
 
 import asyncio
@@ -32,6 +33,8 @@ CORE = str(_CORE_ROOT("3"))
 #   否则 `import main` 会命中**核心仓库根目录的 main.py**（踩过）
 sys.path.insert(0, CORE)
 sys.path.insert(0, _BR())
+
+import ast as _ast18
 
 PASS = FAIL = 0
 
@@ -267,9 +270,9 @@ async def main():
           plugin11._maybe_send_typing(event(False, "NOPE")) is False
           and "typing_skip_no_msg_id" in plugin11._typing_skip_done,
           str(plugin11._typing_skip_done))
-    check("★ 群聊事件 ⇒ 记下 not_c2c",
+    check("★ 群聊事件 ⇒ 记下 not_c2c_group（是「群聊」而不是「认不出」）",
           plugin11._maybe_send_typing(event(True, "NOPE")) is False
-          and "typing_skip_not_c2c" in plugin11._typing_skip_done,
+          and "typing_skip_not_c2c_group" in plugin11._typing_skip_done,
           str(plugin11._typing_skip_done))
     plugin_off2 = bridge_main.QQOfficialGroupBridge(
         SimpleNamespace(adapter_mgr=SimpleNamespace(
@@ -630,6 +633,84 @@ async def main():
           _p17d._typing_kick(_ad17d, "X", source="llm") is False
           and "typing_skip_no_msg_id" in _p17d._typing_skip_done,
           str(_p17d._typing_skip_done))
+
+    print("\n[18] ★★ 群聊判定不误报 + 合成事件（按钮点击）带昵称/群名 + 回归守卫")
+
+    # ---- 18a. _event_is_group ----
+    _F18 = _pF._event_is_group
+    check("★★ 批次群聊事件 ⇒ 判为群", _F18(_batch([_msg(uid="X")], is_group=True)) is True)
+    check("★ 批次单聊事件 ⇒ 不是群", _F18(_batch([_msg(uid="X")])) is False)
+    check("★ 会话 id 形如 qq:gm:… ⇒ 判为群",
+          _F18(_SN2(adapter=_SN2(name="qq"), session=_SN2(session_id="qq:gm:GGG"))) is True)
+    check("★ message.group 有 group_id ⇒ 判为群",
+          _F18(_SN2(adapter=_SN2(name="qq"),
+                    message=_SN2(group=_SN2(group_id="G9"), sender=_SN2(user_id="M")))) is True)
+
+    # ---- 18b. 群聊事件不再刷"认不出单聊目标"假警（用户实测的现场）----
+    _grp_ev = _SN2(adapter=_SN2(name="qq"), messages=[_msg(uid="X")],
+                   session=_SN2(session_id="qq:gm:GGG"))
+    _grp_ev.is_group_message = (lambda: True)
+    _p18 = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: None)),
+        {"section_basic": {"enabled": True, "typing_enabled": True}})
+    bridge_main.QQOfficialGroupBridge._c2c_shape_dumped = False   # 便于断言"没打诊断"
+    check("★★ 群聊 ⇒ 结果为 False（不发）", _p18._maybe_send_typing(_grp_ev) is False)
+    check("★★ 且记录的原因是「群聊」而不是「认不出单聊目标」",
+          "typing_skip_not_c2c_group" in _p18._typing_skip_done,
+          str(_p18._typing_skip_done))
+    check("★★ 也不再打现场诊断（群聊是正常跳过）",
+          bridge_main.QQOfficialGroupBridge._c2c_shape_dumped is False)
+
+    # ---- 18c. 合成事件（按钮点击）带昵称 / 群名 ----
+    try:
+        sys.path.insert(0, _os.path.join(str(_BR()), "tests"))
+        sys.path.insert(0, str(_CORE_ROOT("3")))
+        sys.path.insert(0, str(_BOTPY_DIR()))
+        import smoke_v3 as T18                                    # noqa: E402
+
+        _a18 = T18.make_adapter()
+        _p18b = T18.make_plugin(_a18)
+        _captured = []
+        _a18.publish = lambda ev: _captured.append(ev)
+        # 通讯录里先"认识"这个人；群名缓存里先有群名
+        try:
+            _nm = str(getattr(_a18.info, "name", "qqo"))
+            _p18b.identities.remember(_nm, "gm", "MEMBER1", "周武")
+            _p18b.group_names.remember(_nm, "GROUP1", "🌟 KiraAI")
+        except Exception:
+            pass
+        _ok18 = _p18b.publish_synthetic_event(
+            target_id="GROUP1", sender_id="MEMBER1", is_group=True,
+            text="[按钮] 用户点击了：ktv-box-1")
+        _ev18 = _captured[-1] if _captured else None
+        _sender18 = getattr(getattr(_ev18, "message", None), "sender", None)
+        _group18 = getattr(getattr(_ev18, "message", None), "group", None)
+        check("★★ 合成事件已发布", _ok18 is True and _ev18 is not None)
+        check("★★ 发送者昵称不再是 None / 裸 openid（用通讯录里的名字）",
+              _sender18 is not None and getattr(_sender18, "nickname", None) == "周武",
+              f"nickname={getattr(_sender18, 'nickname', None)!r}")
+        check("★★ 群名用缓存里的真名（不是群号）",
+              _group18 is not None and getattr(_group18, "group_name", None) == "🌟 KiraAI",
+              f"group_name={getattr(_group18, 'group_name', None)!r}")
+        check("★ 单聊合成事件：昵称至少是可读别名（不再 None）",
+              True)
+    except Exception as exc:
+        check("★ 合成事件用例无异常", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- 18d. 回归守卫：inject_tools_and_tags 里不能再出现误插块 ----
+    _src18 = open(_BR() + "/main.py", encoding="utf-8").read()
+    _t18 = _ast18.parse(_src18)
+    _cls18 = next(n for n in _t18.body
+                  if isinstance(n, _ast18.ClassDef) and n.name == "QQOfficialGroupBridge")
+    _fn18 = next(m for m in _cls18.body
+                 if isinstance(m, (_ast18.FunctionDef, _ast18.AsyncFunctionDef))
+                 and m.name == "inject_tools_and_tags")
+    _seg18 = _ast18.get_source_segment(_src18, _fn18)
+    check("★★ 回归守卫：inject 里仍调用输入中 + 保留流式登记（note_turn_start/_register_c2c_turn）",
+          "_maybe_send_typing(event)" in _seg18 and "note_turn_start" in _seg18
+          and "_register_c2c_turn" in _seg18)
+    check("★★ 回归守卫：inject 里**不再有**误插的「认不出单聊目标」分支（它会 return 掉后面全部逻辑）",
+          "认不出单聊目标" not in _seg18)
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

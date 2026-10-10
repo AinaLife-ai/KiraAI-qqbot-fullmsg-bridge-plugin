@@ -1031,29 +1031,6 @@ class QQOfficialGroupBridge(BasePlugin):
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
         # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
-        try:
-            target = self._c2c_target_of(event)
-            adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
-            if not target:
-                self._typing_skip(
-                    "not_c2c",
-                    "认不出单聊目标（官方 msg_type=6 只支持单聊）—— 已附带现场诊断，"
-                    "请把这条反馈")
-                self._dump_c2c_shape_once(event, logger)
-                return False
-            if not adapter_name:
-                self._typing_skip("no_adapter_name",
-                                  "事件里没有适配器名（adapter.name 为空）")
-                self._dump_c2c_shape_once(event, logger)
-                return False
-            adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
-            if adapter is None:
-                self._typing_skip("no_adapter", "适配器 %s 还没就绪", adapter_name)
-                return False
-            # ★ 统一走 `_typing_kick`（与「消息刚到时」那条路共用同一套门禁）
-            return self._typing_kick(adapter, target, source="llm")
-        except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
         # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
         try:
             target = self._c2c_target_of(event)
@@ -1154,6 +1131,36 @@ class QQOfficialGroupBridge(BasePlugin):
                 profile = detect_profile(adapter)
             types = message_types_of(adapter, profile) or ["text"]
             ts = int(time.time())
+            # ★★ 2026-10-10（用户实测）：按钮点击这类**合成事件**以前
+            #   `sender.nickname=None`、群名也可能取不到 ⇒ 日志与历史里全是 openid，
+            #   模型分不清"是谁、在哪个群"。现在复用与正常消息**同一套来源**：
+            #     * 昵称：跨场景通讯录（IdentityStore）→ 兜底 stable_alias(uid)；
+            #     * 群名：群名缓存；取不到就**后台补拉一次**（下次点击就有名字）。
+            _nick = ""
+            try:
+                _nick = self.identities.remember(
+                    adapter_name, "gm" if is_group else "dm", str(sender_id), "") or ""
+            except Exception:
+                _nick = ""
+            if not _nick:
+                try:
+                    from identity_shared import stable_alias as _stable_alias
+
+                    _nick = _stable_alias(str(sender_id))
+                except Exception:
+                    _nick = str(sender_id)
+            _gname = ""
+            if is_group:
+                try:
+                    _gname = self.group_names.lookup(adapter_name, str(target_id)) or ""
+                except Exception:
+                    _gname = ""
+                if not _gname:
+                    try:
+                        self._prefetch_group_names(
+                            adapter, adapter_name, getattr(adapter, "client", None))
+                    except Exception:
+                        pass
             try:
                 event = KiraMessageEvent(
                     adapter=adapter.info,
@@ -1162,10 +1169,9 @@ class QQOfficialGroupBridge(BasePlugin):
                         timestamp=ts,
                         group=Group(
                             group_id=str(target_id),
-                            group_name=self.group_names.lookup(adapter_name, str(target_id))
-                            or str(target_id),
+                            group_name=_gname or str(target_id),
                         ) if is_group else None,
-                        sender=User(user_id=str(sender_id), nickname=None),
+                        sender=User(user_id=str(sender_id), nickname=_nick),
                         is_mentioned=True,
                         is_notice=is_notice,
                         # ★ 非空占位：空串会被渲染成 `[message_id: ]`，
@@ -2414,6 +2420,44 @@ class QQOfficialGroupBridge(BasePlugin):
     #: 「事件形状」诊断只打一次（用户实测"明明是单聊却报不是单聊"时，一次定位）
     _c2c_shape_dumped = False
 
+    @staticmethod
+    def _event_is_group(event) -> bool:
+        """这个事件**明确是群聊**吗？（把"正常跳过"与"认不出形状"分开）
+
+        判据（任一成立即认为是群）：
+          * 批次事件自带 `is_group_message()`（核心：`messages[-1].group is not None`）；
+          * `message.group` 有非空 `group_id`；
+          * 会话 id 形如 `qq:gm:…` / `qq:group:…`；
+          * 批次消息里出现过真群。
+        """
+        try:
+            fn = getattr(event, "is_group_message", None)
+            if callable(fn):
+                try:
+                    if fn():
+                        return True
+                except Exception:
+                    pass
+            msg = getattr(event, "message", None)
+            grp = getattr(msg, "group", None) if msg is not None else None
+            if grp is not None and str(getattr(grp, "group_id", "") or ""):
+                return True
+            for holder in (getattr(event, "session", None), event, msg):
+                if holder is None:
+                    continue
+                sid = getattr(holder, "session_id", None) or getattr(holder, "sid", None)
+                if isinstance(sid, str) and sid:
+                    parts = [p.lower() for p in sid.replace("/", ":").split(":") if p]
+                    if any(p in ("gm", "group", "guild", "channel") for p in parts):
+                        return True
+            for m in (getattr(event, "messages", None) or []):
+                g = getattr(m, "group", None)
+                if g is not None and str(getattr(g, "group_id", "") or ""):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _c2c_target_of(self, event) -> str:
         """这个事件是不是**单聊**？是就返回对方 openid，否则返回空串。
 
@@ -2644,6 +2688,13 @@ class QQOfficialGroupBridge(BasePlugin):
             target = self._c2c_target_of(event)
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
             if not target:
+                # ★ 2026-10-10：**群聊**是"正常跳过"，不该报成"认不出单聊目标"
+                #   （用户实测：群里每次 LLM 请求都刷一条假警 + 一份现场诊断）。
+                if self._event_is_group(event):
+                    self._typing_skip(
+                        "not_c2c_group",
+                        "这是**群聊**（官方 msg_type=6 只支持单聊）—— 正常跳过，无需处理")
+                    return False
                 self._typing_skip(
                     "not_c2c",
                     "认不出单聊目标（官方 msg_type=6 只支持单聊）—— 已附带现场诊断，"
@@ -2679,6 +2730,8 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._typing_skip("disabled", "配置 typing_enabled=关")
                 return False
             if not target:
+                if self._event_is_group(None):
+                    pass
                 self._typing_skip("not_c2c", "认不出单聊目标（官方 msg_type=6 只支持单聊）")
                 return False
             client = adapter.get_client() if adapter is not None else None
