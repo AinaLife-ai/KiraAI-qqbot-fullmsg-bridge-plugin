@@ -228,7 +228,8 @@ check("stats：总数/人数/剩余/名字都对",
       and st_b["users"][0]["name"] == "周武" and st_b["users"][0]["count"] == 2, str(st_b)[:160])
 check("stats：用户序按次数降序", [u["name"] for u in st_b["users"]] == ["周武", "小美"], "")
 txt = BP.render_stats_text(st_b, now=t0 + 10, name_of=lambda u: {"U1": "周武", "U2": "小美"}.get(u))
-check("查账文本：含人数/结余/状态", "已点 3 次" in txt and "剩 0" in txt and "周武 × 2" in txt,
+check("查账文本：含人数/结余/状态（人名后带短 openid）",
+      "已点 3 次" in txt and "剩 0" in txt and "周武（" in txt and "× 2" in txt,
       txt[:200])
 check("查账文本紧凑（省 token，< 600 字符）", len(txt) < 600, str(len(txt)))
 

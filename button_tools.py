@@ -73,6 +73,7 @@ class QQButtonTool(BaseTool):
             "scope": {"type": "string", "enum": ["session", "all"],
                       "description": "查找范围：session=当前会话（默认）；all=所有会话"},
             "session": {"type": "string", "description": "目标会话 openid 前缀（防重名时点名）"},
+            "ref": {"type": "string", "description": "账本编号（形如 #2，查账时显示的那个）"},
         },
         "required": ["action"],
     }
@@ -123,7 +124,7 @@ class QQButtonTool(BaseTool):
 
     def _locate(self, event, *, button_id: str = "", message_id: str = "",
                 label: str = "", scope: str = "session",
-                sid_prefix: str = "") -> Tuple[Optional[Any], List[Any], str]:
+                sid_prefix: str = "", ref: str = "") -> Tuple[Optional[Any], List[Any], str]:
         """定位一本账。`scope=all` 时可跨会话（候选会带会话标签，便于区分）。"""
         plugin, store = self._store(event)
         if store is None:
@@ -131,7 +132,8 @@ class QQButtonTool(BaseTool):
         _scope = str(scope or "session").lower()
         for sid in self._sids(event):
             hit, cands = store.find(sid, button_id=button_id, message_id=message_id,
-                                    label=label, scope=_scope, sid_prefix=sid_prefix)
+                                    label=label, scope=_scope, sid_prefix=sid_prefix,
+                                    ref=ref)
             if hit is not None:
                 return hit, cands, ""
             if cands:
@@ -172,17 +174,18 @@ class QQButtonTool(BaseTool):
     async def execute(self, event, *args, action: str = "stats", label: str = "",
                       button_id: str = "", message_id: str = "", limit: int = 20,
                       add_slots: int = 0, minutes: int = 0, reason: str = "",
-                      scope: str = "session", session: str = "", **kwargs) -> str:
+                      scope: str = "session", session: str = "", ref: str = "",
+                      **kwargs) -> str:
         act = str(action or "stats").strip().lower()
         if act not in ("stats", "close", "reset", "extend"):
             return f"未知 action={action}（可用：stats / close / reset / extend）"
         try:
             if act == "stats":
                 return self._stats(event, label=label, button_id=button_id,
-                                   message_id=message_id, limit=limit, scope=scope, sid_prefix=session)
+                                   message_id=message_id, limit=limit, scope=scope, sid_prefix=session, ref=ref)
             if act == "close":
                 return self._close(event, label=label, button_id=button_id,
-                                   message_id=message_id, reason=reason, scope=scope, sid_prefix=session)
+                                   message_id=message_id, reason=reason, scope=scope, sid_prefix=session, ref=ref)
             if act == "reset":
                 return self._reset(event, label=label, button_id=button_id,
                                    message_id=message_id)
@@ -194,7 +197,7 @@ class QQButtonTool(BaseTool):
 
     # ------------------------------------------------------------------ #
     def _stats(self, event, *, label, button_id, message_id, limit, scope="session",
-               sid_prefix="") -> str:
+               sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "查账失败：按钮账本未启用。"
@@ -213,10 +216,64 @@ class QQButtonTool(BaseTool):
             except Exception:
                 return ""
 
-        return BP.render_stats_text(store.stats(hit, limit=lim), name_of=_name)
+        st = store.stats(hit, limit=lim)
+        # ★ 会话名**读时解析**（群名可能后来才有 ⇒ 这样能回填；私聊显示对方名字）
+        return BP.render_stats_text(st, name_of=_name,
+                                    session_name=self._session_label(event, hit, plugin))
+
+    def _session_label(self, event, pol, plugin) -> str:
+        """会话标签：群 ⇒ 群名（拿不到就空，交给短 id）；私聊 ⇒ 对方昵称。"""
+        try:
+            sid = str(pol.get("sid") or "")
+            if not sid:
+                return ""
+            if pol.get("is_group", True):
+                # 适配器名可能取不到 / 与写入端不一致 ⇒ 逐个候选试（含跨适配器兜底）
+                _names = []
+                _ev_name = str(getattr(getattr(event, "session", None),
+                                       "adapter_name", "") or "")
+                if _ev_name:
+                    _names.append(_ev_name)
+                try:
+                    _names += [str(k) for k in (getattr(plugin, "profiles", {}) or {})]
+                except Exception:
+                    pass
+                try:
+                    _names += [str(n) for n, _a in plugin._find_adapters()]
+                except Exception:
+                    pass
+                _names.append("")
+                nm = None
+                for _an in _names:
+                    try:
+                        nm = plugin.group_names.lookup(_an, sid)
+                    except Exception:
+                        nm = None
+                    if nm:
+                        adapter_name = _an
+                        break
+                else:
+                    adapter_name = _ev_name or (_names[1] if len(_names) > 1 else "")
+                if not nm:
+                    # 顺手排队拉一次（官方 30 QPM、后台任务、失败不重试）
+                    try:
+                        ada = plugin.ctx.adapter_mgr.get_adapter(adapter_name)
+                        plugin.group_names.schedule_fetch(ada, adapter_name, sid,
+                                                          ada.get_client(), __import__("logging").getLogger("plugin"))
+                    except Exception:
+                        pass
+                return str(nm or "")
+            # 私聊：会话 id 就是对方的 user_openid
+            try:
+                nm = plugin.identities.lookup_any(sid) or ""
+            except Exception:
+                nm = ""
+            return f"私聊·{nm}" if nm else "私聊"
+        except Exception:
+            return ""
 
     def _close(self, event, *, label, button_id, message_id, reason, scope="session",
-               sid_prefix="") -> str:
+               sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "截止失败：按钮账本未启用。"
@@ -230,7 +287,7 @@ class QQButtonTool(BaseTool):
                 f"{int(hit.get('total') or 0)} 次、{len(hit.get('users') or {})} 人参与。")
 
     def _reset(self, event, *, label, button_id, message_id, scope="session",
-               sid_prefix="") -> str:
+               sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "重置失败：按钮账本未启用。"
@@ -244,7 +301,7 @@ class QQButtonTool(BaseTool):
         return f"已重置「{hit.get('label') or hit['key']}」（原计数 {old} 已清空，按钮重新可用）。"
 
     def _extend(self, event, *, label, button_id, message_id, add_slots, minutes,
-                scope="session", sid_prefix="") -> str:
+                scope="session", sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "调整失败：按钮账本未启用。"

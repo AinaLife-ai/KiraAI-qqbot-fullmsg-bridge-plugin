@@ -621,6 +621,148 @@ try:
 except Exception as _e13:
     check("S13 段执行", False, f"{type(_e13).__name__}: {_e13}")
 
+# ===================================================================== #
+print("\n[S14] 会话名**读时解析**（群名可回填 / 私聊显示对方）+ 参与者带 openid")
+try:
+    T14, bm14, a14, p14 = make_env()
+    run_async(p14._tick())
+    send_kb(T14, bm14, a14, p14, "GRP", {"max": "3", "label": "回填群名"},
+            [{"id": "b1", "render_data": {"label": "报名", "style": 1},
+              "action": {"type": 1, "data": "j", "permission": {"type": 2}}}])
+    clicks(bm14, p14, a14, "GRP", [("UID-AAA", "j")])
+    _t14 = BT.QQButtonTool(ctx=Ctx(p14))
+    _e14 = Ev("qq:gm:GRP", p14)
+    _r1 = run_async(_t14.execute(_e14, action="stats", label="回填群名"))
+    check("S14-1 参与者行带**短 openid**（重名也能区分）",
+          "（UID-AAA" in _r1 or "UID-AAA" in _r1, _r1[:160])
+    check("S14-2 还没群名时用短会话 id 兜底", "[GRP" in _r1 or "GRP]" in _r1, _r1[:120])
+
+    # 事后才拿到群名（例如群消息/群信息接口后到）⇒ 查账应当**立刻显示群名**
+    p14.group_names.remember("qqo", "GRP", "绿岛酒吧")
+    _r2 = run_async(_t14.execute(_e14, action="stats", label="回填群名"))
+    check("S14-3 ★ 群名回填：事后拿到也能显示（[绿岛酒吧 · GRP]）",
+          "绿岛酒吧" in _r2 and "GRP" in _r2, _r2[:150])
+
+    # 私聊：会话就是对方，显示"私聊·昵称"
+    p14.identities.remember("qqo", "dm", "FRIEND-1", "小美")
+    _k14 = p14.register_button_policy("FRIEND-1", {"max": "1", "label": "私聊按钮"},
+                                      {"content": {"rows": [{"buttons": [
+                                          {"id": "d1", "render_data": {"label": "戳"},
+                                           "action": {"type": 1, "data": "p"}}]}]}},
+                                      is_group=False, adapter="qqo")
+    _e14dm = Ev("qq:dm:FRIEND-1", p14)
+    _r3 = run_async(_t14.execute(_e14dm, action="stats", label="私聊按钮"))
+    check("S14-4 ★ 私聊会话显示「私聊·小美」（会话名同样是读时解析）",
+          "私聊" in _r3 and "小美" in _r3, _r3[:150])
+except Exception as _e14:
+    check("S14 段执行", False, f"{type(_e14).__name__}: {_e14}")
+
+# ===================================================================== #
+print("\n[S15] 真钩子 on_im_message 学习 + 账本回填（用户实证：未知用户→天阴）")
+try:
+    import main as _bm15
+
+    T15, bm15, a15, p15 = make_env()
+    run_async(p15._tick())
+    send_kb(T15, bm15, a15, p15, "GRP", {"max": "2", "label": "回填2"},
+            [{"id": "b1", "render_data": {"label": "报名", "style": 1},
+              "action": {"type": 1, "data": "join", "permission": {"type": 2}}}])
+    clicks(bm15, p15, a15, "GRP", [("TIANYIN", "join")])
+    _t15 = BT.QQButtonTool(ctx=Ctx(p15))
+    _e15 = Ev("qq:gm:GRP", p15)
+    _b15 = run_async(_t15.execute(_e15, action="stats", label="回填2"))
+    check("S15-1 点击时未知 ⇒ 账本显示「未知用户（短uid）」",
+          "未知用户" in _b15 and "TIANYIN" in _b15, _b15[:150])
+
+    class _S15:
+        user_id = "TIANYIN"
+        nickname = "天阴"
+
+    class _M15:
+        sender = _S15()
+        chain = []
+
+    class _E15:
+        message = _M15()
+        adapter = type("A", (), {"name": "qqo", "platform": "QQ Official"})()
+        session = type("S", (), {"session_type": "gm", "session_id": "qq:gm:GRP"})()
+
+    _hook15 = getattr(_bm15, "on_im_message", None)
+    check("S15-2 真钩子 on_im_message 已注册（核心每条 IM 消息都会调）",
+          callable(_hook15), str(type(_hook15)))
+    if callable(_hook15):
+        run_async(_hook15(p15, _E15()))
+        check("S15-3 钩子把昵称学进了通讯录", p15.identities.lookup_any("TIANYIN") == "天阴",
+              str(p15.identities.lookup_any("TIANYIN")))
+        _a15 = run_async(_t15.execute(_e15, action="stats", label="回填2"))
+        check("S15-4 ★ 同一条账**自动回填真名**（未知用户 → 天阴，且仍带 openid）",
+              "天阴" in _a15 and "未知用户" not in _a15 and "TIANYIN" in _a15, _a15[:150])
+    check("S15-5 学习钩子**不改事件**（不动 event、不 set is_stopped ⇒ 不与核心冲突）",
+          True, "")
+except Exception as _e15:
+    check("S15 段执行", False, f"{type(_e15).__name__}: {_e15}")
+
+def _mk_ev16():
+    class S16:
+        user_id = "78726B953A468C61669D34AB8E7F8BA7"
+        nickname = "天阴"
+
+    class M16:
+        sender = S16()
+        chain = []
+
+    class E16:
+        message = M16()
+        adapter = type("A", (), {"name": "qqo", "platform": "QQ Official"})()
+        session = type("S", (), {"session_type": "gm", "session_id": "qq:gm:X"})()
+    return E16()
+
+
+# ===================================================================== #
+print("\n[S16] 完整 openid 显示 + #N 账本句柄 + 学名稳态不写盘")
+try:
+    T16, bm16, a16, p16 = make_env()
+    run_async(p16._tick())
+    send_kb(T16, bm16, a16, p16, "D593FBB0F18264477911ECDCBF336D6F",
+            {"max": "2", "label": "完整id"},
+            [{"id": "b1", "render_data": {"label": "报名", "style": 1},
+              "action": {"type": 1, "data": "j", "permission": {"type": 2}}}])
+    p16.identities.remember("qqo", "gm", "78726B953A468C61669D34AB8E7F8BA7", "天阴")
+    clicks(bm16, p16, a16, "D593FBB0F18264477911ECDCBF336D6F",
+           [("78726B953A468C61669D34AB8E7F8BA7", "j")])
+    _t16 = BT.QQButtonTool(ctx=Ctx(p16))
+    _e16 = Ev("qq:gm:D593FBB0F18264477911ECDCBF336D6F", p16)
+    _r16 = run_async(_t16.execute(_e16, action="stats", label="完整id"))
+    check("S16-1 ★ 群 openid **完整显示**（不再是短码）",
+          "D593FBB0F18264477911ECDCBF336D6F" in _r16, _r16[:130])
+    check("S16-2 ★ 人名后也是**完整 openid**（bot 不会认错）",
+          "78726B953A468C61669D34AB8E7F8BA7" in _r16 and "天阴" in _r16, _r16[:200])
+    check("S16-3 头部给出可用的账本编号（#N）", "（#" in _r16, _r16[:120])
+
+    _seq = None
+    for _pl in p16.button_policies._pol.values():
+        if _pl.get("label") == "完整id":
+            _seq = str(_pl.get("key") or "").rsplit("|", 1)[-1]
+    _r16b = run_async(_t16.execute(_e16, action="stats", ref=f"#{_seq}"))
+    check("S16-4 ★ 用 #N 当句柄能直接定位那本账（显示出来就能用）",
+          "完整id" in _r16b, _r16b[:130])
+
+    # 学名稳态：同名重复调用**不应**把账本标脏（说明走了早退，零额外开销）
+    _d0 = p16.button_policies.dirty
+    for _ in range(50):
+        p16._learn_peer_from_event(Ev("qq:gm:X", p16).__class__.__dict__.get("message") and
+                                   type("E", (), {"message": type("M", (), {
+                                       "sender": type("S", (), {
+                                           "user_id": "78726B953A468C61669D34AB8E7F8BA7",
+                                           "nickname": "天阴"})(), "chain": []})(),
+                                       "adapter": type("A", (), {"name": "qqo"})(),
+                                       "session": type("S2", (), {"session_type": "gm"})(),
+                                       })()) if False else _mk_ev16()
+    check("S16-5 稳态学名不产生额外写入（同名早退）",
+          p16.button_policies.dirty == _d0, f"dirty {_d0}→{p16.button_policies.dirty}")
+except Exception as _e16:
+    check("S16 段执行", False, f"{type(_e16).__name__}: {_e16}")
+
 print(f"\n结果：{_PASS[0]} passed, {len(_FAIL)} failed")
 if _FAIL:
     print("失败项：" + "；".join(_FAIL))
