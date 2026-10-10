@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.26
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.27
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -464,6 +464,39 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.27</b> — ★★ 按钮点击的"是谁"修好了：跨适配器查名字 + 身份写进正文</summary>
+
+### 现象
+Notice 行里群名有了，但 `user_nickname: None` ✗ —— 而且**同一个人**在普通消息里
+明明显示 `周武`（user_id 完全一致）。
+
+### 两个根因（都是实测定位）
+1. **适配器名不一致**：通讯录 key 是 `adapter|uid`，而**学习端**用的是
+   `adapter.info.name`（线上是 `qq`），**发送端**注册名却是 `qqo` ⇒ 按注册名查必 miss；
+2. 更深一层：**核心在后续处理里会把 `nickname` 字段丢掉**
+   （它自己的接收日志那行也是 `None`）⇒ 只填字段**不够**。
+
+### 修法
+* 通讯录查询：先按 `adapter.info.name`、再按注册名，最后**跨适配器兜底扫描**
+  （新增 `IdentityStore.lookup_any()`）；仍然拿不到就用**可读别名**，**永不 None**；
+* **身份写进正文**：`[按钮] 用户点击了：x` → `[按钮] 周武 点击了：x`
+  （正文与字段无关 ⇒ 核心怎么处理都丢不掉）；
+* 顺手修一个隐藏错误：`stable_alias` 其实定义在 `qqbot_bridge`（我 import 的地方写错了）。
+
+### 现在的实际显示（本地实测）
+```
+认识的人   → nickname='周武'                       正文='[按钮] 周武 点击了：fin-1'
+陌生人     → nickname='未知用户(DF8B8F24E934…)'     正文='[按钮] 未知用户(DF8B8F24E934…) 点击了：fin-1'
+```
+
+> **真实 vs 占位，分得很清楚**：只有"说过话的人"才有真名（与群聊普通消息**同源同真**）；
+> 从没说过话的成员，官方没有任何"按 openid 查昵称"的接口（成员名册是内邀、且只含
+> "机器人见过的成员"）⇒ 只能显示 **`未知用户(<openid>)`**（openid 是我们确实拥有的标识、
+> 可核对，**绝不是伪造的名字**）；TA 一发言，名字会自动补上。
+
+</details>
+
+<details>
 <summary><b>v1.6.26</b> — 🚑 二修 Notice 补丁：**"套娃"**（把旧补丁当成了原始实现）</summary>
 
 ### 现象（v1.6.25 仍然报错）
