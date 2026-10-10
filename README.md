@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.24
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.25
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -464,6 +464,44 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.25</b> — 🚑 紧急修：Notice 名字补丁的**绑定 bug**（会让 kira-ai 的 on_llm_req 报错）</summary>
+
+### 现象（线上 ERROR）
+```
+File "…kira-ai/main.py", line 110, in on_llm_req
+    formatted_message = self._format_user_message(event.messages[message_index])
+File "…qqbot-bridge/main.py", line 386, in _fmt
+    return _orig(msg)
+TypeError: DefaultPlugin._format_user_message() missing 1 required positional argument: 'msg'
+```
+
+### 根因
+v1.6.24 的「Notice 也显示名字」补丁：`_find_kirai_plugin()` 从插件注册表里拿到的
+是**类**（不是实例），`getattr(类, "方法")` 返回的是**未绑定函数**，
+而我按"已绑定"去调 `_orig(msg)` ⇒ 少传 `self` ⇒ **普通消息**走 fallback 时必炸
+（kira-ai 的 `on_llm_req` 对**每条**消息都会调它，所以每个批次都报错）。
+
+### 修法
+* 统一取**底层函数**（类属性 / 绑定方法的 `__func__`）；
+* 包装按**未绑定**签名 `def _fmt(self, msg)`，并把补丁**打到类上**；
+* 内部统一 `orig_fn(self, msg)` 调用（绑定正确）；
+* 任何异常都退回 `orig_fn(self, msg)` —— **绝不把 kira-ai 搞崩**；
+* 传"类"或"实例"都正确（幂等）。
+
+### 测试（这次用**真 kira-ai 类**，不再用假类）
+之前的测试用手写假类，`getattr(实例, 方法)` 返回**绑定方法**，恰好掩盖了这条路径 ⇒
+漏测。现在直接加载内置 `kira-ai` 的真实插件类做回归：
+* 传**类**打补丁 ✓；
+* 补丁后**普通消息照常渲染**（不再 TypeError —— 正是线上那条 ✓）；
+* notice 带上 `group_name` / `user_nickname` ✓；
+* 传实例再打一次也安全（幂等）✓。
+
+**教训**：打"别人的方法"的补丁，必须用**真实对象的绑定形态**去测
+（类属性 vs 绑定方法，是本轮漏测的根源）。
+
+</details>
+
+<details>
 <summary><b>v1.6.24</b> — ★★ 按钮点击等**合成事件**带上昵称/群名 + 「输入中」群聊不再假警 + 修一处回归</summary>
 
 ### 一、合成事件（按钮点击 / 成员事件）没有昵称与群名

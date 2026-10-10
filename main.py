@@ -348,32 +348,46 @@ def _find_kirai_plugin(plugin_mgr: Any):
     return None
 
 
+#: Notice 补丁的版本戳（改了实现就 +1 —— 保证热重载能替换掉旧实现）
+_NOTICE_PATCH_BUILD = "2"
+
+
 def _patch_notice_identity(plugin: Any, logger_: Any = None) -> bool:
-    """把 kira-ai 的 `_format_user_message` 包成"notice 也带名字"。幂等。
+    """把 kira-ai 的 `_format_user_message` 包成"notice 也带名字"。幂等、**绝不搞崩对方**。
 
     is_notice 语义保持不变（历史里仍标记为 notice），只是**显示给模型的那一行**
-    补上 `group_name` / `user_nickname` —— 否则按钮点击/成员事件在模型眼里只有裸 openid。
+    补上 `group_name` / `user_nickname`。
+
+    ★★ 2026-10-10 紧急修正：`plugin` 可能是**类**（插件注册表给的就是类），
+      此时 `getattr(类, "方法")` 是**未绑定函数** —— 必须用 `orig_fn(self, msg)` 调用。
+      上一版按"已绑定"调 `_orig(msg)` ⇒ 少传 self ⇒ kira-ai 的 `on_llm_req`
+      **对每条消息都 TypeError**（线上 ERROR）。现在对"类 / 实例"都正确。
     """
     if plugin is None:
         return False
-    orig = getattr(plugin, "_format_user_message", None)
-    if not callable(orig):
+    raw = getattr(plugin, "_format_user_message", None)
+    if not callable(raw):
         return False
-    if getattr(orig, "_kira_bridge_notice_identity", False):
+    is_cls = isinstance(plugin, type)
+    target_cls = plugin if is_cls else type(plugin)
+    # 统一取底层函数（未绑定）
+    orig_fn = raw if is_cls else getattr(raw, "__func__", raw)
+    # ★ 版本化标记：热重载时若类上残留的是**旧版**（含已知会崩的那版）就重新包装，
+    #   否则坏补丁会一直留在类上、只有完整重启才会好。
+    if getattr(orig_fn, "_kira_bridge_notice_identity", None) == _NOTICE_PATCH_BUILD:
         return True
     try:
-        import types as _types
         from datetime import datetime as _dt
 
         from core.chat.message_utils import KiraIMMessage as _KIMM
 
-        def _fmt(plugin_self, msg, _orig=orig):
+        def _fmt(self, msg, _orig=orig_fn):
             try:
                 if isinstance(msg, _KIMM) and getattr(msg, "is_notice", False):
                     ts = msg.timestamp
-                    tz = plugin_self.ctx.get_timezone()
+                    tz = self.ctx.get_timezone()
                     dt = _dt.fromtimestamp(ts, tz=tz) if tz else _dt.fromtimestamp(ts)
-                    ds = plugin_self._get_current_time_str(dt=dt)
+                    ds = self._get_current_time_str(dt=dt)
                     if msg.is_group_message():
                         return (f"[{ds}] Notice [group_name: {msg.group.group_name} "
                                 f"group_id: {msg.group.group_id} user_nickname: "
@@ -383,15 +397,16 @@ def _patch_notice_identity(plugin: Any, logger_: Any = None) -> bool:
                             f"user_id: {msg.sender.user_id}] | {msg.message_str}")
             except Exception:
                 pass
-            return _orig(msg)
+            # ★ 一定按"未绑定函数"调用：自带 self，绝不会少参数
+            return _orig(self, msg)
 
-        _fmt._kira_bridge_notice_identity = True
-        _fmt._kira_bridge_orig = orig
-        plugin._format_user_message = _types.MethodType(_fmt, plugin)
+        _fmt._kira_bridge_notice_identity = _NOTICE_PATCH_BUILD
+        _fmt._kira_bridge_orig = orig_fn
+        setattr(target_cls, "_format_user_message", _fmt)
         if logger_ is not None:
             logger_.info(
                 "[QQBOT-BRIDGE] 已给 kira-ai 补上「Notice 也显示名字」"
-                "（按钮点击/成员事件不再只有裸 openid）")
+                "（按钮点击/成员事件不再只有裸 openid；普通消息原样）")
         return True
     except Exception as exc:
         if logger_ is not None:
