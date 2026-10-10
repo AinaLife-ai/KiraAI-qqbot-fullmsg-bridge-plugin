@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.32
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.33
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -130,7 +130,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `typing_enabled` | 开 | **私聊「输入中…」提示**（msg_type=6）：模型开始思考时给单聊会话发一个状态，用户看到「对方正在输入…」而不是发呆。腾讯官方 SDK 与官方推荐的 Hermes 都有、KiraAI 核心没有。**仅单聊生效**（官方只支持 C2C），同会话 50 秒防抖，发失败不影响回复 |
 | `typing_max_frames` | 2 | **每条入站消息最多花几帧「输入中」**。官方：同一个入站消息最多 4 次被动回复，`msg_type=6` 也算一次 ⇒ 默认 2 帧（+ 1 条回复 = 3，留余量），填 1 更保守，最多 3 |
 | `button_policy_enabled` | 开 | 按钮策略总开关（限次/限人/截止/计数）|
-| `button_deliver_default` | `last` | 默认告知方式：last=只在截止那次转给模型；all=每次都转；off=都不转 |
+| `button_deliver_default` | `all` | 默认告知方式：all=每次有效点击都转（默认，与旧版一致）；last=只在截止那次转；off=都不转 |
 | `button_hard_default` | 开 | 默认硬拦截：超额/过期/重复的点击不再转给模型 |
 | `button_notify_default` | 关 | 截止时是否给用户发一条提示（机械文案，默认不发）|
 | `button_notify_text` | 空 | 自定义提示文案（可用 keyboard 标签的 notify_text 逐条覆盖）|
@@ -504,14 +504,17 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
  "kirai":{"max":2,"per":1,"label":"候补位"}}
 ```
 
-### 默认行为：`deliver=last`（安静模式）
+### 默认行为：**转达方式＝原来正常的方式** + **硬模式**
 
-* 中途的点击**不会打扰模型**（不产生消息）；
-* 只有**触发截止的那一次**（名额满 / 到点了）会带着**汇总**发给模型：
-  `[按钮] 周武 点击了：join（✅ 这是最后一个名额（3/3），按钮已截止；名单：周武、小美、阿强）`；
-* 超额/过期/重复的点击**默认硬拦截**：不再转给模型（需要时模型自己查账）；
-* 没有任何"全局结束点"（无 `max`、无 `ttl/until`）时，`last` **自动退化成 `all`** ——
-  否则模型永远收不到消息（安静过头）。
+* **默认 `deliver=all`**：每次**有效**点击都会转给模型（与旧版完全一致，模型照常接话）；
+* **硬模式（默认开）**：**超过上限 / 已过期 / 重复（once、per、连点保护）**的点击
+  **不再转给模型** —— 这就是「bot 收到的点击有上限」；
+  模型需要时用 `qq_button_stats` 查账（谁点了、剩几个、超额几次都能查）；
+* 触发**截止的那一次**照常转达，并**额外带上汇总**（谁点的、共几次、按钮已截止）；
+* `deliver=last`：只在截止那一次转（更安静，适合只关心「满了/结束了」的场景）；
+* `deliver=off`：一次都不转，纯记账（模型自己查账）；
+* 选了 `last` 但没设任何全局结束点（无 `max`、无 `ttl/until`）时，**自动退化成 `all`** ——
+  否则模型永远收不到消息。
 
 ### 模型可以查账、也可以自己管
 
@@ -599,6 +602,17 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.33</b> — 更正默认告知方式：<b>deliver=all</b>（原来正常的方式）；硬模式只管「超过上限/过期」</summary>
+
+* 用户澄清：要的不是「中途点击不打扰」，而是**默认照旧每次点击都转达**；
+  **硬模式只负责「超过上限 / 过期 / 重复之后不再转」**；
+* `button_deliver_default` 默认 `last` → **`all`**；`last` / `off` 保留供用户自选；
+* 触发截止的那一次照常转达，并额外带汇总；超额/过期仍硬拦截（默认开）；
+* 其余不变（声明剥离、官方字段深扫、查账工具、双世代全绿）。
+
+</details>
+
+<details>
 <summary><b>v1.6.32</b> — 按钮策略：限次/限人/截止/计数/查账（插件侧，官方 click_limit 已弃用）</summary>
 
 * **声明**：`<keyboard max="3" once="1" ttl="600" until="22:30" cooldown="30" label="报名">`

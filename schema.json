@@ -379,13 +379,13 @@
       "button_deliver_default": {
         "name": "默认告知方式",
         "type": "select",
-        "default": "last",
+        "default": "all",
         "options": [
-          "last",
           "all",
+          "last",
           "off"
         ],
-        "hint": "last＝只在「触发截止的那一次」把点击转给模型（默认，最安静）；all＝每次有效点击都转；off＝都不转（模型用 qq_button_stats 查账）。"
+        "hint": "all＝每次有效点击都转给模型（默认，与旧版行为一致）；last＝只在「触发截止的那一次」转（更安静，适合只关心「满了/结束了」的场景）；off＝都不转（模型用 qq_button_stats 自己查账）。注意：无论选哪个，「超过上限／过期／重复」的点击都不会再转（硬拦截）。"
       },
       "button_hard_default": {
         "name": "默认硬拦截",

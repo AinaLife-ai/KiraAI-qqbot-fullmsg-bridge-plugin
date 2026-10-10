@@ -137,22 +137,29 @@ check("过期后策略被标记 closed", p_ttl["closed"] and p_ttl["closed_reaso
 e2 = st5.decide(p_ttl, "U2", now=t0 + 120)
 check("已 closed 的再点仍是拒绝", not e2["accepted"], str(e2["reason"]))
 
-print('\n[D] deliver 模式（默认 last=只转"触发截止的那一次"）')
+print('\n[D] deliver 模式（默认 all＝原来正常的方式；last/off 供自选）')
 st6 = BP.ButtonPolicyStore()
-p_last = st6.register("sid", {"max": 2})       # 默认 deliver=last
-r1, r2 = st6.decide(p_last, "U1"), st6.decide(p_last, "U2")
-check("last：第 1 次不转（accepted 但 closing=False）", r1["accepted"] and not r1["closing"], str(r1))
-check("last：第 2 次（截止那次）要转", r2["closing"] is True, str(r2))
+p_def = st6.register("sid", {"max": 2})        # 没写 deliver ⇒ 默认 all
+r1, r2 = st6.decide(p_def, "U1"), st6.decide(p_def, "U2")
+check("★★ 默认 deliver=all（每次有效点击都转给模型，与旧版一致）",
+      p_def["deliver"] == "all", str(p_def.get("deliver")))
+check("默认 all：第 1 次也转（accepted=True）", r1["accepted"] is True, str(r1))
+check("默认 all：第 2 次是截止那次（closing=True，且会带汇总）", r2["closing"] is True, str(r2))
 
 st7 = BP.ButtonPolicyStore()
 p_off = st7.register("sid", {"max": 3, "deliver": "off"})
-check("off：deliver=off（一次都不转）", p_off["deliver"] == "off", p_off.get("deliver"))
-p_all = st7.register("sid", {"deliver": "all"})
-check("all：deliver=all", p_all["deliver"] == "all", p_all.get("deliver"))
+check("off：显式 deliver=off（一次都不转）", p_off["deliver"] == "off", p_off.get("deliver"))
+p_last2 = st7.register("sid", {"max": 2, "deliver": "last"})
+check("last：显式 deliver=last 保留可用", p_last2["deliver"] == "last", p_last2.get("deliver"))
+_v_last = st7.decide(p_last2, "UA")
+_v_close = st7.decide(p_last2, "UB")
+check("last 语义：中途 accepted 但非 closing（不转）；截止那一次 closing=True（转）",
+      _v_last["accepted"] and not _v_last["closing"] and _v_close["closing"] is True,
+      f"{_v_last['accepted']}/{_v_last['closing']} {_v_close['closing']}")
 
 st8 = BP.ButtonPolicyStore()
 p_deg = st8.register("sid", {"deliver": "last"})   # 既无 max 也无截止
-check('★ 退化规则：没有"全局结束点"时 last→all（否则模型永远收不到）',
+check("★ 退化规则：选了 last 但没有全局结束点 ⇒ 退成 all（否则永远收不到）",
       st8._effective_deliver(p_deg) == "all", "")
 
 print("\n[E] 三路匹配（message_id / token / 会话+按钮兜底）")

@@ -20,8 +20,8 @@
    * `ttl`       从发出起多少秒后截止
    * `until`     绝对截止时刻 `HH:MM`（早于当前时间则视为次日）或 ISO 串
    * `cooldown`  同一人多少秒内的连点只算一次（不计入次数）
-   * `deliver`   `last`（默认：**只在截止那一次**告诉模型）/ `all`（每次有效点击都告诉）/
-                 `off`（都不告诉，纯记账，模型自己查账）
+   * `deliver`   `all`（**默认**：每次有效点击都告诉模型，与旧版一致）/
+                 `last`（只在截止那一次告诉）/ `off`（都不告诉，模型自己查账）
    * `hard`      超额/过期**不再转给模型**（默认取全局配置，全局默认 1=硬）
    * `notify`    截止时给**用户**发一条机械文案（默认关；机械文案一向不推荐）
    * `notify_text` 自定义文案
@@ -273,7 +273,9 @@ class ButtonPolicyStore:
             "per": _as_int(merged.get("per")) or 0,
             "once": bool(merged.get("once") or False),
             "cooldown": _as_int(merged.get("cooldown")) or 0,
-            "deliver": str(merged.get("deliver") or "last"),
+            #: 默认 **all** = 原来正常的方式（每次有效点击都转给模型）。
+            #  "last"（只在截止那一次）/ "off"（都不转）留给用户按需选。
+            "deliver": str(merged.get("deliver") or "all"),
             "hard": _as_bool(merged.get("hard"), True),
             "notify": _as_bool(merged.get("notify"), False),
             "notify_text": str(merged.get("notify_text") or "")[:120],
@@ -423,10 +425,14 @@ class ButtonPolicyStore:
         return verdict
 
     def _effective_deliver(self, pol: dict) -> str:
-        """`last` 模式的退化规则：**没有任何"全局结束点"**（无 max、无截止）时
-        退成 `all` —— 否则模型永远收不到任何消息（安静过头了）。
+        """计算真正生效的告知方式。
+
+        * 默认 `all`：每次**有效**点击都转给模型（与旧版行为一致）；
+        * `last`：只在"触发截止的那一次"转（**用户显式选择**才用）；
+          若该策略没有任何全局结束点（无 max、无截止）⇒ 退成 `all`；
+        * `off`：一次都不转（模型用查账工具自己看）。
         """
-        mode = str(pol.get("deliver") or "last")
+        mode = str(pol.get("deliver") or "all")
         if mode == "last" and not int(pol.get("max") or 0) and not float(pol.get("until") or 0):
             return "all"
         return mode
@@ -674,7 +680,7 @@ class ButtonPolicyStore:
             pol.setdefault("msgs", [])
             pol.setdefault("closed", False)
             pol.setdefault("closed_reason", "")
-            pol.setdefault("deliver", "last")
+            pol.setdefault("deliver", "all")
             pol.setdefault("hard", True)
             pol.setdefault("notify", False)
             pol.setdefault("notify_text", "")

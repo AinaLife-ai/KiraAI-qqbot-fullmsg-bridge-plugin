@@ -706,9 +706,11 @@ try:
         return caps, n_after_1, n_after_2, n_after_3, len(waits)
 
     _caps3, _n1, _n2, _n3, _acks3 = asyncio.run(_clicks())
-    check("★★ 第 1 次点击按 deliver=last **不打扰模型**", _n1 == 0, f"publish 次数={_n1}")
-    check("★★ 第 2 次（最后一个名额）必须转给模型", _n2 == 1, f"{_n1}→{_n2}")
-    check("★★ 满额后的第 3 次**不再转**（硬拦截默认开）", _n3 == 1, f"{_n2}→{_n3}")
+    check("★★ 默认 deliver=all：第 1 次点击照常转给模型（与旧版一致）",
+          _n1 == 1, f"publish 次数={_n1}")
+    check("★★ 第 2 次（最后一个名额）也转（截止那次还带汇总）", _n2 == 2, f"{_n1}→{_n2}")
+    check("★★ 满额后的第 3 次**不再转**（硬拦截默认开 ＝ bot 收到的点击有上限）",
+          _n3 == 2, f"{_n2}→{_n3}")
     _txt_g = str((_caps3[-1] if _caps3 else {}).get("text") or "")
     check("★★ 截止那次带汇总（谁点的 + 计数 + 已截止）",
           "最后一个名额" in _txt_g or "已截止" in _txt_g, _txt_g[:160])

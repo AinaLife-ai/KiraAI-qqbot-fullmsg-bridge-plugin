@@ -725,7 +725,7 @@ class QQOfficialGroupBridge(BasePlugin):
         if not isinstance(button, dict) or not button:
             button = basic
         self.button_policy_enabled = bool(button.get("button_policy_enabled", True))
-        self.button_deliver_default = str(button.get("button_deliver_default") or "last")
+        self.button_deliver_default = str(button.get("button_deliver_default") or "all")
         self.button_hard_default = bool(button.get("button_hard_default", True))
         self.button_notify_default = bool(button.get("button_notify_default", False))
         self.button_notify_text = str(button.get("button_notify_text") or "")
