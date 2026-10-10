@@ -1641,9 +1641,34 @@ class QQOfficialGroupBridge(BasePlugin):
                 }):
                     tool_set.add(cls(ctx=self.ctx))
                 # ---- 按钮策略「查账」工具（v1.6.32）----
+                #   ★ 2026-10-11：这里加"落地校验"——核心 ToolSet.add 对不认识的对象
+                #   是 `continue`（静默丢弃），线上就出现过"bot 说没有这个工具"。
+                #   所以加完必须**回查**，没进去就大声报警。
                 if self.button_policy_enabled:
-                    for cls in build_button_tools({"button_policy_enabled": True}):
-                        tool_set.add(cls(ctx=self.ctx))
+                    _btn_cls = build_button_tools({"button_policy_enabled": True})
+                    for cls in _btn_cls:
+                        try:
+                            tool_set.add(cls(ctx=self.ctx))
+                        except Exception as exc:
+                            logger.warning("[QQBOT-BRIDGE] 注入按钮工具失败：%s", exc)
+                    _missing = []
+                    for cls in _btn_cls:
+                        try:
+                            if cls.name not in tool_set:
+                                _missing.append(cls.name)
+                        except Exception:
+                            pass
+                    if not getattr(self, "_btn_tools_logged", False):
+                        self._btn_tools_logged = True
+                        if _missing:
+                            logger.warning(
+                                "[QQBOT-BRIDGE] ⚠ 按钮查账工具**没能进模型**：%s"
+                                "（多半是没继承 BaseTool 或 ToolSet 形状变了）——"
+                                "模型会说「手边没有那个工具」", _missing)
+                        else:
+                            logger.info(
+                                "[QQBOT-BRIDGE] 按钮查账工具已进模型：%s",
+                                "、".join(c.name for c in _btn_cls))
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 注入 L1 工具失败: %s", exc)
 
