@@ -336,13 +336,15 @@ class ApiSendPatcher:
                             pass
                 if _cb and not flags.get("kb_cb_logged"):
                     flags["kb_cb_logged"] = True
-                    self.logger.warning(
-                        "[QQBOT-BRIDGE] 本条含 %d 个**回调按钮**（action.type=1）：需要平台能把"
-                        "互动事件推给机器人（长连接已订阅 INTERACTION 位；点按钮会先回执、"
-                        "再作为一条消息转给模型）。⚠ 若开放平台后台把“消息推送方式”设成 "
-                        "Webhook 且地址不可达，客户端点按钮会提示「请求第三方失败」——"
-                        "查一下后台的推送方式，或改用 type=2 指令按钮"
-                        "（插件默认已给指令按钮加 enter:true，点一下就自动发送）", _cb)
+                    # ★ 2026-10-10：回调按钮现在是**推荐**用法（插件已订阅 INTERACTION 位、
+                    #   3 秒内回执、把点击转成一条消息）⇒ 从 WARNING 降为 INFO，
+                    #   只在真出问题时才需要看它。
+                    self.logger.info(
+                        "[QQBOT-BRIDGE] 本条含 %d 个回调按钮（action.type=1）：点击后平台把"
+                        "互动事件推给我们（长连接已订阅 INTERACTION 位），我们 3 秒内回执、"
+                        "再转成一条消息给模型。若客户端点按钮提示「请求第三方失败」，"
+                        "通常是开放平台后台的「消息推送方式」设成了 Webhook 且地址不可达",
+                        _cb)
             except Exception:
                 pass
             if not flags.get("kb_logged"):
