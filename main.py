@@ -2872,8 +2872,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._typing_skip("disabled", "配置 typing_enabled=关")
                 return False
             if not target:
-                if self._event_is_group(None):
-                    pass
+                # （调用方已解析出 target；这里兜底，正常不会走到）
                 self._typing_skip("not_c2c", "认不出单聊目标（官方 msg_type=6 只支持单聊）")
                 return False
             client = adapter.get_client() if adapter is not None else None
