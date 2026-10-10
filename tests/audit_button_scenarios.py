@@ -210,14 +210,14 @@ check("S1-5 第 4/5 人超额 ⇒ 不再打扰模型（硬模式）",
 import button_tools as BT                                            # noqa: E402
 
 ev = Ev("qq:gm:GRP", p)
-out = run_async(BT.QQButtonStatsTool(ctx=Ctx(p)).execute(ev))
+out = run_async(BT.QQButtonTool(ctx=Ctx(p)).execute(ev, action="stats"))
 check("S1-6 查账：3/3、已截止、名单可见",
       "已点 3 次" in out and ("已截止" in out or "剩 0" in out), out[:150])
 _pol = p.button_policies._pol[key]
 check("S1-7 账本里正好 3 人（超额的没被计入）",
       int(_pol["total"]) == 3 and len(_pol["users"]) == 3,
       f"total={_pol['total']} people={len(_pol['users'])}")
-out2 = run_async(BT.QQButtonExtendTool(ctx=Ctx(p)).execute(ev, add_slots=2))
+out2 = run_async(BT.QQButtonTool(ctx=Ctx(p)).execute(ev, action="extend", add_slots=2))
 res2, _ = clicks(bm, p, a, "GRP", [("U4", "join"), ("U5", "join"), ("U6", "join")])
 check("S1-8 加 2 个名额后：U4/U5 能点（都转达）、U6 又被拦",
       "已调整" in out2 and [len(r) for r in res2] == [1, 2, 2],
@@ -356,13 +356,12 @@ print("\n[S10] 查账工具必须**真的进模型**（线上 bug：ToolSet 静�
 try:
     import button_tools as BT9
 
-    _insts = [BT9.QQButtonStatsTool(ctx=None), BT9.QQButtonCloseTool(ctx=None),
-              BT9.QQButtonResetTool(ctx=None), BT9.QQButtonExtendTool(ctx=None)]
-    _WANT = {"qq_button_stats", "qq_button_close", "qq_button_reset", "qq_button_extend"}
+    _insts = [BT9.QQButtonTool(ctx=None)]
+    _WANT = {"qq_button"}
     try:
         from core.utils.tool_utils import BaseTool as _BT9
 
-        check("S10-1 四个查账工具都继承核心 BaseTool（否则会被静默丢弃）",
+        check("S10-1 按钮工具继承核心 BaseTool（否则会被静默丢弃）",
               all(isinstance(i, _BT9) for i in _insts),
               str([type(i).__name__ for i in _insts]))
     except Exception as _e9a:
@@ -375,7 +374,7 @@ try:
         for _i in _insts:
             _ts9.add(_i)
         _got9 = {t.name for t in _ts9.tools}
-        check("S10-2 ★ 真实 ToolSet.add ⇒ 四个工具都进去了（线上就是这里丢的）",
+        check("S10-2 ★ 真实 ToolSet.add ⇒ 工具真的进去了（线上就是这里丢的）",
               _got9 == _WANT, str(sorted(_got9)))
     except Exception as _e9b:
         check("S10-2 真实 ToolSet 用例", False, f"{type(_e9b).__name__}: {_e9b}")
@@ -408,7 +407,7 @@ try:
         if callable(_hook):
             _hook(_Ev9(), _req9, _TS9())
             _names9 = {t.name for t in _req9.tool_set.tools}
-            check("S10-4 ★ 插件真实注入路径（inject_tools_and_tags）把查账工具送进了模型",
+            check("S10-4 ★ 插件真实注入路径（inject_tools_and_tags）把按钮工具送进了模型",
                   _WANT <= _names9, str(sorted(_names9)))
         else:
             check("S10-4 插件存在 inject_tools_and_tags", False, "钩子缺失")
@@ -416,6 +415,38 @@ try:
         check("S10-4 注入路径用例", False, f"{type(_e9c).__name__}: {_e9c}")
 except Exception as _e9:
     check("S10 段执行", False, f"{type(_e9).__name__}: {_e9}")
+
+# ===================================================================== #
+print("\n[S11] 合并工具 qq_button：四个动作各跑一遍（真实链路）")
+try:
+    import button_tools as BT11
+
+    T11, bm11, a11, p11 = make_env()
+    run_async(p11._tick())
+    _, _k11 = send_kb(T11, bm11, a11, p11, "GRP", {"max": "2", "label": "四动作"},
+                      [{"id": "b1", "render_data": {"label": "报名", "style": 1},
+                        "action": {"type": 1, "data": "join", "permission": {"type": 2}}}])
+    clicks(bm11, p11, a11, "GRP", [("Z1", "join")])
+    _t11 = BT11.QQButtonTool(ctx=Ctx(p11))
+    _ev11 = Ev("qq:gm:GRP", p11)
+    _o_stats = run_async(_t11.execute(_ev11, action="stats", label="四动作"))
+    check("S11-1 action=stats ⇒ 查账输出（人数/结余/状态）",
+          "已点 1 次" in _o_stats, _o_stats[:120])
+    _o_ext = run_async(_t11.execute(_ev11, action="extend", label="四动作", add_slots=1))
+    check("S11-2 action=extend ⇒ 加名额成功", "已调整" in _o_ext and "加 1 个名额" in _o_ext,
+          _o_ext[:120])
+    _o_close = run_async(_t11.execute(_ev11, action="close", label="四动作"))
+    check("S11-3 action=close ⇒ 立刻截止", "已截止" in _o_close, _o_close[:120])
+    _r11, _ = clicks(bm11, p11, a11, "GRP", [("Z2", "join")])
+    check("S11-4 截止后点击不转达（0 次）", len(_r11[0]) == 0, str(len(_r11[0])))
+    _o_reset = run_async(_t11.execute(_ev11, action="reset", label="四动作"))
+    check("S11-5 action=reset ⇒ 清空重开", "已重置" in _o_reset, _o_reset[:120])
+    _r11b, _ = clicks(bm11, p11, a11, "GRP", [("Z3", "join")])
+    check("S11-6 重开后又能点（转达 1 次）", len(_r11b[0]) == 1, str(len(_r11b[0])))
+    _o_bad = run_async(_t11.execute(_ev11, action="nope"))
+    check("S11-7 未知 action ⇒ 明确报错不崩", "未知 action" in _o_bad, _o_bad[:80])
+except Exception as _e11:
+    check("S11 段执行", False, f"{type(_e11).__name__}: {_e11}")
 
 print(f"\n结果：{_PASS[0]} passed, {len(_FAIL)} failed")
 if _FAIL:

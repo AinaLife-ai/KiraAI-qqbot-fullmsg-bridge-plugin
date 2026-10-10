@@ -258,7 +258,7 @@ class InteractionBridge:
                 self._policy_quiet_logged = True
                 self.logger.info(
                     "[QQBOT-BRIDGE] 按钮策略生效：本次点击按策略**未转给模型**"
-                    "（deliver=%s；原因=%s）——模型需要时可以用 qq_button_stats 查账",
+                    "（deliver=%s；原因=%s）——模型需要时可以用 qq_button 查账（action=stats）",
                     _v.get("deliver", "-"), _v.get("reason", "-"))
             # 可选：给用户一句提示（默认关；机械文案一向不推荐，开了才发）
             if _v.get("notify"):

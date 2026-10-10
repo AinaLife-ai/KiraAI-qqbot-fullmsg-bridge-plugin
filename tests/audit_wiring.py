@@ -112,7 +112,7 @@ check("★ 互动事件：认 botpy 的 Interaction 对象", "botpy 的 Interact
 _rc = open(_os.path.join(str(_BR()), "rich_content.py"), encoding="utf-8").read()
 check("★ 键盘元素继承核心 Text（不再吐占位文本）", "_TEXT_BASE = Text" in _rc)
 check("★ 提示词：优先回调按钮 + 正文与按钮同 <msg>",
-      "优先用回调按钮" in _rc and "正文与按钮放进同一个 <msg>" in _rc)
+      "回调按钮" in _rc and "action.type=1" in _rc and "同一个 <msg>" in _rc)
 _ap = open(_os.path.join(str(_BR()), "api_send.py"), encoding="utf-8").read()
 check("★ 键盘不是 markdown 时自动升格", "自动升格成" in _ap or "升格" in _ap)
 
