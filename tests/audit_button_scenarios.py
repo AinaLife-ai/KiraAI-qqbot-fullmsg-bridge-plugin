@@ -763,6 +763,58 @@ try:
 except Exception as _e16:
     check("S16 段执行", False, f"{type(_e16).__name__}: {_e16}")
 
+# ===================================================================== #
+print("\n[S17] 订阅位异常：**只提醒、不自动动任何东西**（用户定案）")
+try:
+    T17, bm17, a17, p17 = make_env()
+    run_async(p17._tick())
+    _flag17 = p17.profiles.setdefault("__intents__", {})
+    _ALL = p17._EXTRA_BIT_MEMBER | p17._EXTRA_BIT_INTERACTION
+    _flag17["patched"] = True
+    _flag17["bits"] = _ALL
+    p17._intents_patched_at = time.time() - 9999
+    p17._intents_warned = False
+    p17._intents_reverted = False
+
+    class _BadGW:
+        _can_reconnect = False
+
+        class _C:
+            closed = True
+        _conn = _C()
+
+    _flag17["gateways"] = [lambda: _BadGW()]
+    _acts = []
+    p17._request_reconnect = lambda name, reason="": _acts.append("reconnect")
+    _orig_revert = p17._revert_extra_intents
+    p17._revert_extra_intents = lambda: _acts.append("revert")
+
+    _warns = []
+    import logging as _lg
+    _old_warn = _lg.getLogger("plugin").warning
+    try:
+        p17._health_check_intents()
+    finally:
+        pass
+    check("S17-1 ★ 异常时**不撤任何订阅位**（按钮的互动位不动）",
+          int(_flag17.get("bits") or 0) == _ALL, hex(int(_flag17.get("bits") or 0)))
+    check("S17-2 ★ 也**不自动重连、不自动回退**（零动作，避免误判代价）",
+          _acts == [], str(_acts))
+    check("S17-3 只提醒一次（不刷屏）",
+          getattr(p17, "_intents_warned", False) is True, str(getattr(p17, "_intents_warned", None)))
+    p17._health_check_intents()
+    check("S17-4 再巡检也不重复动作", _acts == [], str(_acts))
+
+    _src17 = open(os.path.join(str(ROOT), "main.py"), encoding="utf-8").read()
+    check("S17-5 提醒文案告诉用户**自己怎么处理**（关 extra_intents + 重启）",
+          "extra_intents 关掉后重启" in _src17 and "不会自动修改任何订阅位" in _src17, "")
+    check("S17-6 假守卫已修（`done` → `patched`）：禁用插件时能真的摘掉补丁",
+          'flag.get("patched")' in _src17 and "not flag.get(\"done\")" not in _src17, "")
+    check("S17-7 还原路径仍然会调用它（禁用插件 ⇒ 摘掉，不留残patch）",
+          "_revert_extra_intents()" in _src17, "")
+except Exception as _e17:
+    check("S17 段执行", False, f"{type(_e17).__name__}: {_e17}")
+
 print(f"\n结果：{_PASS[0]} passed, {len(_FAIL)} failed")
 if _FAIL:
     print("失败项：" + "；".join(_FAIL))

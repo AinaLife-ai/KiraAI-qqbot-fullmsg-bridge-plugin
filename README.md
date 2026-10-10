@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.43
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.44
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,28 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.44</b> — 订阅位异常改为「**只提醒、不自动动任何东西**」（用户定案）</summary>
+
+### 背景
+`额外订阅位 (extra_intents)` 会多订阅两位（`1<<24 成员事件`、`1<<26 互动回调`）。
+巡检发现长连接异常时，旧版本会**自动回退**订阅位 —— 但这个判定**本身就可能是误判**
+（换网 / 电脑休眠 / 平台例行断线；甚至 `WS_INVALID_SESSION` 也常只是"session 过期要重新 identify"），
+一旦回退真的生效，就会把**互动回调位**一起撤掉 ⇒ **按钮静默失效**。
+
+### 定案：零自动动作
+* 检测到异常 ⇒ **只打一次提醒**（不撤位、不重连、不改任何状态）；
+* 提醒文案**告诉用户怎么处理**："本插件不会自动修改任何订阅位；如果你确实**收不到消息**，
+  再把 `extra_intents` 关掉后重启 KiraAI 即可（代价：按钮点击/成员进出通知不生效）。收发正常就无需操作。"
+* 理由：**"因为一次抖动悄悄弄丢功能"比"多提示一句"危险得多** —— 撤不撤由人决定。
+
+### 附带修掉的真 bug
+`_revert_extra_intents()` 的守卫条件写的是 `flag["done"]`，而全代码**从未给 `done` 赋值** ⇒ 恒真 ⇒
+**它永远是空操作**（旧日志里"已自动回退…"是不准确的）。
+现在守卫改为 `patched`：它**唯一**的调用点是"禁用插件/还原"路径 ⇒ 禁用时能**真的**摘掉补丁、不留残壳。
+
+</details>
+
+<details>
 <summary><b>v1.6.43</b> — 性能修正（学名钩子 113µs→3.1µs）+ openid 全量显示 + `#N` 账本句柄</summary>
 
 ### ① 性能：学名钩子从 113µs 降到 **3.1µs**（36×）
