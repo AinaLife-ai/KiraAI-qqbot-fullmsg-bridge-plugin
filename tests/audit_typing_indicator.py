@@ -634,6 +634,23 @@ async def main():
           and "typing_skip_no_msg_id" in _p17d._typing_skip_done,
           str(_p17d._typing_skip_done))
 
+    def _grp_msg18(is_notice=True):
+        """真 KiraIMMessage（补丁里有 isinstance 检查，假对象过不去）。"""
+        from core.chat import Group, User
+        from core.chat.message_elements import Text
+        from core.chat.message_utils import KiraIMMessage, MessageChain
+
+        m = KiraIMMessage(
+            timestamp=0,
+            group=Group(group_id="GROUP1", group_name="🌟 KiraAI"),
+            sender=User(user_id="MEMBER1", nickname="周武"),
+            is_mentioned=True, is_notice=is_notice, message_id="qqo-TEST",
+            self_id="BOT1",
+            chain=MessageChain([Text("[按钮] 用户点击了：ktv-box-1")]),
+        )
+        m.message_str = "[按钮] 用户点击了：ktv-box-1"
+        return m
+
     print("\n[18] ★★ 群聊判定不误报 + 合成事件（按钮点击）带昵称/群名 + 回归守卫")
 
     # ---- 18a. _event_is_group ----
@@ -711,6 +728,50 @@ async def main():
           and "_register_c2c_turn" in _seg18)
     check("★★ 回归守卫：inject 里**不再有**误插的「认不出单聊目标」分支（它会 return 掉后面全部逻辑）",
           "认不出单聊目标" not in _seg18)
+
+    # ---- 18e. Notice 名字补丁：notice 带上名字、普通消息不受影响 ----
+    class _KiraLike:
+        """模拟核心内置 kira-ai 的 `_format_user_message`（两个分支逐字照抄）。"""
+
+        class _Ctx:
+            def get_timezone(self):
+                return None
+
+        def __init__(self):
+            self.ctx = _KiraLike._Ctx()
+
+        def _get_current_time_str(self, dt=None):
+            return "Oct 10 2026 11:58 Sat"
+
+        def _format_user_message(self, msg):
+            ds = self._get_current_time_str()
+            if msg.is_group_message():
+                if msg.is_notice:
+                    return (f"[{ds}] Notice [group_id: {msg.group.group_id}, "
+                            f"user_id: {msg.sender.user_id}] | {msg.message_str}")
+                return (f"[{ds}] [message_id: {msg.message_id}] [group_name: "
+                        f"{msg.group.group_name} group_id: {msg.group.group_id} "
+                        f"user_nickname: {msg.sender.nickname}, "
+                        f"user_id: {msg.sender.user_id}] | {msg.message_str}")
+            if msg.is_notice:
+                return (f"[{ds}] Notice [user_id: {msg.sender.user_id}] | {msg.message_str}")
+            return (f"[{ds}] [message_id: {msg.message_id}] [user_nickname: "
+                    f"{msg.sender.nickname}, user_id: {msg.sender.user_id}] | {msg.message_str}")
+
+    _k18 = _KiraLike()
+    _before_g = _k18._format_user_message(_grp_msg18())
+    check("★ 补丁前：notice 只有裸 id（复现用户日志里的样子）",
+          "Notice [group_id: GROUP1, user_id: MEMBER1]" in _before_g, _before_g[:90])
+    check("★★ _patch_notice_identity 安装成功", bridge_main._patch_notice_identity(_k18) is True)
+    _after_g = _k18._format_user_message(_grp_msg18())
+    check("★★ 补丁后：notice 带上群名与昵称（模型不再分不清是谁/在哪个群）",
+          "group_name: 🌟 KiraAI" in _after_g and "user_nickname: 周武" in _after_g, _after_g[:120])
+    check("★ 补丁幂等（重复安装不叠加）", bridge_main._patch_notice_identity(_k18) is True)
+    _k18_fake = _KiraLike()
+    bridge_main._patch_notice_identity(_k18_fake)
+    check("★ 普通消息（is_notice=False）的渲染不受影响",
+          _k18_fake._format_user_message(_grp_msg18(is_notice=False))
+          == _KiraLike()._format_user_message(_grp_msg18(is_notice=False)))
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

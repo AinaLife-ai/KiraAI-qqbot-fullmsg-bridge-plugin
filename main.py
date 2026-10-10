@@ -321,6 +321,84 @@ def _identity_path():
             return None
 
 
+def _find_kirai_plugin(plugin_mgr: Any):
+    """从插件注册表里找到 **内置 kira-ai 插件实例**（找不到返回 None）。
+
+    防御式读取（与 sticker_support.plugin_present 同一套思路）：任何异常都当"没有"。
+    """
+    if plugin_mgr is None:
+        return None
+    for getter in ("list_plugins", "get_registered_plugins", "get_plugins"):
+        fn = getattr(plugin_mgr, getter, None)
+        if not callable(fn):
+            continue
+        try:
+            items = fn() or []
+        except Exception:
+            continue
+        entries = list(items.values()) if isinstance(items, dict) else list(items)
+        for item in entries:
+            try:
+                mod = str(getattr(item, "__module__", "") or "")
+                cls = str(type(item).__name__)
+                if "builtin_plugins" in mod and ("kira" in mod.lower() or cls == "KiraAIPlugin"):
+                    return item
+            except Exception:
+                continue
+    return None
+
+
+def _patch_notice_identity(plugin: Any, logger_: Any = None) -> bool:
+    """把 kira-ai 的 `_format_user_message` 包成"notice 也带名字"。幂等。
+
+    is_notice 语义保持不变（历史里仍标记为 notice），只是**显示给模型的那一行**
+    补上 `group_name` / `user_nickname` —— 否则按钮点击/成员事件在模型眼里只有裸 openid。
+    """
+    if plugin is None:
+        return False
+    orig = getattr(plugin, "_format_user_message", None)
+    if not callable(orig):
+        return False
+    if getattr(orig, "_kira_bridge_notice_identity", False):
+        return True
+    try:
+        import types as _types
+        from datetime import datetime as _dt
+
+        from core.chat.message_utils import KiraIMMessage as _KIMM
+
+        def _fmt(plugin_self, msg, _orig=orig):
+            try:
+                if isinstance(msg, _KIMM) and getattr(msg, "is_notice", False):
+                    ts = msg.timestamp
+                    tz = plugin_self.ctx.get_timezone()
+                    dt = _dt.fromtimestamp(ts, tz=tz) if tz else _dt.fromtimestamp(ts)
+                    ds = plugin_self._get_current_time_str(dt=dt)
+                    if msg.is_group_message():
+                        return (f"[{ds}] Notice [group_name: {msg.group.group_name} "
+                                f"group_id: {msg.group.group_id} user_nickname: "
+                                f"{msg.sender.nickname}, user_id: {msg.sender.user_id}]"
+                                f" | {msg.message_str}")
+                    return (f"[{ds}] Notice [user_nickname: {msg.sender.nickname}, "
+                            f"user_id: {msg.sender.user_id}] | {msg.message_str}")
+            except Exception:
+                pass
+            return _orig(msg)
+
+        _fmt._kira_bridge_notice_identity = True
+        _fmt._kira_bridge_orig = orig
+        plugin._format_user_message = _types.MethodType(_fmt, plugin)
+        if logger_ is not None:
+            logger_.info(
+                "[QQBOT-BRIDGE] 已给 kira-ai 补上「Notice 也显示名字」"
+                "（按钮点击/成员事件不再只有裸 openid）")
+        return True
+    except Exception as exc:
+        if logger_ is not None:
+            logger_.debug("[QQBOT-BRIDGE] Notice 名字补丁失败（忽略）: %s", exc)
+        return False
+
+
 def _split_media_and_rest(chain):
     """把消息链拆成 ``(媒体链, 其余链)``；**没有媒体元素就返回 None**。
 
@@ -797,6 +875,14 @@ class QQOfficialGroupBridge(BasePlugin):
             self._sync_keyboard_enter()
         except Exception:
             pass
+        # kira-ai「Notice 也显示名字」补丁（幂等；插件实例可能后于我们加载）
+        if not getattr(self, "_notice_identity_patched", False):
+            try:
+                if _patch_notice_identity(_find_kirai_plugin(
+                        getattr(self.ctx, "plugin_mgr", None)), logger):
+                    self._notice_identity_patched = True
+            except Exception:
+                pass
         adapters = self._find_adapters()
         if not adapters:
             if report:
@@ -1182,6 +1268,12 @@ class QQOfficialGroupBridge(BasePlugin):
                     ),
                     timestamp=ts,
                 )
+                # ★ message_str 是 init=False 的字段：不显式写，日志/提示词那行末尾
+                #   就会是 `| None`（正文丢失）。这里直接补上。
+                try:
+                    event.message.message_str = str(text)
+                except Exception:
+                    pass
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 构造合成事件失败: %s", exc)
                 return False
