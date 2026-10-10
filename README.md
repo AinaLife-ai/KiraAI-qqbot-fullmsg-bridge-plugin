@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.40
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.41
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,17 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.41</b> — 查账文本列出**超额的人**（谁试过没算）；会话标签/键做紧凑</summary>
+
+* 超额不再只报数量，而是**列出是谁**（最多 6 个，超出显示"等 N 人"）：
+  `超额未计入 2 次（周武、未知用户(DEADBEEF…)）`；同一个人多次超额会带 `×N`；
+  没说过话的人仍如实显示 `未知用户(<openid>)`（绝不伪造名字）；
+* 会话标签去冗余（标签本身就是 id 前缀时不再重复显示）；
+* 文本里的键只显示 `短会话id|序号`（完整 sid 保留在结构化字段里）⇒ 省 token。
+
+</details>
+
+<details>
 <summary><b>v1.6.40</b> — 修两个「账本显示」真问题：满额后仍显示「进行中」+ 超额点击不记账</summary>
 
 ### ① 满额后查账永远「进行中」（用户实测）

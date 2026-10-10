@@ -688,6 +688,18 @@ class ButtonPolicyStore:
                              "closed": bool(b.get("closed")),
                              "closed_reason": b.get("closed_reason") or "",
                              "overflow": int(b.get("overflow") or 0)})
+        # ★ 超额的人（谁试过但没算）—— 用户要看的就是这个
+        _ov_map = {}
+        for _bid, _b in (pol.get("btn") or {}).items():
+            for _u, _n in (_b.get("overflow_users") or {}).items():
+                _ov_map[_u] = int(_ov_map.get(_u) or 0) + int(_n)
+        for _u, _n in (pol.get("overflow_users") or {}).items():
+            _ov_map[_u] = max(int(_ov_map.get(_u) or 0), int(_n))
+        _ov_rows = []
+        for _u, _n in sorted(_ov_map.items(), key=lambda kv: -kv[1])[:8]:
+            _nm = (names or {}).get(str(_u)) or ""
+            _ov_rows.append({"uid": str(_u), "name": _nm or f"未知用户({_u})", "count": int(_n)})
+
         # ★ 派生"真正生效的截止状态"（2026-10-11 用户问：满额了为什么还显示进行中？）
         #   scope=each 时"满额"记在**逐按钮桶**上，策略级 closed 仍是 False ⇒ 必须派生。
         _scope = str(pol.get("scope") or "each")
@@ -728,6 +740,7 @@ class ButtonPolicyStore:
             "closed": _eff_closed, "closed_reason": _eff_reason,
             "partial_closed": _partial,
             "overflow": int(pol.get("overflow") or 0),
+            "overflow_rows": _ov_rows,
             "cooldown_hits": int(pol.get("cooldown_hits") or 0),
             "overflow_people": len(pol.get("overflow_users") or {}) or
                                len({u for b in (pol.get("btn") or {}).values()
@@ -1006,6 +1019,8 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
     # ★ 会话**双标识**：名称（人看）+ openid 前 8 位（防重名、bot 也能点名）
     _sess = str(st.get("session") or "").strip()
     _sid_short = str(st.get("sid") or "")[:8]
+    if _sess and _sid_short and _sess.startswith(_sid_short):
+        _sess = ""                      # 标签本身就是 id 前缀 ⇒ 别重复显示
     if _sess and _sid_short:
         _prefix = f"[{_sess} · {_sid_short}] "
     elif _sid_short:
@@ -1014,7 +1029,13 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
         _prefix = f"[{_sess}] "
     else:
         _prefix = ""
-    head = f"【按钮账】{_prefix}{label}（{st.get('key')}）"
+    #: 键只显示「短会话 id|序号」——完整的 sid 在结构化字段里，文本里省 token
+    _key = str(st.get("key") or "")
+    _key_show = _key
+    _sid_full = str(st.get("sid") or "")
+    if _key.startswith(_sid_full + "|"):
+        _key_show = _sid_short + _key[len(_sid_full):]
+    head = f"【按钮账】{_prefix}{label}（{_key_show}）"
     bits = [f"已点 {st.get('total', 0)} 次"]
     if st.get("max"):
         bits.append(f"名额 {st['total']}/{st['max']}，剩 {st.get('remaining', 0)}")
@@ -1041,8 +1062,21 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
         bits.append("状态：进行中")
     _ov = int(st.get("overflow") or 0)
     if _ov:
-        _ovp = int(st.get("overflow_people") or 0)
-        bits.append(f"超额未计入 {_ov} 次" + (f"（{_ovp} 人）" if _ovp else ""))
+        _rows = st.get("overflow_rows") or []
+        def _nm_of(r):
+            nm = str(r.get("name") or "")
+            if not nm or nm.startswith("未知用户("):
+                try:
+                    nm = (name_of(r.get("uid")) or "") if callable(name_of) else nm
+                except Exception:
+                    nm = nm
+            return nm or f"未知用户({r.get('uid')})"
+
+        _who = "、".join(
+            f"{_nm_of(r)}" + (f"×{r.get('count')}" if int(r.get("count") or 1) > 1 else "")
+            for r in _rows[:6])
+        _more = "" if len(_rows) <= 6 else f" 等 {len(_rows)} 人"
+        bits.append(f"超额未计入 {_ov} 次" + (f"（{_who}{_more}）" if _who else ""))
     lines = [head + "｜" + "｜".join(bits)]
     _btns = st.get("buttons") or []
     if len(_btns) > 1:
