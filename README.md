@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.41
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.42
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,24 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.42</b> — 参与者/超额都带 openid；群名与私聊会话名**读时解析**（可回填）；学习钩子覆盖面加大</summary>
+
+* **参与者行也带 openid**：`- 周武（9CD54739） × 1（最后 03:04）`（超额的人同样）⇒ 重名也能区分；
+* **会话名读时解析**：群名在查账时实时查缓存（拿不到就排队拉一次）⇒
+  发按钮时还没群名、事后拿到了也**立刻显示**；私聊显示 `私聊·小美`（对方昵称）；
+* **学习覆盖面加大**：新增 `on_im_message` 钩子（核心**每条 IM 消息**都会调）——
+  连"没吵醒 bot"的消息也能学到昵称；旧的 `on_llm_request` 保留兜底。
+  该钩子**只读事件、只写我们自己的通讯录**（不改 event、不 set `is_stopped`），与核心零冲突。
+
+实测（真实链路）：
+```
+点击时： - 未知用户（78726B95） × 1      ← 还没人说过话
+说话后： - 天阴（78726B95） × 1          ← 同一条账，自动回填（不用重记）
+```
+
+</details>
+
+<details>
 <summary><b>v1.6.41</b> — 查账文本列出**超额的人**（谁试过没算）；会话标签/键做紧凑</summary>
 
 * 超额不再只报数量，而是**列出是谁**（最多 6 个，超出显示"等 N 人"）：

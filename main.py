@@ -4666,3 +4666,23 @@ async def on_llm_request(self, event, request, tag_set, *_, **__):
 
 on.llm_request(priority=Priority.MEDIUM)(on_llm_request)
 QQOfficialGroupBridge.on_llm_request = on_llm_request
+
+
+# --------------------------------------------------------------------------- #
+# 昵称学习（3.0 主线）：`on_im_message` 每条 IM 消息都会跑（核心 receive 阶段
+# `await handler.exec_handler(event)`），比 on_llm_request 覆盖更全 ——
+# 连"没吵醒 bot"的消息也能学到。★ 只读事件、只写我们自己的通讯录：
+#   绝不修改 event、绝不设置 event.is_stopped（否则会把消息吃掉 ⇒ 与核心冲突）。
+# --------------------------------------------------------------------------- #
+async def on_im_message(self, event, *_, **__):
+    try:
+        self._learn_peer_from_event(event)
+    except Exception:
+        pass
+
+
+try:
+    on.im_message(priority=Priority.LOW)(on_im_message)
+    QQOfficialGroupBridge.on_im_message = on_im_message
+except Exception:                     # 2.x 没这个钩子 ⇒ 用 on_llm_request + 事件接管学习
+    pass

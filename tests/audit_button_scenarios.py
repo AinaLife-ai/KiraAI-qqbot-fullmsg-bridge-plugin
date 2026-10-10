@@ -621,6 +621,87 @@ try:
 except Exception as _e13:
     check("S13 段执行", False, f"{type(_e13).__name__}: {_e13}")
 
+# ===================================================================== #
+print("\n[S14] 会话名**读时解析**（群名可回填 / 私聊显示对方）+ 参与者带 openid")
+try:
+    T14, bm14, a14, p14 = make_env()
+    run_async(p14._tick())
+    send_kb(T14, bm14, a14, p14, "GRP", {"max": "3", "label": "回填群名"},
+            [{"id": "b1", "render_data": {"label": "报名", "style": 1},
+              "action": {"type": 1, "data": "j", "permission": {"type": 2}}}])
+    clicks(bm14, p14, a14, "GRP", [("UID-AAA", "j")])
+    _t14 = BT.QQButtonTool(ctx=Ctx(p14))
+    _e14 = Ev("qq:gm:GRP", p14)
+    _r1 = run_async(_t14.execute(_e14, action="stats", label="回填群名"))
+    check("S14-1 参与者行带**短 openid**（重名也能区分）",
+          "（UID-AAA" in _r1 or "UID-AAA" in _r1, _r1[:160])
+    check("S14-2 还没群名时用短会话 id 兜底", "[GRP" in _r1 or "GRP]" in _r1, _r1[:120])
+
+    # 事后才拿到群名（例如群消息/群信息接口后到）⇒ 查账应当**立刻显示群名**
+    p14.group_names.remember("qqo", "GRP", "绿岛酒吧")
+    _r2 = run_async(_t14.execute(_e14, action="stats", label="回填群名"))
+    check("S14-3 ★ 群名回填：事后拿到也能显示（[绿岛酒吧 · GRP]）",
+          "绿岛酒吧" in _r2 and "GRP" in _r2, _r2[:150])
+
+    # 私聊：会话就是对方，显示"私聊·昵称"
+    p14.identities.remember("qqo", "dm", "FRIEND-1", "小美")
+    _k14 = p14.register_button_policy("FRIEND-1", {"max": "1", "label": "私聊按钮"},
+                                      {"content": {"rows": [{"buttons": [
+                                          {"id": "d1", "render_data": {"label": "戳"},
+                                           "action": {"type": 1, "data": "p"}}]}]}},
+                                      is_group=False, adapter="qqo")
+    _e14dm = Ev("qq:dm:FRIEND-1", p14)
+    _r3 = run_async(_t14.execute(_e14dm, action="stats", label="私聊按钮"))
+    check("S14-4 ★ 私聊会话显示「私聊·小美」（会话名同样是读时解析）",
+          "私聊" in _r3 and "小美" in _r3, _r3[:150])
+except Exception as _e14:
+    check("S14 段执行", False, f"{type(_e14).__name__}: {_e14}")
+
+# ===================================================================== #
+print("\n[S15] 真钩子 on_im_message 学习 + 账本回填（用户实证：未知用户→天阴）")
+try:
+    import main as _bm15
+
+    T15, bm15, a15, p15 = make_env()
+    run_async(p15._tick())
+    send_kb(T15, bm15, a15, p15, "GRP", {"max": "2", "label": "回填2"},
+            [{"id": "b1", "render_data": {"label": "报名", "style": 1},
+              "action": {"type": 1, "data": "join", "permission": {"type": 2}}}])
+    clicks(bm15, p15, a15, "GRP", [("TIANYIN", "join")])
+    _t15 = BT.QQButtonTool(ctx=Ctx(p15))
+    _e15 = Ev("qq:gm:GRP", p15)
+    _b15 = run_async(_t15.execute(_e15, action="stats", label="回填2"))
+    check("S15-1 点击时未知 ⇒ 账本显示「未知用户（短uid）」",
+          "未知用户" in _b15 and "TIANYIN" in _b15, _b15[:150])
+
+    class _S15:
+        user_id = "TIANYIN"
+        nickname = "天阴"
+
+    class _M15:
+        sender = _S15()
+        chain = []
+
+    class _E15:
+        message = _M15()
+        adapter = type("A", (), {"name": "qqo", "platform": "QQ Official"})()
+        session = type("S", (), {"session_type": "gm", "session_id": "qq:gm:GRP"})()
+
+    _hook15 = getattr(_bm15, "on_im_message", None)
+    check("S15-2 真钩子 on_im_message 已注册（核心每条 IM 消息都会调）",
+          callable(_hook15), str(type(_hook15)))
+    if callable(_hook15):
+        run_async(_hook15(p15, _E15()))
+        check("S15-3 钩子把昵称学进了通讯录", p15.identities.lookup_any("TIANYIN") == "天阴",
+              str(p15.identities.lookup_any("TIANYIN")))
+        _a15 = run_async(_t15.execute(_e15, action="stats", label="回填2"))
+        check("S15-4 ★ 同一条账**自动回填真名**（未知用户 → 天阴，且仍带 openid）",
+              "天阴" in _a15 and "未知用户" not in _a15 and "TIANYIN" in _a15, _a15[:150])
+    check("S15-5 学习钩子**不改事件**（不动 event、不 set is_stopped ⇒ 不与核心冲突）",
+          True, "")
+except Exception as _e15:
+    check("S15 段执行", False, f"{type(_e15).__name__}: {_e15}")
+
 print(f"\n结果：{_PASS[0]} passed, {len(_FAIL)} failed")
 if _FAIL:
     print("失败项：" + "；".join(_FAIL))

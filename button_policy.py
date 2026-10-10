@@ -1012,12 +1012,13 @@ def render_note(pol: dict, verdict: Dict[str, Any], *,
 
 
 def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
-                      name_of=None) -> str:
+                      name_of=None, session_name: str = "") -> str:
     """把 `stats()` 的字典渲染成一段给模型看的**紧凑**中文。"""
     now = now if now is not None else time.time()
     label = st.get("label") or st.get("key") or "按钮"
     # ★ 会话**双标识**：名称（人看）+ openid 前 8 位（防重名、bot 也能点名）
-    _sess = str(st.get("session") or "").strip()
+    #: 会话名优先用**读时解析**的结果（群名后补也能显示出来 ⇒ 可回填）
+    _sess = str(session_name or st.get("session") or "").strip()
     _sid_short = str(st.get("sid") or "")[:8]
     if _sess and _sid_short and _sess.startswith(_sid_short):
         _sess = ""                      # 标签本身就是 id 前缀 ⇒ 别重复显示
@@ -1072,9 +1073,14 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
                     nm = nm
             return nm or f"未知用户({r.get('uid')})"
 
-        _who = "、".join(
-            f"{_nm_of(r)}" + (f"×{r.get('count')}" if int(r.get("count") or 1) > 1 else "")
-            for r in _rows[:6])
+        def _who_one(r):
+            _nm = _nm_of(r)
+            _nm = "未知用户" if _nm.startswith("未知用户(") else _nm
+            _sc = str(r.get("uid") or "")[:8]
+            _cnt = f"×{r.get('count')}" if int(r.get("count") or 1) > 1 else ""
+            return f"{_nm}（{_sc}）{_cnt}"
+
+        _who = "、".join(_who_one(r) for r in _rows[:6])
         _more = "" if len(_rows) <= 6 else f" 等 {len(_rows)} 人"
         bits.append(f"超额未计入 {_ov} 次" + (f"（{_who}{_more}）" if _who else ""))
     lines = [head + "｜" + "｜".join(bits)]
@@ -1090,7 +1096,9 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
             nm = (name_of(r["uid"]) if callable(name_of) else None) or r.get("name") or \
                  f"未知用户({r['uid']})"
             t = time.strftime("%H:%M", time.localtime(r["last"]))
-            lines.append(f"- {nm} × {r['count']}（最后 {t}）")
+            _short = str(r.get("uid") or "")[:8]
+            _nm2 = nm if nm and not nm.startswith("未知用户(") else "未知用户"
+            lines.append(f"- {_nm2}（{_short}） × {r['count']}（最后 {t}）")
     else:
         lines.append("还没有人点。")
     return "\n".join(lines)

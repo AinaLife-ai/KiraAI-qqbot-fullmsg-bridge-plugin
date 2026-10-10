@@ -213,7 +213,61 @@ class QQButtonTool(BaseTool):
             except Exception:
                 return ""
 
-        return BP.render_stats_text(store.stats(hit, limit=lim), name_of=_name)
+        st = store.stats(hit, limit=lim)
+        # ★ 会话名**读时解析**（群名可能后来才有 ⇒ 这样能回填；私聊显示对方名字）
+        return BP.render_stats_text(st, name_of=_name,
+                                    session_name=self._session_label(event, hit, plugin))
+
+    def _session_label(self, event, pol, plugin) -> str:
+        """会话标签：群 ⇒ 群名（拿不到就空，交给短 id）；私聊 ⇒ 对方昵称。"""
+        try:
+            sid = str(pol.get("sid") or "")
+            if not sid:
+                return ""
+            if pol.get("is_group", True):
+                # 适配器名可能取不到 / 与写入端不一致 ⇒ 逐个候选试（含跨适配器兜底）
+                _names = []
+                _ev_name = str(getattr(getattr(event, "session", None),
+                                       "adapter_name", "") or "")
+                if _ev_name:
+                    _names.append(_ev_name)
+                try:
+                    _names += [str(k) for k in (getattr(plugin, "profiles", {}) or {})]
+                except Exception:
+                    pass
+                try:
+                    _names += [str(n) for n, _a in plugin._find_adapters()]
+                except Exception:
+                    pass
+                _names.append("")
+                nm = None
+                for _an in _names:
+                    try:
+                        nm = plugin.group_names.lookup(_an, sid)
+                    except Exception:
+                        nm = None
+                    if nm:
+                        adapter_name = _an
+                        break
+                else:
+                    adapter_name = _ev_name or (_names[1] if len(_names) > 1 else "")
+                if not nm:
+                    # 顺手排队拉一次（官方 30 QPM、后台任务、失败不重试）
+                    try:
+                        ada = plugin.ctx.adapter_mgr.get_adapter(adapter_name)
+                        plugin.group_names.schedule_fetch(ada, adapter_name, sid,
+                                                          ada.get_client(), __import__("logging").getLogger("plugin"))
+                    except Exception:
+                        pass
+                return str(nm or "")
+            # 私聊：会话 id 就是对方的 user_openid
+            try:
+                nm = plugin.identities.lookup_any(sid) or ""
+            except Exception:
+                nm = ""
+            return f"私聊·{nm}" if nm else "私聊"
+        except Exception:
+            return ""
 
     def _close(self, event, *, label, button_id, message_id, reason, scope="session",
                sid_prefix="") -> str:
