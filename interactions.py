@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any, Optional
 
 from qqbot_bridge import _MARK as _BRIDGE_MARK
@@ -135,6 +136,23 @@ class InteractionBridge:
             return "no-client"
         current = getattr(client, _HANDLER_ATTR, None)
         if getattr(current, "_kira_bridge_owner", None) is not None:
+            # ★ 2026-10-10：能走到这里说明**已经有人挂了** handler。
+            #   若那是"另一份还在跑的旧副本"，它的行为会盖住我们（版本号很新、
+            #   行为却是旧的）—— 这种"说不清"的现场必须留下证据，所以大声喊。
+            try:
+                _owner = getattr(current, "_kira_bridge_owner", None)
+                _omod = getattr(sys.modules.get(getattr(current, "__module__", ""), None),
+                                "__file__", "?")
+                if getattr(self, "_conflict_logged", False) is not True:
+                    self._conflict_logged = True
+                    self.logger.warning(
+                        "[QQBOT-BRIDGE] 互动回调已被**别的实例**接管（owner=%s，定义于 %s）"
+                        " ⇒ 本次不抢；若你刚更新过代码却仍是旧行为，"
+                        "多半就是那份**旧副本**在跑（找找 KiraAI 插件目录下有没有两份 "
+                        "qqbot-fullmsg-bridge / 或没完全重启核心）",
+                        _owner, _omod)
+            except Exception:
+                pass
             return "already"
         if client_has_native_handler(client, _HANDLER_ATTR):
             return "native"

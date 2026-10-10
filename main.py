@@ -244,6 +244,50 @@ def _group_names_path():
 _BANNER_DONE = False
 
 
+def _identity_src_ok(src: str):
+    """纯函数：这段源码里有没有"身份改写"（便于被测试反向验证）。
+
+    返回 ``(是否合格, 缺失项列表)``。
+    """
+    need = {
+        "正文带名": "{_nick} 点击了" in src,
+        "未知用户占位": "未知用户(" in src,
+    }
+    return all(need.values()), [k for k, v in need.items() if not v]
+
+
+def _identity_code_selfcheck() -> str:
+    """运行时自检：**当前真正加载的** `publish_synthetic_event` 里有没有身份改写。
+
+    为什么要它：线上出现过"我装的是新版，日志却是旧行为"的情形。
+    版本号来自 manifest（文件级），而真正执行的是**加载进内存的函数**；
+    只有当场读它的源码，才能证明跑的是哪一份。
+    """
+    src = ""
+    how = ""
+    _cls = globals().get("QQOfficialBridge")
+    if _cls is not None:
+        try:
+            import inspect
+
+            src = inspect.getsource(_cls.publish_synthetic_event)
+            how = "内存中的函数"
+        except Exception:                        # noqa: BLE001
+            src = ""
+    if not src:
+        try:
+            with open(os.path.join(_PLUGIN_DIR, "main.py"), encoding="utf-8") as _fh:
+                src = _fh.read()
+            how = "磁盘 main.py"
+        except Exception as exc:                 # noqa: BLE001
+            return f"?（读不到: {type(exc).__name__}）"
+    _ok, _bad = _identity_src_ok(src)
+    if _ok:
+        # 再报一个指纹：源码行数（对照安装包能立刻发现"其实是旧文件"）
+        return f"✅（{how}，{len(src.splitlines())} 行）"
+    return f"❌ 缺失={','.join(_bad)} ⇒ **加载的是旧 main.py**（或装到了别的副本）"
+
+
 def _log_banner_once() -> None:
     """打一条"信息量大"的启动横幅（**排查问题的第一现场**）。
 
@@ -285,10 +329,15 @@ def _log_banner_once() -> None:
     except Exception:
         trim_ok = "?"
     logger.info(
-        "[QQBOT-BRIDGE] ╔═ 版本 v%s｜语音转码：silk 编码器=%s、ffmpeg=%s｜"
-        "图片规范化(Pillow)=%s｜语音条上限=%s═╗ "
+        # ★ 2026-10-10：**把"加载自哪个目录"也打出来** —— 线上出现过
+        #   "我说更新了、日志却还是旧行为"的情形（合并 PR ≠ 装上了文件）。
+        #   有这一行，看一眼就知道跑的是哪一份代码；若日志正文还是
+        #   `[按钮] 用户点击了：`（旧文案）而版本显示 >= 1.6.27 ⇒ 装到了别的副本。
+        "[QQBOT-BRIDGE] ╔═ 版本 v%s（加载自 %s）｜**身份改写=%s**｜"
+        "语音转码：silk 编码器=%s、ffmpeg=%s｜图片规范化(Pillow)=%s｜语音条上限=%s═╗ "
         "想确认问题请先看这一行（日志里搜 QQBOT-BRIDGE）",
-        _plugin_version(), silk_ok, ff_ok, pil_ok, trim_ok,
+        _plugin_version(), _PLUGIN_DIR, _identity_code_selfcheck(),
+        silk_ok, ff_ok, pil_ok, trim_ok,
     )
 
 
@@ -1333,6 +1382,17 @@ class QQOfficialGroupBridge(BasePlugin):
                     _text2 = _text2.replace("用户点击了", f"{_nick} 点击了", 1)
                 else:
                     _text2 = f"{_text2}（{_nick}）"
+            # ★ 每次点击一行诊断（2026-10-10）：把"身份怎么来、正文最终长啥样"
+            #   一次性摊开 —— 版本争议/装没装上，看这一行就结束。
+            try:
+                logger.info(
+                    "[QQBOT-BRIDGE] 合成事件身份：uid=%s ⇒ 身份=%s（%s）｜正文=%s",
+                    str(sender_id)[:12], _nick,
+                    "通讯录" if _from_store else "未知占位",
+                    _text2[:60],
+                )
+            except Exception:
+                pass
             try:
                 event = KiraMessageEvent(
                     adapter=adapter.info,

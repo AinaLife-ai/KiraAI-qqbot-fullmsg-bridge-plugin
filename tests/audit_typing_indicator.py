@@ -761,6 +761,89 @@ async def main():
         _hard = [lit for lit in ('"qqo"', "'qqo'", '"qq"', "'qq'")
                  if lit in _src_guard]
         check("★★ 源码里**没有**硬编码适配器名字面量（防回归）", not _hard, str(_hard))
+        try:
+            import main as _m29
+
+            _sc = _m29._identity_code_selfcheck()
+            check("★★ 运行时自检（当前加载的代码有身份改写）必须为 ✅",
+                  str(_sc).startswith("✅"), str(_sc))
+            # 反向验证：喂"旧代码"源码 ⇒ 判据必须为假（证明它真在查这两处，不是摆设）
+            _ok_old, _bad_old = _m29._identity_src_ok(
+                "def publish_synthetic_event(self, **kw): return True   # 旧版：无改写")
+            check("★★ 反向验证：旧源码判据必须为假（❌）", _ok_old is False and bool(_bad_old), str(_bad_old))
+            _ok_new, _bad_new = _m29._identity_src_ok(
+                'x = f"{_nick} 点击了"' + "\n" + 'y = f"未知用户({sender_id})"')
+            check("★★ 正向判据：含改写片段必须为真（✅）", _ok_new is True and not _bad_new, str(_bad_new))
+            check("★★ 自检作用于本仓库 main.py 时必须合格",
+                  str(_m29._identity_src_ok(open(_BR() + "/main.py", encoding="utf-8").read())[0]) == "True", "")
+        except Exception as _e29:
+            check("★★ 自检测试执行", False, f"{type(_e29).__name__}: {_e29}")
+
+        # ★★ 2026-10-10 用户质疑（线上 Notice 仍是 None）⇒ 直接跑**全链路**：
+        #   真实 InteractionBridge + 真实回调 body ⇒ 断言事件正文带真名、旧文案不残留。
+        try:
+            from interactions import InteractionBridge as _IB
+
+            async def _fake_ack(_iid, _code):
+                _acked4.append((_iid, _code))
+
+            _a4 = T18.make_adapter()
+            _p4 = T18.make_plugin(_a4)
+            _cap4 = []
+            _a4.publish = lambda ev: _cap4.append(ev)
+            _uid4 = "9CD54739CC9BAA46B93243088802DC72"     # ← 用户日志里的那个人
+            _key4 = str(getattr(_a4.info, "name", "qqo"))
+            _p4.identities.remember(_key4, "gm", _uid4, "周武")
+            _acked4 = []
+            _client4 = SimpleNamespace(api=SimpleNamespace(on_interaction_result=_fake_ack))
+            _br4 = _IB(_p4, __import__("logging").getLogger("plugin"))
+            _body4 = {
+                "id": "IT-USERLOG-1", "type": 11,          # 11 = 消息按钮回调
+                "data": {"resolved": {"button_data": "/香香在", "button_id": "b1"}},
+                "group_openid": "D593FBB0F18264477911ECDCBF336D6F",
+                "group_member_openid": _uid4,
+            }
+            # 本套件自身跑在事件循环里 ⇒ 用**独立线程**开新循环跑这段异步链路
+            import threading as _th4
+
+            _err4 = []
+
+            def _run4():
+                _loop4 = asyncio.new_event_loop()
+                try:
+                    _loop4.run_until_complete(_br4._on_interaction(_client4, _body4))
+                except Exception as _e:
+                    _err4.append(_e)
+                finally:
+                    _loop4.close()
+
+            _t4 = _th4.Thread(target=_run4)
+            _t4.start()
+            _t4.join(20)
+            if _err4:
+                raise _err4[0]
+
+            _msg4 = None
+            if _cap4:
+                try:
+                    _msg4 = _cap4[-1].message
+                except Exception:
+                    _msg4 = None
+            _txt4 = ""
+            if _msg4 is not None:
+                try:
+                    _txt4 = str(_msg4.chain[0].text)
+                except Exception:
+                    _txt4 = str(getattr(_msg4, "message_str", "") or "")
+            check("★★ 全链路（真实回调 body）⇒ 正文带真名、旧文案「用户点击了」不残留",
+                  "周武" in _txt4 and "用户点击了" not in _txt4, repr(_txt4))
+            check("★★ 全链路 ⇒ nickname 字段也=周武（Notice 头部就会显示人名）",
+                  getattr(_msg4.sender, "nickname", None) == "周武" if _msg4 else False,
+                  repr(getattr(getattr(_msg4, "sender", None), "nickname", None)))
+            check("★★ 全链路 ⇒ 平台回执已发出（官方 3 秒硬要求）",
+                  bool(_acked4) and _acked4[0][1] == 0, str(_acked4[:1]))
+        except Exception as _e4:
+            check("★★ 全链路测试执行", False, f"{type(_e4).__name__}: {_e4}")
 
         check("★★ 完全没记录 ⇒ 占位是「未知用户(<openid>)」（不是真名、可核对）",
               _m18c is not None

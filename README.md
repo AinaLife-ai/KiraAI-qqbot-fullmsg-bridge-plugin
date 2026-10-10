@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.28
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.29
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -461,10 +461,48 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 
 ## 更新日志
 
+## ✅ 怎么确认你装的是新版（排查第一步）
+
+> 线上真实教训：合并了 PR ≠ 装上了文件。**一句话判据** —— 看按钮点击那条消息的正文：
+
+| 正文长相 | 说明 |
+|---|---|
+| `[按钮] 用户点击了：/香香在` | **旧版（≤ v1.6.26）** —— v1.6.27 起绝不会是这个样子 ✗ |
+| `[按钮] 周武 点击了：/香香在` | 新版，且**认出了真名**（与群聊普通消息同源）✓ |
+| `[按钮] 未知用户(<openid>) 点击了：…` | 新版，但这人**没说过话**（官方无接口查昵称，用 openid 占位）✓ |
+
+另有两个硬证据：
+1. **启动横幅**（日志里搜 `QQBOT-BRIDGE`）：
+   `╔═ 版本 v1.6.29（加载自 /path/to/plugins/qqbot-fullmsg-bridge）…`
+   —— 版本 + **代码目录**都在这一行；目录不对 ⇒ 装到别的副本去了；
+2. 直接看插件目录里的 `manifest.json` 的 `version` 字段。
+
 ## 更新日志
 
 <details open>
-<summary><b>v1.6.28</b> — 验证：**不硬绑定适配器名**（用户改过名字也照样认得出真名）</summary>
+<summary><b>v1.6.29</b> — 全链路自证 + 「你装的到底是哪一版」一眼可辨</summary>
+
+### 起因（用户 13:48 日志）
+按钮点击仍是 `user_nickname: None` + 正文 `[按钮] 用户点击了：/香香在` ——
+**而同一时刻的普通消息却显示 `user_nickname: 周武`**（同一 openid `9CD5…`）。
+
+### 硬查结论
+* 全仓库产出这句话的地方**只有一处**：`interactions.py:205`；
+* v1.6.27 已在构造事件时把身份写进正文，且**逐行确认事件用的是改写后的文本**
+  （`chain=MessageChain([Text(_text2)])`、`message_str=_text2`）、`sender.nickname=_nick`；
+* ⇒ **用户线上跑的是 ≤ v1.6.26**：日志正文格式还是旧文案（新版**必定**是
+  `[按钮] 周武 点击了：…` 或 `[按钮] 未知用户(<openid>) 点击了：…`，不可能停在 `用户`）。
+
+### 本版加的"自证"手段
+1. **启动横幅打印代码目录**：`版本 vX（加载自 <绝对路径>）` ⇒ 装错副本一眼可见；
+2. **全链路测试**（不是只测函数）：真实 `InteractionBridge` 收**真实回调 body**
+   （type=11 + `data.resolved.button_data` + `group_member_openid`）
+   ⇒ 断言 ① 正文带真名且旧文案不残留 ② `nickname` 字段=真名 ③ 回执已发出；
+
+</details>
+
+<details>
+<summary><b>v1.6.29</b> — 验证：**不硬绑定适配器名**（用户改过名字也照样认得出真名）</summary>
 
 ### 用户疑问
 "你的适配器没有硬绑定用户自己改的适配器名字来检查吧？"
