@@ -349,7 +349,7 @@ def _find_kirai_plugin(plugin_mgr: Any):
 
 
 #: Notice 补丁的版本戳（改了实现就 +1 —— 保证热重载能替换掉旧实现）
-_NOTICE_PATCH_BUILD = "2"
+_NOTICE_PATCH_BUILD = "3"
 
 
 def _patch_notice_identity(plugin: Any, logger_: Any = None) -> bool:
@@ -372,6 +372,16 @@ def _patch_notice_identity(plugin: Any, logger_: Any = None) -> bool:
     target_cls = plugin if is_cls else type(plugin)
     # 统一取底层函数（未绑定）
     orig_fn = raw if is_cls else getattr(raw, "__func__", raw)
+    # ★★★ 2026-10-10 线上第二次事故：**我们自己的旧补丁还在类上**时，
+    #   `raw` 拿到的是旧补丁本身 ⇒ 再包一层就成"套娃"（调用链里又走到坏那层）。
+    #   ⇒ 一路沿 `_kira_bridge_orig` 剥到**真正的原始函数**。
+    _hops = 0
+    while getattr(orig_fn, "_kira_bridge_notice_identity", None) and _hops < 8:
+        _nxt = getattr(orig_fn, "_kira_bridge_orig", None)
+        if not callable(_nxt):
+            break
+        orig_fn = _nxt
+        _hops += 1
     # ★ 版本化标记：热重载时若类上残留的是**旧版**（含已知会崩的那版）就重新包装，
     #   否则坏补丁会一直留在类上、只有完整重启才会好。
     if getattr(orig_fn, "_kira_bridge_notice_identity", None) == _NOTICE_PATCH_BUILD:
@@ -397,8 +407,12 @@ def _patch_notice_identity(plugin: Any, logger_: Any = None) -> bool:
                             f"user_id: {msg.sender.user_id}] | {msg.message_str}")
             except Exception:
                 pass
-            # ★ 一定按"未绑定函数"调用：自带 self，绝不会少参数
-            return _orig(self, msg)
+            # ★ 主路：按"未绑定函数"调用（自带 self）；万一对方其实是绑定方法，
+            #   这里会 TypeError —— 再按"已绑定"调一次（绝不把 kira-ai 搞崩）。
+            try:
+                return _orig(self, msg)
+            except TypeError:
+                return _orig(msg)
 
         _fmt._kira_bridge_notice_identity = _NOTICE_PATCH_BUILD
         _fmt._kira_bridge_orig = orig_fn

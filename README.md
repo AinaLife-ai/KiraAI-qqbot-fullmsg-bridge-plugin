@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.25
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.26
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -464,6 +464,37 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.26</b> — 🚑 二修 Notice 补丁：**"套娃"**（把旧补丁当成了原始实现）</summary>
+
+### 现象（v1.6.25 仍然报错）
+```
+qqbot-bridge/main.py:401 in _fmt → return _orig(self, msg)
+qqbot-bridge/main.py:386 in _fmt → if isinstance(msg, _KIMM) ...
+TypeError: 'KiraIMMessage' object is not callable
+```
+
+### 根因
+v1.6.24 那层**坏补丁已经打在类上**（类对象跨插件重载存活）。v1.6.25 重新包装时
+`raw = getattr(类, 方法)` 拿到的其实是**我们自己的旧补丁**，于是把它当"原始实现"包了起来
+⇒ 调用链变成 `新补丁 → 旧坏补丁 → …`，绑定依旧错位。
+
+### 修法
+* **剥壳**：包装前一路沿 `_kira_bridge_orig` 往下剥，直到拿到**真正的原始函数**
+  （不管被套了几层）；
+* **兜底调用**：`_orig(self, msg)` 若因绑定形态不对而 `TypeError`，自动退回 `_orig(msg)`；
+* 版本戳 `_NOTICE_PATCH_BUILD` +1 ⇒ 热重载必定重包，**不必等完整重启**。
+
+### 新增回归用例（这次专门模拟"套娃"）
+在类上先留一层**旧式坏补丁**（把未绑定函数当已绑定调），再用新补丁去修：
+* 新补丁必须**一路剥到真原始** ⇒ 普通消息照常渲染（不再 TypeError）✓
+* notice 仍带 `group_name` / `user_nickname` ✓
+
+**教训（本轮第二次）**：给"别人的方法"打补丁，不仅要**用真实对象形态测**，
+还要**假定对方（或自己以前的版本）已经打过补丁** —— 包装前必须先剥到原始实现。
+
+</details>
+
+<details>
 <summary><b>v1.6.25</b> — 🚑 紧急修：Notice 名字补丁的**绑定 bug**（会让 kira-ai 的 on_llm_req 报错）</summary>
 
 ### 现象（线上 ERROR）

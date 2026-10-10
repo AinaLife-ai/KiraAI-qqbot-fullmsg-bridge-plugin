@@ -787,6 +787,39 @@ async def main():
         check("★★ 打补丁后：notice 带上群名与昵称",
               "group_name: 🌟 KiraAI" in _notice_after and "user_nickname: 周武" in _notice_after,
               _notice_after[:140])
+        # ★★★ 模拟线上第二次事故（"套娃"）：
+        #   类上先留一层 **v1.6.24 那种坏补丁**（把未绑定函数当已绑定调），
+        #   新补丁必须能**一路剥到真原始**、让普通消息照常渲染。
+        class _Victim:
+            class _Ctx2:
+                def get_timezone(self):
+                    return None
+
+            def __init__(self):
+                self.ctx = _Victim._Ctx2()
+
+            def _get_current_time_str(self, dt=None):
+                return "T"
+
+            def _format_user_message(self, msg):
+                return f"ORIG|{getattr(msg, 'message_str', '')}"
+
+        def _old_broken_fmt(self, msg, _orig=_Victim._format_user_message):
+            return _orig(msg)            # ✗ 旧版就是这里少传 self
+
+        _old_broken_fmt._kira_bridge_notice_identity = True     # 旧标记（非当前 build）
+        _old_broken_fmt._kira_bridge_orig = _Victim._format_user_message
+        _Victim._format_user_message = _old_broken_fmt           # 坏补丁已在类上
+        check("★ 套娃场景已就位（类上是旧坏补丁）",
+              _Victim._format_user_message is _old_broken_fmt)
+        bridge_main._patch_notice_identity(_Victim)
+        _v = _Victim()
+        _v_normal = _v._format_user_message(_mk18(False))
+        check("★★★ 套娃自愈：新补丁一路剥到**真原始** ⇒ 普通消息照常渲染（不再 TypeError）",
+              _v_normal.startswith("ORIG|"), _v_normal[:80])
+        _v_notice = _v._format_user_message(_mk18(True))
+        check("★★ 且 notice 仍带名字", "group_name" in _v_notice, _v_notice[:100])
+
         check("★★ 传**实例**再打一次也安全（幂等、不叠加）",
               bridge_main._patch_notice_identity(_inst2) is True
               and "user_nickname: 周武" in _inst2._format_user_message(_mk18(False)))
