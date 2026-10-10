@@ -733,6 +733,35 @@ async def main():
         _p18b.publish_synthetic_event(target_id="GROUPX", sender_id="NOBODY-KNOWN",
                                       is_group=True, text="[按钮] 用户点击了：fin-9")
         _m18c = _cap2[-1].message if _cap2 else None
+        # ★★ 用户疑问（2026-10-10）：会不会**硬绑定**适配器名？
+        #   实测三种"名字被改过"的情形都必须照样能查到真名：
+        #     A. 用户把适配器的**显示名**改了（info.name = 自定义）
+        #     B. 学习时用的名字与发送时的注册名**完全不同**（跨适配器兜底）
+        #     C. 完全按注册名来（常规情形）
+        for _case, _learn_key in (("A 显示名自定义", "我自己改的名字"),
+                                  ("B 学习端名字完全不同", "another-bot"),
+                                  ("C 常规", None)):
+            _a2 = T18.make_adapter()
+            _p2 = T18.make_plugin(_a2)
+            _cap3 = []
+            _a2.publish = lambda ev: _cap3.append(ev)
+            if _case.startswith("A"):
+                try:
+                    _a2.info.name = "我自己改的名字"
+                except Exception:
+                    pass
+            _key = _learn_key or str(getattr(_a2.info, "name", "qqo"))
+            _p2.identities.remember(_key, "gm", "UID-" + _case[:1], "周武")
+            _p2.publish_synthetic_event(target_id="G9", sender_id="UID-" + _case[:1],
+                                        is_group=True, text="[按钮] 用户点击了：fin-1")
+            _nick2 = getattr(_cap3[-1].message.sender, "nickname", None) if _cap3 else None
+            check(f"★★ {_case} ⇒ 仍拿到真名（无硬绑定）", _nick2 == "周武", repr(_nick2))
+
+        _src_guard = open(_BR() + "/main.py", encoding="utf-8").read()
+        _hard = [lit for lit in ('"qqo"', "'qqo'", '"qq"', "'qq'")
+                 if lit in _src_guard]
+        check("★★ 源码里**没有**硬编码适配器名字面量（防回归）", not _hard, str(_hard))
+
         check("★★ 完全没记录 ⇒ 占位是「未知用户(<openid>)」（不是真名、可核对）",
               _m18c is not None
               and str(getattr(_m18c.sender, "nickname", "")).startswith("未知用户(")

@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.27
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.28
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -464,6 +464,33 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.28</b> — 验证：**不硬绑定适配器名**（用户改过名字也照样认得出真名）</summary>
+
+### 用户疑问
+"你的适配器没有硬绑定用户自己改的适配器名字来检查吧？"
+
+### 结论：没有硬绑定 ✓
+* 源码里**没有**任何 `"qq"` / `"qqo"` 字面量（有测试守卫，加了就红）；
+* 查名字的顺序是**运行时取值**：
+  1. `adapter.info.name`（**与学习端同一个来源** —— 名字就是这么学来的）；
+  2. 适配器**注册名**（`_find_adapters()` 给的 key）；
+  3. `IdentityStore.lookup_any()` —— **跨适配器兜底扫描**（key 形如 `adapter|uid`，
+     扫后缀即可，与适配器名无关）。
+
+### 实测（三种"名字被改过"的情形都过）
+| 情形 | 结果 |
+|---|---|
+| A 用户把适配器**显示名**改了（`info.name` = 自定义） | 仍拿到 `周武` ✓ |
+| B 学习时用的名字与发送时注册名**完全不同**（走兜底扫描） | 仍拿到 `周武` ✓ |
+| C 常规（两边同名） | 仍拿到 `周武` ✓ |
+
+> 补充说明：**群名缓存**不存在这个风险 —— 它的**写入端与读取端用的是同一个 key**
+> （注册名），自洽；昵称那套之所以出问题，是因为写入端用的是 `info.name`
+> （这是本轮修复的根因）。
+
+</details>
+
+<details>
 <summary><b>v1.6.27</b> — ★★ 按钮点击的"是谁"修好了：跨适配器查名字 + 身份写进正文</summary>
 
 ### 现象
