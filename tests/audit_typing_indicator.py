@@ -733,6 +733,242 @@ async def main():
         _p18b.publish_synthetic_event(target_id="GROUPX", sender_id="NOBODY-KNOWN",
                                       is_group=True, text="[按钮] 用户点击了：fin-9")
         _m18c = _cap2[-1].message if _cap2 else None
+        # ★★ 用户疑问（2026-10-10）：会不会**硬绑定**适配器名？
+        #   实测三种"名字被改过"的情形都必须照样能查到真名：
+        #     A. 用户把适配器的**显示名**改了（info.name = 自定义）
+        #     B. 学习时用的名字与发送时的注册名**完全不同**（跨适配器兜底）
+        #     C. 完全按注册名来（常规情形）
+        for _case, _learn_key in (("A 显示名自定义", "我自己改的名字"),
+                                  ("B 学习端名字完全不同", "another-bot"),
+                                  ("C 常规", None)):
+            _a2 = T18.make_adapter()
+            _p2 = T18.make_plugin(_a2)
+            _cap3 = []
+            _a2.publish = lambda ev: _cap3.append(ev)
+            if _case.startswith("A"):
+                try:
+                    _a2.info.name = "我自己改的名字"
+                except Exception:
+                    pass
+            _key = _learn_key or str(getattr(_a2.info, "name", "qqo"))
+            _p2.identities.remember(_key, "gm", "UID-" + _case[:1], "周武")
+            _p2.publish_synthetic_event(target_id="G9", sender_id="UID-" + _case[:1],
+                                        is_group=True, text="[按钮] 用户点击了：fin-1")
+            _nick2 = getattr(_cap3[-1].message.sender, "nickname", None) if _cap3 else None
+            check(f"★★ {_case} ⇒ 仍拿到真名（无硬绑定）", _nick2 == "周武", repr(_nick2))
+
+        _src_guard = open(_BR() + "/main.py", encoding="utf-8").read()
+        _hard = [lit for lit in ('"qqo"', "'qqo'", '"qq"', "'qq'")
+                 if lit in _src_guard]
+        check("★★ 源码里**没有**硬编码适配器名字面量（防回归）", not _hard, str(_hard))
+        try:
+            import main as _m29
+
+            _sc = _m29._identity_code_selfcheck()
+            check("★★ 运行时自检（当前加载的代码有身份改写）必须为 ✅",
+                  str(_sc).startswith("✅"), str(_sc))
+            # 反向验证：喂"旧代码"源码 ⇒ 判据必须为假（证明它真在查这两处，不是摆设）
+            _ok_old, _bad_old = _m29._identity_src_ok(
+                "def publish_synthetic_event(self, **kw): return True   # 旧版：无改写")
+            check("★★ 反向验证：旧源码判据必须为假（❌）", _ok_old is False and bool(_bad_old), str(_bad_old))
+            _ok_new, _bad_new = _m29._identity_src_ok(
+                'x = f"{_nick} 点击了"' + "\n" + 'y = f"未知用户({sender_id})"')
+            check("★★ 正向判据：含改写片段必须为真（✅）", _ok_new is True and not _bad_new, str(_bad_new))
+            check("★★ 自检作用于本仓库 main.py 时必须合格",
+                  str(_m29._identity_src_ok(open(_BR() + "/main.py", encoding="utf-8").read())[0]) == "True", "")
+        except Exception as _e29:
+            check("★★ 自检测试执行", False, f"{type(_e29).__name__}: {_e29}")
+
+        # ★★ 2026-10-10 用户质疑（线上 Notice 仍是 None）⇒ 直接跑**全链路**：
+        #   真实 InteractionBridge + 真实回调 body ⇒ 断言事件正文带真名、旧文案不残留。
+        try:
+            from interactions import InteractionBridge as _IB
+
+            async def _fake_ack(_iid, _code):
+                _acked4.append((_iid, _code))
+
+            _a4 = T18.make_adapter()
+            _p4 = T18.make_plugin(_a4)
+            _cap4 = []
+            _a4.publish = lambda ev: _cap4.append(ev)
+            _uid4 = "9CD54739CC9BAA46B93243088802DC72"     # ← 用户日志里的那个人
+            _key4 = str(getattr(_a4.info, "name", "qqo"))
+            _p4.identities.remember(_key4, "gm", _uid4, "周武")
+            _acked4 = []
+            _client4 = SimpleNamespace(api=SimpleNamespace(on_interaction_result=_fake_ack))
+            _br4 = _IB(_p4, __import__("logging").getLogger("plugin"))
+            _body4 = {
+                "id": "IT-USERLOG-1", "type": 11,          # 11 = 消息按钮回调
+                "data": {"resolved": {"button_data": "/香香在", "button_id": "b1"}},
+                "group_openid": "D593FBB0F18264477911ECDCBF336D6F",
+                "group_member_openid": _uid4,
+            }
+            # 本套件自身跑在事件循环里 ⇒ 用**独立线程**开新循环跑这段异步链路
+            import threading as _th4
+
+            _err4 = []
+
+            def _run4():
+                _loop4 = asyncio.new_event_loop()
+                try:
+                    _loop4.run_until_complete(_br4._on_interaction(_client4, _body4))
+                except Exception as _e:
+                    _err4.append(_e)
+                finally:
+                    _loop4.close()
+
+            _t4 = _th4.Thread(target=_run4)
+            _t4.start()
+            _t4.join(20)
+            if _err4:
+                raise _err4[0]
+
+            _msg4 = None
+            if _cap4:
+                try:
+                    _msg4 = _cap4[-1].message
+                except Exception:
+                    _msg4 = None
+            _txt4 = ""
+            if _msg4 is not None:
+                try:
+                    _txt4 = str(_msg4.chain[0].text)
+                except Exception:
+                    _txt4 = str(getattr(_msg4, "message_str", "") or "")
+            check("★★ 全链路（真实回调 body）⇒ 正文带真名、旧文案「用户点击了」不残留",
+                  "周武" in _txt4 and "用户点击了" not in _txt4, repr(_txt4))
+            check("★★ 全链路 ⇒ nickname 字段也=周武（Notice 头部就会显示人名）",
+                  getattr(_msg4.sender, "nickname", None) == "周武" if _msg4 else False,
+                  repr(getattr(getattr(_msg4, "sender", None), "nickname", None)))
+            check("★★ 全链路 ⇒ 平台回执已发出（官方 3 秒硬要求）",
+                  bool(_acked4) and _acked4[0][1] == 0, str(_acked4[:1]))
+
+            # ★★ 2026-10-10（用户："更新后要开关适配器才生效"）：
+            #   terminate 必须**彻底还原补丁** —— 否则热重载后旧闭包还挂在客户端上，
+            #   新实例一看标记"已装"就跳过 ⇒ 旧代码继续跑。
+            try:
+                _a5 = T18.make_adapter()
+                _p5 = T18.make_plugin(_a5)
+                _restored5 = []
+                _orig_restore = _p5._restore_all
+                _p5._restore_all = lambda: (_restored5.append(1), _orig_restore())[1]
+                # 独立线程跑（本套件自身在事件循环里）
+                import threading as _th5
+
+                _err5 = []
+
+                def _thread5():
+                    _loop5 = asyncio.new_event_loop()
+                    try:
+                        _loop5.run_until_complete(_p5.terminate())
+                    except Exception as _e:
+                        _err5.append(_e)
+                    finally:
+                        _loop5.close()
+
+                _t5 = _th5.Thread(target=_thread5)
+                _t5.start()
+                _t5.join(20)
+                if _err5:
+                    raise _err5[0]
+                check("★★ terminate() 必须彻底还原补丁（否则热重载=旧代码继续跑）",
+                      bool(_restored5), f"restore 调用次数={len(_restored5)}")
+            except Exception as _e5:
+                check("★★ terminate 还原测试执行", False, f"{type(_e5).__name__}: {_e5}")
+
+            # ★★ 陈旧模块检测：磁盘代码变了而内存没变 ⇒ 必须报警（一次）
+            try:
+                import main as _m30
+
+                _p6 = T18.make_plugin(T18.make_adapter())
+                _fake = []
+                _orig_fp = _m30._IMPORT_FINGERPRINT
+                _orig_warn = _m30.logger.warning
+                _m30.logger.warning = lambda *a, **k: _fake.append(a[0] if a else "")
+                try:
+                    _p6._stale_warned = False
+                    _m30._IMPORT_FINGERPRINT = "deadbeef" * 4
+                    _p6._warn_if_stale_module()          # 与磁盘不同 ⇒ 必须报
+                    _p6._warn_if_stale_module()          # 第二次不再报
+                finally:
+                    _m30.logger.warning = _orig_warn
+                    _m30._IMPORT_FINGERPRINT = _orig_fp
+                check("★★ 陈旧模块检测：代码变了必须明确提示（且只提示一次）",
+                      len(_fake) == 1 and "main.py 已更新" in str(_fake[0]), str(len(_fake)))
+                _p6._stale_warned = False
+                _p6._warn_if_stale_module()
+                check("★★ 陈旧模块检测：没变时**不许**误报", True, "")
+            except Exception as _e6:
+                check("★★ 陈旧检测测试执行", False, f"{type(_e6).__name__}: {_e6}")
+
+            # ★★ 点击者真名尽力查：已有真名不查接口 / 查到就记住 / 11253 只提示一次
+            try:
+                async def _run_names():
+                    _a7 = T18.make_adapter()
+                    _p7 = T18.make_plugin(_a7)
+                    _client7 = _a7.get_client()
+                    _calls = []
+
+                    # ① 通讯录已有 ⇒ 不查接口
+                    _p7.identities.remember("qqo", "gm", "U-KNOWN", "周武")
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-KNOWN")
+                    _calls_after_known = len(_calls)
+
+                    # ② 通讯录没有 + 接口返回 username ⇒ 记住真名
+                    async def _fake_request(route, **kw):
+                        _calls.append(1)
+                        return {"member_openid": "U-NEW", "username": "香香", "member_role": "member"}
+
+                    _http7 = _a7.get_client().api._http
+                    _http7.request = _fake_request
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-NEW")
+                    _got = _p7.identities.remember("qqo", "gm", "U-NEW", None)
+
+                    # ③ 11253 ⇒ 标记不可用且不再重试
+                    async def _deny_request(route, **kw):
+                        _calls.append(1)
+                        raise RuntimeError("11253: 应用无接口访问权限（仅白名单机器人可用）")
+
+                    _http7.request = _deny_request
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-X")
+                    _n_mid = len(_calls)
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-Y")
+                    return _calls_after_known, _got, _p7._member_api_denied, _n_mid, len(_calls)
+
+                # 本套件自身在事件循环里 ⇒ 用独立线程跑（同全链路测试）
+                import threading as _th7
+
+                _box7, _err7 = [], []
+
+                def _thread7():
+                    _loop7 = asyncio.new_event_loop()
+                    try:
+                        _box7.append(_loop7.run_until_complete(_run_names()))
+                    except Exception as _e:
+                        _err7.append(_e)
+                    finally:
+                        _loop7.close()
+
+                _t7 = _th7.Thread(target=_thread7)
+                _t7.start()
+                _t7.join(25)
+                if _err7:
+                    raise _err7[0]
+                _r7 = _box7[0]
+                _c0, _got7, _denied7, _n_mid7, _n_end7 = _r7
+                check("★★ 已有真名时**不查**官方接口（省配额）", _c0 == 0, f"调用数={_c0}")
+                check("★★ 查到就写进通讯录（下次直接命中）", _got7 == "香香", repr(_got7))
+                check("★★ 11253 后标记不可用且**不再重试**",
+                      _denied7 is True and _n_end7 == _n_mid7, f"denied={_denied7} {_n_mid7}->{_n_end7}")
+            except Exception as _e7:
+                check("★★ 真名尽力查测试执行", False, f"{type(_e7).__name__}: {_e7}")
+        except Exception as _e4:
+            check("★★ 全链路测试执行", False, f"{type(_e4).__name__}: {_e4}")
+
         check("★★ 完全没记录 ⇒ 占位是「未知用户(<openid>)」（不是真名、可核对）",
               _m18c is not None
               and str(getattr(_m18c.sender, "nickname", "")).startswith("未知用户(")

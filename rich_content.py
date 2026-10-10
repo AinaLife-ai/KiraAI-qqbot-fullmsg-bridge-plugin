@@ -76,7 +76,14 @@ MAX_BUTTONS_PER_ROW = 5
 MAX_BUTTON_DATA = 100
 #: 官方《消息按钮》里 render_data.style 的取值（其它值平台会报 305007 样式参数错误，
 #: 或按默认样式渲染 —— 型号/客户端表现不一）：0 灰线框 / 1 蓝线框 / 3 白底红字 / 4 蓝底白字。
-OFFICIAL_BUTTON_STYLES = (0, 1, 3, 4)
+#: 官方《发送群聊消息》schema（2026-10 抓取）原文：
+#: `0 灰色线框，1 蓝色线框，3 白色背景+红色字体，4 蓝色背景+白色字体`。
+#: ⇒ 四种都合法，**我们绝不擅自改模型的样式值**（只统计异常值供排查）。
+OFFICIAL_BUTTON_STYLES = (0, 1)
+#: 频道文档里的样式值 ⇒ 归一到群聊可用的 {0,1}
+STYLE_ALIASES = {3: 1, 4: 1, 2: 1, 5: 0, 6: 0}
+#: 客户端不支持该 action 时的默认 toast（官方标"必填"，我们兜个默认值）
+DEFAULT_UNSUPPORT_TIPS = "当前版本暂不支持该按钮，请升级手机QQ"
 
 #: markdown 正文建议上限（官方：单条建议 ≤ 4000 字符）
 MAX_MARKDOWN_CHARS = 4000
@@ -199,6 +206,7 @@ def validate_keyboard(raw: str, stats: Optional[dict] = None) -> dict:
     if len(rows) > MAX_KEYBOARD_ROWS:
         raise KeyboardError(f"键盘最多 {MAX_KEYBOARD_ROWS} 行，收到 {len(rows)} 行")
 
+    _seen_ids: set = set()
     for r_i, row in enumerate(rows):
         if not isinstance(row, dict):
             raise KeyboardError(f"第 {r_i + 1} 行不是对象")
@@ -212,9 +220,16 @@ def validate_keyboard(raw: str, stats: Optional[dict] = None) -> dict:
         for b_i, btn in enumerate(buttons):
             if not isinstance(btn, dict):
                 raise KeyboardError(f"第 {r_i + 1} 行第 {b_i + 1} 个按钮不是对象")
+            # ★ 官方字段表里 `id` 是**非必填**（"按钮ID：在一个keyboard消息内设置唯一"）。
+            #   旧实现缺 id 直接报错 ⇒ 模型偶尔不写就被拒；现在自动补一个唯一 id。
             bid = btn.get("id")
             if not isinstance(bid, str) or not bid.strip():
-                raise KeyboardError(f"第 {r_i + 1} 行第 {b_i + 1} 个按钮缺少 id")
+                _auto = f"b{r_i + 1}_{b_i + 1}"
+                while _auto in _seen_ids:
+                    _auto += "_"
+                btn["id"] = _auto
+                bid = btn["id"]
+            _seen_ids.add(bid)
             action = btn.get("action")
             if isinstance(action, dict):
                 data = action.get("data")
@@ -251,6 +266,7 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
             if not isinstance(btn, dict):
                 continue
             # 样式合法性（只统计、**不修改** —— 避免"我们改坏"的可能）
+            action_before = btn.get("action")
             rd = btn.get("render_data")
             if isinstance(rd, dict) and "style" in rd:
                 try:
@@ -258,6 +274,8 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
                         stats["bad_style"] += 1
                 except Exception:
                     stats["bad_style"] += 1
+            # 注：`unsupport_tips` 在官方**群聊消息 schema** 里标"否"（非必填），
+            #     所以**不擅自补**（保持"模型给什么就是什么"）。
             action = btn.get("action")
             if not isinstance(action, dict):
                 continue
@@ -438,7 +456,18 @@ KEYBOARD_TAG_DESCRIPTION = (
     '"visited_label":"已点"},"action":{"type":1,"data":"/签到","permission":{"type":2}}}]}]}}。'
     "最多 5 行、每行最多 5 个按钮，action.data 不超过 100 字符；"
     "按钮文字用 render_data.label（不超过 10 字符），visited_label 可写点击后的文案。"
-    "★ 按钮样式（render_data.style）有四种，**按语义挑，不要都用同一种**："
-    "0 = 灰色线框（次要/取消）；1 = 蓝色线框（普通）；"
+    "★ 按钮样式（render_data.style）四种，**按语义挑、不要都用同一种**"
+    "（官方《发送群聊消息》schema 原文）：0 = 灰色线框（次要/取消）；1 = 蓝色线框（普通）；"
     "3 = 白底红字（危险/删除）；4 = 蓝底白字（主推/推荐）。"
+    "★ **谁能按 / 能不能限次数**（官方口径，2026-10 核实原文）："
+    "action.permission.type：0 = 指定用户（配 specify_user_ids 点名）、1 = **仅管理员**、"
+    "2 = 所有人（默认）——想「只让某几个人能按」就用 0+名单。"
+    "action.click_limit（点击次数上限）**官方已标为弃用**、默认不限 ⇒ "
+    "**平台层面没有「最多被多少人点」的接口**，要限次数只能自己记（谁点过、点几次）。"
+    "★ **想让一排按钮「点一个、其余变灰」**：给这些按钮加同一个 `group_id`"
+    "（官方：同一分组内有一个按钮操作后其它按钮变灰不可点击；**仅 action.type=1 回调按钮有效**）。"
+    "★ 还可以给回调按钮加二次确认：action.modal = {\"content\": \"确认参加吗\""
+    "（≤40 字符，不能带链接）, \"confirm_text\": \"确认\", \"cancel_text\": \"取消\"}。"
+    "★ 上限：最多 5 行、每行最多 5 个按钮（合计 25 个）；action.data ≤ 100 字符；"
+    "按钮必须挂在 markdown 消息上（同一条 <msg> 里写 <markdown> 即可）。"
 )

@@ -244,6 +244,76 @@ def _group_names_path():
 _BANNER_DONE = False
 
 
+#: 本进程 import 时，main.py 的指纹 —— 用来发现"磁盘已更新、内存还是旧代码"。
+_IMPORT_FINGERPRINT = ""
+_IMPORTED_AT = 0.0
+
+
+def _module_fingerprint(path: str = "") -> str:
+    """算 main.py 的 md5（读不到就返回空串）。"""
+    try:
+        import hashlib
+
+        target = path or os.path.join(_PLUGIN_DIR, "main.py")
+        with open(target, "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _remember_import_fingerprint() -> None:
+    global _IMPORT_FINGERPRINT, _IMPORTED_AT
+    _IMPORT_FINGERPRINT = _module_fingerprint()
+    _IMPORTED_AT = time.time()
+
+
+def _identity_src_ok(src: str):
+    """纯函数：这段源码里有没有"身份改写"（便于被测试反向验证）。
+
+    返回 ``(是否合格, 缺失项列表)``。
+    """
+    need = {
+        "正文带名": "{_nick} 点击了" in src,
+        "未知用户占位": "未知用户(" in src,
+    }
+    return all(need.values()), [k for k, v in need.items() if not v]
+
+
+def _identity_code_selfcheck() -> str:
+    """运行时自检：**当前真正加载的** `publish_synthetic_event` 里有没有身份改写。
+
+    为什么要它：线上出现过"我装的是新版，日志却是旧行为"的情形。
+    版本号来自 manifest（文件级），而真正执行的是**加载进内存的函数**；
+    只有当场读它的源码，才能证明跑的是哪一份。
+    """
+    src = ""
+    how = ""
+    _cls = globals().get("QQOfficialBridge")
+    if _cls is not None:
+        try:
+            import inspect
+
+            src = inspect.getsource(_cls.publish_synthetic_event)
+            how = "内存中的函数"
+        except Exception:                        # noqa: BLE001
+            src = ""
+    if not src:
+        try:
+            with open(os.path.join(_PLUGIN_DIR, "main.py"), encoding="utf-8") as _fh:
+                src = _fh.read()
+            how = "磁盘 main.py"
+        except Exception as exc:                 # noqa: BLE001
+            return f"?（读不到: {type(exc).__name__}）"
+    _ok, _bad = _identity_src_ok(src)
+    if _ok:
+        # 再报一个指纹：源码行数（对照安装包能立刻发现"其实是旧文件"）
+        return f"✅（{how}，{len(src.splitlines())} 行）"
+    return f"❌ 缺失={','.join(_bad)} ⇒ **加载的是旧 main.py**（或装到了别的副本）"
+
+
+_remember_import_fingerprint()
+
+
 def _log_banner_once() -> None:
     """打一条"信息量大"的启动横幅（**排查问题的第一现场**）。
 
@@ -285,10 +355,15 @@ def _log_banner_once() -> None:
     except Exception:
         trim_ok = "?"
     logger.info(
-        "[QQBOT-BRIDGE] ╔═ 版本 v%s｜语音转码：silk 编码器=%s、ffmpeg=%s｜"
-        "图片规范化(Pillow)=%s｜语音条上限=%s═╗ "
+        # ★ 2026-10-10：**把"加载自哪个目录"也打出来** —— 线上出现过
+        #   "我说更新了、日志却还是旧行为"的情形（合并 PR ≠ 装上了文件）。
+        #   有这一行，看一眼就知道跑的是哪一份代码；若日志正文还是
+        #   `[按钮] 用户点击了：`（旧文案）而版本显示 >= 1.6.27 ⇒ 装到了别的副本。
+        "[QQBOT-BRIDGE] ╔═ 版本 v%s（加载自 %s）｜**身份改写=%s**｜"
+        "语音转码：silk 编码器=%s、ffmpeg=%s｜图片规范化(Pillow)=%s｜语音条上限=%s═╗ "
         "想确认问题请先看这一行（日志里搜 QQBOT-BRIDGE）",
-        _plugin_version(), silk_ok, ff_ok, pil_ok, trim_ok,
+        _plugin_version(), _PLUGIN_DIR, _identity_code_selfcheck(),
+        silk_ok, ff_ok, pil_ok, trim_ok,
     )
 
 
@@ -619,6 +694,10 @@ class QQOfficialGroupBridge(BasePlugin):
 
         self.dedup = MessageDedup(ttl=self.dedup_ttl)
         self.identities = IdentityStore(path=_identity_path() if self.remember_nicknames else None)
+        #: 官方「获取群成员信息」接口不可用（11253/内邀）——只提示一次，之后不再重试
+        self._member_api_denied = False
+        self._member_api_logged = False
+        self._stale_warned = False
         #: 把通讯录挂到 ctx 上，供 L1 的「按名字找人」工具读取
         #   （工具是独立类，只拿得到 ctx；挂载失败不影响主流程）
         try:
@@ -832,9 +911,19 @@ class QQOfficialGroupBridge(BasePlugin):
             pass
         await self._flush_identities(force=True)
         await self._flush_group_names(force=True)
+        # ★★★ 2026-10-10 用户实测（"更新后要开关适配器/重载插件才生效"）根因：
+        #   核心的加载流程是 `terminate()` → 重新 `initialize()`（manager.py:748）。
+        #   旧实现**故意保留补丁**想省事，但补丁闭包里抓的是**旧模块的函数对象** ——
+        #   新实例 `_attach()` 一看标记"已装"就跳过 ⇒ **旧代码继续跑**，
+        #   只能靠重建适配器（客户端对象被换掉、旧 handler 自然消失）才能刷新。
+        #   ⇒ 正确做法：terminate 时**彻底还原**，让新实例用自己的新代码重新挂。
+        try:
+            self._restore_all()
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] terminate 还原补丁异常（忽略）: %s", exc)
         logger.info(
             "[QQBOT-BRIDGE] 已停止（本次已处理 %d 条消息，其中 %d 条出现「全量+@」双副本，通常为 0；"
-            "补丁保留给热重载，要彻底还原请把 enabled 设为 false 或重启 KiraAI）",
+            "补丁已**彻底还原**，热重载/重新启用会由新代码重新挂载）",
             self._handled, self._cross_pairs,
         )
 
@@ -852,8 +941,123 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._health_check_intents()
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] intent 健康检查异常（忽略）: %s", exc)
+            try:
+                self._warn_if_stale_module()
+            except Exception:
+                pass
             await self._flush_identities()
             await self._flush_group_names()
+
+    # ------------------------------------------------------------------ #
+    # 按钮点击者真名：官方成员详情接口（白名单）
+    # ------------------------------------------------------------------ #
+    async def _fetch_member_name(self, client, group_id: str, member_id: str,
+                                 timeout: float = 0.8):
+        """查一位群成员的真名。成功返回昵称，失败/无权限返回 None。
+
+        ★ 官方原文（/v2/groups/{group_openid}/members/{member_openid}）：
+          响应体含 `username`（用户昵称）、`member_role`（member/owner/admin）；
+          但页面同时标注"该能力正在内邀接入中"，错误码 **11253 = 仅白名单机器人可用**。
+        ⇒ 我们对"没权限"只提示一次，之后不再打扰；有权限的机器人自动受益。
+        """
+        if getattr(self, "_member_api_denied", False):
+            return None
+        if client is None or not group_id or not member_id:
+            return None
+        try:
+            api = getattr(client, "api", None)
+            http = getattr(api, "_http", None)
+            if http is None:
+                return None
+            from botpy.http import Route          # 延迟导入：没 botpy 也能加载
+
+            route = Route(
+                "GET", "/v2/groups/{group_openid}/members/{member_openid}",
+                group_openid=str(group_id), member_openid=str(member_id),
+            )
+            data = await asyncio.wait_for(http.request(route), timeout=timeout)
+        except Exception as exc:                  # noqa: BLE001
+            detail = str(exc)[:200]
+            if "11253" in detail or "无接口访问权限" in detail:
+                self._member_api_denied = True
+                if not getattr(self, "_member_api_logged", False):
+                    self._member_api_logged = True
+                    logger.info(
+                        "[QQBOT-BRIDGE] 官方「获取群成员信息」接口对当前机器人不可用"
+                        "（错误码 11253：**仅白名单/内邀机器人**可用）⇒ 没见过的人只能显示"
+                        "「未知用户(<openid>)」；等 TA 在群里说句话，名字会自动补上。"
+                        "（若想让机器人拿到真名，可联系平台运营申请该接口白名单）")
+            else:
+                logger.debug("[QQBOT-BRIDGE] 成员真名查询失败（忽略）: %s", detail)
+            return None
+        if not isinstance(data, dict):
+            return None
+        name = data.get("username") or data.get("nickname")
+        role = data.get("member_role")
+        if role and str(role) in ("owner", "admin", "member"):
+            self.pending_roles_click = getattr(self, "pending_roles_click", {})
+        return str(name).strip() if isinstance(name, str) and name.strip() else None
+
+    async def learn_peer_names(self, client, *, is_group: bool, target_id: str,
+                               sender_id: str, timeout: float = 0.8) -> None:
+        """按钮点击等**合成事件**之前：尽力把"这人是谁、这是哪个群"补全。
+
+        * 群名：交给既有的 `group_names.schedule_fetch`（官方 30 QPM，已做限速）；
+        * 人名：通讯录里没有才去查官方成员详情接口（内邀能力，失败即降级）。
+
+        全程 best-effort：任何异常都不影响事件发布（占位兜底）。
+        """
+        try:
+            adapter = None
+            adapter_name = ""
+            for name, a in self._find_adapters():
+                try:
+                    if a.get_client() is client:
+                        adapter, adapter_name = a, str(name)
+                        break
+                except Exception:
+                    continue
+            if adapter is None:
+                for name, a in self._find_adapters():
+                    adapter, adapter_name = a, str(name)
+                    break
+            if adapter is None:
+                return
+            _kname = str(getattr(getattr(adapter, "info", None), "name", "") or adapter_name)
+            if is_group and target_id and not self.group_names.lookup(adapter_name, str(target_id)):
+                self.group_names.schedule_fetch(adapter, adapter_name, str(target_id),
+                                                client, logger)
+            if not sender_id or not is_group:
+                return
+            if self.identities.remember(_kname, "gm", str(sender_id), None):
+                return                       # 通讯录里已有真名 ⇒ 不必查
+            name = await self._fetch_member_name(client, str(target_id), str(sender_id),
+                                                 timeout=timeout)
+            if name:
+                self.identities.remember(_kname, "gm", str(sender_id), name)
+                logger.info("[QQBOT-BRIDGE] 按钮点击者真名已查到：%s（官方成员详情接口）", name)
+        except Exception as exc:              # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] learn_peer_names 异常（忽略）: %s", exc)
+
+    def _warn_if_stale_module(self) -> None:
+        """磁盘上的 main.py 变了、而内存里还是旧代码 ⇒ **明确告诉用户该做什么**。
+
+        为什么要它：线上反复出现"我更新了，行为却没变"（合并 PR ≠ 装文件 ≠ 生效）。
+        判定：import 时记下 md5，之后每轮巡检与磁盘比对。
+        """
+        if getattr(self, "_stale_warned", False):
+            return
+        now_fp = _module_fingerprint()
+        if not now_fp or not _IMPORT_FINGERPRINT or now_fp == _IMPORT_FINGERPRINT:
+            return
+        self._stale_warned = True
+        logger.warning(
+            "[QQBOT-BRIDGE] ⚠ 检测到**磁盘上的 main.py 已更新**（md5 %s → %s），"
+            "但当前进程里跑的还是**旧代码** ⇒ 你看到的行为不会变。"
+            "请「禁用再启用本插件」或重启 KiraAI（本版起：禁用/重载会自动还原旧补丁，"
+            "新代码接管后即刻生效，不必再开关适配器）",
+            _IMPORT_FINGERPRINT[:8], now_fp[:8],
+        )
 
     async def _flush_group_names(self, force: bool = False):
         """群名缓存落盘 —— 同样走线程，不占事件循环。"""
@@ -1333,6 +1537,17 @@ class QQOfficialGroupBridge(BasePlugin):
                     _text2 = _text2.replace("用户点击了", f"{_nick} 点击了", 1)
                 else:
                     _text2 = f"{_text2}（{_nick}）"
+            # ★ 每次点击一行诊断（2026-10-10）：把"身份怎么来、正文最终长啥样"
+            #   一次性摊开 —— 版本争议/装没装上，看这一行就结束。
+            try:
+                logger.info(
+                    "[QQBOT-BRIDGE] 合成事件身份：uid=%s ⇒ 身份=%s（%s）｜正文=%s",
+                    str(sender_id)[:12], _nick,
+                    "通讯录" if _from_store else "未知占位",
+                    _text2[:60],
+                )
+            except Exception:
+                pass
             try:
                 event = KiraMessageEvent(
                     adapter=adapter.info,
