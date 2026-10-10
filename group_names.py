@@ -64,6 +64,9 @@ class GroupInfoCache:
         self._fetch_sem = None
         self._failed: set = set()
         self._dirty = False
+        #: 「有新群名学到」的信号：由 `_tick` 消费，用来重跑"会话标题回填"
+        #: （否则 `_backfilled` 的"只跑一次"闸会让新名字永远进不了 WebUI 会话名）
+        self._title_dirty = False
         self._notified = False
         self._ok_logged = False
         if path:
@@ -99,9 +102,17 @@ class GroupInfoCache:
             return
         self._names[key] = (clean, time.time())
         self._names.move_to_end(key)
+        self._title_dirty = True          # ★ 有新名字 ⇒ 让巡检回填一次会话标题
         while len(self._names) > self.max_entries:
             self._names.popitem(last=False)
         self._dirty = True
+
+    def consume_title_dirty(self) -> bool:
+        """有新的群名学到吗？（读一次即清 —— 供巡检决定要不要回填会话标题）"""
+        if not self._title_dirty:
+            return False
+        self._title_dirty = False
+        return True
 
     def mark_failed(self, adapter: str, group_id: str) -> None:
         """标记该群拉取失败（白名单限制）—— 之后不再重试，避免无谓调用。"""

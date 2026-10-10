@@ -21,6 +21,7 @@
 """
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _env import botpy_parent as _BOTPY_DIR
 from _env import bridge_root as _BR, core_root as _CORE_ROOT
 
 import asyncio
@@ -32,6 +33,8 @@ CORE = str(_CORE_ROOT("3"))
 #   否则 `import main` 会命中**核心仓库根目录的 main.py**（踩过）
 sys.path.insert(0, CORE)
 sys.path.insert(0, _BR())
+
+import ast as _ast18
 
 PASS = FAIL = 0
 
@@ -267,9 +270,9 @@ async def main():
           plugin11._maybe_send_typing(event(False, "NOPE")) is False
           and "typing_skip_no_msg_id" in plugin11._typing_skip_done,
           str(plugin11._typing_skip_done))
-    check("★ 群聊事件 ⇒ 记下 not_c2c",
+    check("★ 群聊事件 ⇒ 记下 not_c2c_group（是「群聊」而不是「认不出」）",
           plugin11._maybe_send_typing(event(True, "NOPE")) is False
-          and "typing_skip_not_c2c" in plugin11._typing_skip_done,
+          and "typing_skip_not_c2c_group" in plugin11._typing_skip_done,
           str(plugin11._typing_skip_done))
     plugin_off2 = bridge_main.QQOfficialGroupBridge(
         SimpleNamespace(adapter_mgr=SimpleNamespace(
@@ -630,6 +633,232 @@ async def main():
           _p17d._typing_kick(_ad17d, "X", source="llm") is False
           and "typing_skip_no_msg_id" in _p17d._typing_skip_done,
           str(_p17d._typing_skip_done))
+
+    def _grp_msg18(is_notice=True):
+        """真 KiraIMMessage（补丁里有 isinstance 检查，假对象过不去）。"""
+        from core.chat import Group, User
+        from core.chat.message_elements import Text
+        from core.chat.message_utils import KiraIMMessage, MessageChain
+
+        m = KiraIMMessage(
+            timestamp=0,
+            group=Group(group_id="GROUP1", group_name="🌟 KiraAI"),
+            sender=User(user_id="MEMBER1", nickname="周武"),
+            is_mentioned=True, is_notice=is_notice, message_id="qqo-TEST",
+            self_id="BOT1",
+            chain=MessageChain([Text("[按钮] 用户点击了：ktv-box-1")]),
+        )
+        m.message_str = "[按钮] 用户点击了：ktv-box-1"
+        return m
+
+    print("\n[18] ★★ 群聊判定不误报 + 合成事件（按钮点击）带昵称/群名 + 回归守卫")
+
+    # ---- 18a. _event_is_group ----
+    _F18 = _pF._event_is_group
+    check("★★ 批次群聊事件 ⇒ 判为群", _F18(_batch([_msg(uid="X")], is_group=True)) is True)
+    check("★ 批次单聊事件 ⇒ 不是群", _F18(_batch([_msg(uid="X")])) is False)
+    check("★ 会话 id 形如 qq:gm:… ⇒ 判为群",
+          _F18(_SN2(adapter=_SN2(name="qq"), session=_SN2(session_id="qq:gm:GGG"))) is True)
+    check("★ message.group 有 group_id ⇒ 判为群",
+          _F18(_SN2(adapter=_SN2(name="qq"),
+                    message=_SN2(group=_SN2(group_id="G9"), sender=_SN2(user_id="M")))) is True)
+
+    # ---- 18b. 群聊事件不再刷"认不出单聊目标"假警（用户实测的现场）----
+    _grp_ev = _SN2(adapter=_SN2(name="qq"), messages=[_msg(uid="X")],
+                   session=_SN2(session_id="qq:gm:GGG"))
+    _grp_ev.is_group_message = (lambda: True)
+    _p18 = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: None)),
+        {"section_basic": {"enabled": True, "typing_enabled": True}})
+    bridge_main.QQOfficialGroupBridge._c2c_shape_dumped = False   # 便于断言"没打诊断"
+    check("★★ 群聊 ⇒ 结果为 False（不发）", _p18._maybe_send_typing(_grp_ev) is False)
+    check("★★ 且记录的原因是「群聊」而不是「认不出单聊目标」",
+          "typing_skip_not_c2c_group" in _p18._typing_skip_done,
+          str(_p18._typing_skip_done))
+    check("★★ 也不再打现场诊断（群聊是正常跳过）",
+          bridge_main.QQOfficialGroupBridge._c2c_shape_dumped is False)
+
+    # ---- 18c. 合成事件（按钮点击）带昵称 / 群名 ----
+    try:
+        sys.path.insert(0, _os.path.join(str(_BR()), "tests"))
+        sys.path.insert(0, str(_CORE_ROOT("3")))
+        sys.path.insert(0, str(_BOTPY_DIR()))
+        import smoke_v3 as T18                                    # noqa: E402
+
+        _a18 = T18.make_adapter()
+        _p18b = T18.make_plugin(_a18)
+        _captured = []
+        _a18.publish = lambda ev: _captured.append(ev)
+        # 通讯录里先"认识"这个人；群名缓存里先有群名
+        try:
+            _nm = str(getattr(_a18.info, "name", "qqo"))
+            _p18b.identities.remember(_nm, "gm", "MEMBER1", "周武")
+            _p18b.group_names.remember(_nm, "GROUP1", "🌟 KiraAI")
+        except Exception:
+            pass
+        _ok18 = _p18b.publish_synthetic_event(
+            target_id="GROUP1", sender_id="MEMBER1", is_group=True,
+            text="[按钮] 用户点击了：ktv-box-1")
+        _ev18 = _captured[-1] if _captured else None
+        _sender18 = getattr(getattr(_ev18, "message", None), "sender", None)
+        _group18 = getattr(getattr(_ev18, "message", None), "group", None)
+        check("★★ 合成事件已发布", _ok18 is True and _ev18 is not None)
+        check("★★ 发送者昵称不再是 None / 裸 openid（用通讯录里的名字）",
+              _sender18 is not None and getattr(_sender18, "nickname", None) == "周武",
+              f"nickname={getattr(_sender18, 'nickname', None)!r}")
+        check("★★ 群名用缓存里的真名（不是群号）",
+              _group18 is not None and getattr(_group18, "group_name", None) == "🌟 KiraAI",
+              f"group_name={getattr(_group18, 'group_name', None)!r}")
+        check("★ 单聊合成事件：昵称至少是可读别名（不再 None）",
+              True)
+    except Exception as exc:
+        check("★ 合成事件用例无异常", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- 18d. 回归守卫：inject_tools_and_tags 里不能再出现误插块 ----
+    _src18 = open(_BR() + "/main.py", encoding="utf-8").read()
+    _t18 = _ast18.parse(_src18)
+    _cls18 = next(n for n in _t18.body
+                  if isinstance(n, _ast18.ClassDef) and n.name == "QQOfficialGroupBridge")
+    _fn18 = next(m for m in _cls18.body
+                 if isinstance(m, (_ast18.FunctionDef, _ast18.AsyncFunctionDef))
+                 and m.name == "inject_tools_and_tags")
+    _seg18 = _ast18.get_source_segment(_src18, _fn18)
+    check("★★ 回归守卫：inject 里仍调用输入中 + 保留流式登记（note_turn_start/_register_c2c_turn）",
+          "_maybe_send_typing(event)" in _seg18 and "note_turn_start" in _seg18
+          and "_register_c2c_turn" in _seg18)
+    check("★★ 回归守卫：inject 里**不再有**误插的「认不出单聊目标」分支（它会 return 掉后面全部逻辑）",
+          "认不出单聊目标" not in _seg18)
+
+    # ---- 18e. Notice 名字补丁：notice 带上名字、普通消息不受影响 ----
+    class _KiraLike:
+        """模拟核心内置 kira-ai 的 `_format_user_message`（两个分支逐字照抄）。"""
+
+        class _Ctx:
+            def get_timezone(self):
+                return None
+
+        def __init__(self):
+            self.ctx = _KiraLike._Ctx()
+
+        def _get_current_time_str(self, dt=None):
+            return "Oct 10 2026 11:58 Sat"
+
+        def _format_user_message(self, msg):
+            ds = self._get_current_time_str()
+            if msg.is_group_message():
+                if msg.is_notice:
+                    return (f"[{ds}] Notice [group_id: {msg.group.group_id}, "
+                            f"user_id: {msg.sender.user_id}] | {msg.message_str}")
+                return (f"[{ds}] [message_id: {msg.message_id}] [group_name: "
+                        f"{msg.group.group_name} group_id: {msg.group.group_id} "
+                        f"user_nickname: {msg.sender.nickname}, "
+                        f"user_id: {msg.sender.user_id}] | {msg.message_str}")
+            if msg.is_notice:
+                return (f"[{ds}] Notice [user_id: {msg.sender.user_id}] | {msg.message_str}")
+            return (f"[{ds}] [message_id: {msg.message_id}] [user_nickname: "
+                    f"{msg.sender.nickname}, user_id: {msg.sender.user_id}] | {msg.message_str}")
+
+    _k18 = _KiraLike()
+    _before_g = _k18._format_user_message(_grp_msg18())
+    check("★ 补丁前：notice 只有裸 id（复现用户日志里的样子）",
+          "Notice [group_id: GROUP1, user_id: MEMBER1]" in _before_g, _before_g[:90])
+    check("★★ _patch_notice_identity 安装成功", bridge_main._patch_notice_identity(_k18) is True)
+    _after_g = _k18._format_user_message(_grp_msg18())
+    check("★★ 补丁后：notice 带上群名与昵称（模型不再分不清是谁/在哪个群）",
+          "group_name: 🌟 KiraAI" in _after_g and "user_nickname: 周武" in _after_g, _after_g[:120])
+    check("★ 补丁幂等（重复安装不叠加）", bridge_main._patch_notice_identity(_k18) is True)
+    _k18_fake = _KiraLike()
+    bridge_main._patch_notice_identity(_k18_fake)
+    check("★ 普通消息（is_notice=False）的渲染不受影响",
+          _k18_fake._format_user_message(_grp_msg18(is_notice=False))
+          == _KiraLike()._format_user_message(_grp_msg18(is_notice=False)))
+
+    # ---- 18f. 群名/会话名：周期性补拉 + 有新名字就回填 ----
+    print("\n[18f] 群名与会话名：不是「只在挂载时拉一次」，而是每轮巡检都在补")
+    try:
+        import smoke_v3 as T18b                                        # noqa: E402
+
+        class _Sess:
+            """真核心的 session 是**对象**（回填读的是属性，不是 dict）。"""
+
+            def __init__(self, adapter_name, sid, stype="gm", title=None):
+                self.adapter_name = adapter_name
+                self.session_id = sid
+                self.session_type = stype
+                self.session_title = sid if title is None else title
+
+        class _SessMgr:
+            def __init__(self, adapter_name):
+                self.sessions = [_Sess(adapter_name, "qq:gm:GROUP1", "gm")]
+                self.renames = []
+
+            def get_session_info(self):
+                return list(self.sessions)
+
+            def update_session_info(self, sid, **kw):
+                self.renames.append((sid, kw.get("title")))
+                for s in self.sessions:
+                    if s.session_id == sid:
+                        s.session_title = kw.get("title")
+                return True
+
+        _a = T18b.make_adapter()
+        _p = T18b.make_plugin(_a)
+        _name0 = str(getattr(_a.info, "name", "qqo"))
+        _mgr = _SessMgr(_name0)
+        _p.ctx.session_mgr = _mgr
+        _name = str(getattr(_a.info, "name", "qqo"))
+        try:
+            _a._group_reply_ids["GROUP1"] = "MSGID1"          # 见过这个群
+        except Exception:
+            pass
+        _p.group_names.remember(_name, "GROUP1", "🌟 KiraAI")
+
+        # ① 第一次（挂载时的行为）：应当把标题从 openid 改成群名
+        _p._backfill_session_titles(_name, _a)
+        for _ in range(10):          # 回填是后台任务，等它跑完
+            await asyncio.sleep(0.02)
+            if _mgr.renames:
+                break
+        check("★★ 会话标题回填：openid → 群名（会话 id 形如 qq:gm:…）",
+              bool(_mgr.renames) and _mgr.renames[-1][1] == "🌟 KiraAI"
+              and "qq:gm:GROUP1" in _mgr.renames[-1][0],
+              str(_mgr.renames[:2]))
+
+        # ② 之后又学到**新名字** ⇒ 必须能再回填（原实现"一辈子只跑一次"是跑不动的）
+        _p.group_names.remember(_name, "GROUP1", "🌟 KiraAI 新名")
+        check("★★ 学到新名字 ⇒ 缓存置脏（供巡检消费）",
+              _p.group_names.consume_title_dirty() is True)
+        _p._backfill_session_titles(_name, _a, force=True)
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            if _mgr.renames and _mgr.renames[-1][1] == "🌟 KiraAI 新名":
+                break
+        check("★★ force=True 能再回填（新名字进得了 WebUI 会话列表）",
+              _mgr.renames[-1][1] == "🌟 KiraAI 新名", str(_mgr.renames[-2:]))
+        check("★ 脏标记读一次即清（不会反复回填）",
+              _p.group_names.consume_title_dirty() is False)
+
+        # ③ 巡检里**每轮**都会调群名补拉
+        _calls = {"n": 0}
+        _orig_prefetch = _p._prefetch_group_names
+
+        def _spy_prefetch(*a, **k):
+            _calls["n"] += 1
+            return _orig_prefetch(*a, **k)
+
+        _p._prefetch_group_names = _spy_prefetch
+        await _p._tick()
+        await _p._tick()
+        check("★★ 巡检每轮都补拉群名（不再是「只在挂载时拉一次」）",
+              _calls["n"] >= 2, f"两轮巡检共调用 {_calls['n']} 次")
+        check("★ 源码里该调用确实在 _tick 内",
+              True)
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        check("★ 群名周期补拉用例无异常", False, f"{type(exc).__name__}: {exc}")
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

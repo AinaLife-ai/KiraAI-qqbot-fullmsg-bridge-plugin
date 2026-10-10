@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.23
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.24
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -464,6 +464,41 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.24</b> — ★★ 按钮点击等**合成事件**带上昵称/群名 + 「输入中」群聊不再假警 + 修一处回归</summary>
+
+### 一、合成事件（按钮点击 / 成员事件）没有昵称与群名
+日志实证（用户 11:2x）：
+```
+Notice [user_id: 9CD5…] | [按钮] 用户点击了：ktv-box-1          ← 私聊：没有昵称
+Notice [group_id: 6430…, user_id: …] | [按钮] …                 ← 群聊：群名也没有
+```
+而正常消息是 `[user_nickname: 周武, …]` / `[group_name: 🌟 KiraAI …]`。
+根因：`publish_synthetic_event` 里写死 `sender=User(..., nickname=None)`，群名也只查缓存。
+
+**修**：复用与正常消息**同一套来源** ——
+* 昵称：跨场景通讯录 `IdentityStore`（群里认识过的，这里也能用）→ 兜底 `stable_alias(uid)` 可读别名；
+* 群名：群名缓存；取不到就**后台补拉一次**（下次点击就有真名）。
+⇒ 模型不会再"分不清是谁、在哪个群"。
+
+### 二、「输入中」对**群聊**报假警（还打了一份现场诊断）
+群聊本来就不该发 `msg_type=6`（正常跳过），却走了"认不出单聊目标"的告警分支。
+**修**：新增 `_event_is_group()`（批次 `is_group_message()` / `message.group` / 会话 id 里的
+`gm|group|guild|channel` / 批次消息里出现真群），群聊只记一条 `not_c2c_group`，不再报错、不再打诊断。
+
+### 三、顺带修掉一处**我引入的回归**（重要）
+上一轮"把两份输入中实现收敛成一份"时，按文本替换插错了位置：在
+`inject_tools_and_tags` 里塞进了一块输入中解析代码，它的 `return False` 会让后面的
+**流式登记（`note_turn_start` / `_register_c2c_turn`）**与 **3.0 增量挂载 `_attach_v3`**
+整段跑不到。**修**：删掉误插块；并加了**回归守卫测试**（断言 inject 里仍有输入中调用 +
+流式登记、且不再有那块误插代码）。
+
+**测试**：`audit_typing_indicator.py` 75 → **88 条**（新增 [18]：`_event_is_group` 四种判据、
+群聊安静跳过且不打诊断、合成事件带通讯录昵称与缓存群名、回归守卫）。
+全套件 59 个全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.23</b> — ★★ 「输入中」防抖重做（默认 3 秒 / 发消息即清 / 两条路合并成一份）+ 主动回复也能显示状态</summary>
 
 ### 一、防抖重做：默认 **3 秒**，并且**机器人一发消息就清防抖**

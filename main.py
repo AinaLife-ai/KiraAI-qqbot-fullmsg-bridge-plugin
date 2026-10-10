@@ -321,6 +321,84 @@ def _identity_path():
             return None
 
 
+def _find_kirai_plugin(plugin_mgr: Any):
+    """从插件注册表里找到 **内置 kira-ai 插件实例**（找不到返回 None）。
+
+    防御式读取（与 sticker_support.plugin_present 同一套思路）：任何异常都当"没有"。
+    """
+    if plugin_mgr is None:
+        return None
+    for getter in ("list_plugins", "get_registered_plugins", "get_plugins"):
+        fn = getattr(plugin_mgr, getter, None)
+        if not callable(fn):
+            continue
+        try:
+            items = fn() or []
+        except Exception:
+            continue
+        entries = list(items.values()) if isinstance(items, dict) else list(items)
+        for item in entries:
+            try:
+                mod = str(getattr(item, "__module__", "") or "")
+                cls = str(type(item).__name__)
+                if "builtin_plugins" in mod and ("kira" in mod.lower() or cls == "KiraAIPlugin"):
+                    return item
+            except Exception:
+                continue
+    return None
+
+
+def _patch_notice_identity(plugin: Any, logger_: Any = None) -> bool:
+    """把 kira-ai 的 `_format_user_message` 包成"notice 也带名字"。幂等。
+
+    is_notice 语义保持不变（历史里仍标记为 notice），只是**显示给模型的那一行**
+    补上 `group_name` / `user_nickname` —— 否则按钮点击/成员事件在模型眼里只有裸 openid。
+    """
+    if plugin is None:
+        return False
+    orig = getattr(plugin, "_format_user_message", None)
+    if not callable(orig):
+        return False
+    if getattr(orig, "_kira_bridge_notice_identity", False):
+        return True
+    try:
+        import types as _types
+        from datetime import datetime as _dt
+
+        from core.chat.message_utils import KiraIMMessage as _KIMM
+
+        def _fmt(plugin_self, msg, _orig=orig):
+            try:
+                if isinstance(msg, _KIMM) and getattr(msg, "is_notice", False):
+                    ts = msg.timestamp
+                    tz = plugin_self.ctx.get_timezone()
+                    dt = _dt.fromtimestamp(ts, tz=tz) if tz else _dt.fromtimestamp(ts)
+                    ds = plugin_self._get_current_time_str(dt=dt)
+                    if msg.is_group_message():
+                        return (f"[{ds}] Notice [group_name: {msg.group.group_name} "
+                                f"group_id: {msg.group.group_id} user_nickname: "
+                                f"{msg.sender.nickname}, user_id: {msg.sender.user_id}]"
+                                f" | {msg.message_str}")
+                    return (f"[{ds}] Notice [user_nickname: {msg.sender.nickname}, "
+                            f"user_id: {msg.sender.user_id}] | {msg.message_str}")
+            except Exception:
+                pass
+            return _orig(msg)
+
+        _fmt._kira_bridge_notice_identity = True
+        _fmt._kira_bridge_orig = orig
+        plugin._format_user_message = _types.MethodType(_fmt, plugin)
+        if logger_ is not None:
+            logger_.info(
+                "[QQBOT-BRIDGE] 已给 kira-ai 补上「Notice 也显示名字」"
+                "（按钮点击/成员事件不再只有裸 openid）")
+        return True
+    except Exception as exc:
+        if logger_ is not None:
+            logger_.debug("[QQBOT-BRIDGE] Notice 名字补丁失败（忽略）: %s", exc)
+        return False
+
+
 def _split_media_and_rest(chain):
     """把消息链拆成 ``(媒体链, 其余链)``；**没有媒体元素就返回 None**。
 
@@ -797,6 +875,14 @@ class QQOfficialGroupBridge(BasePlugin):
             self._sync_keyboard_enter()
         except Exception:
             pass
+        # kira-ai「Notice 也显示名字」补丁（幂等；插件实例可能后于我们加载）
+        if not getattr(self, "_notice_identity_patched", False):
+            try:
+                if _patch_notice_identity(_find_kirai_plugin(
+                        getattr(self.ctx, "plugin_mgr", None)), logger):
+                    self._notice_identity_patched = True
+            except Exception:
+                pass
         adapters = self._find_adapters()
         if not adapters:
             if report:
@@ -815,6 +901,32 @@ class QQOfficialGroupBridge(BasePlugin):
             patches = self._ensure_class_patch()
         for name, adapter in adapters:
             self._attach(adapter, name, patches)
+
+        # ---- ★★ 群名 / 会话名：**周期性**补拉（2026-10-10 用户提问后修）----
+        #
+        #   原来只在**挂载时**补一次 ⇒ 之后新出现的群、或首次没拉到的群，
+        #   名字永远停在 openid，直到重启/重载（用户实测的疑问）。
+        #   现在：每轮巡检（15s）
+        #     ① 调 `_prefetch_group_names`（它自带**分批 + 串行 + 失败不再重试**，
+        #        官方群名接口限 30 QPM，安全）；
+        #     ② 只要期间**学到过新名字**（缓存里的脏标记）⇒ 立刻重跑一次
+        #        "会话标题回填"，让 WebUI 会话列表及时变成中文；
+        #        仍然只改"标题还是 openid"的会话，用户改过名的一律不碰。
+        try:
+            _names_changed = self.group_names.consume_title_dirty()
+        except Exception:
+            _names_changed = False
+        for name, adapter in adapters:
+            try:
+                self._prefetch_group_names(
+                    adapter, name, getattr(adapter, "client", None))
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 周期性群名补拉异常（忽略）: %s", exc)
+            if _names_changed:
+                try:
+                    self._backfill_session_titles(name, adapter, force=True)
+                except Exception as exc:
+                    logger.debug("[QQBOT-BRIDGE] 会话标题回填异常（忽略）: %s", exc)
         names = ",".join(n for n, _ in adapters)
         if report or self._last_report != names:
             self._last_report = names
@@ -1031,29 +1143,6 @@ class QQOfficialGroupBridge(BasePlugin):
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
         # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
-        try:
-            target = self._c2c_target_of(event)
-            adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
-            if not target:
-                self._typing_skip(
-                    "not_c2c",
-                    "认不出单聊目标（官方 msg_type=6 只支持单聊）—— 已附带现场诊断，"
-                    "请把这条反馈")
-                self._dump_c2c_shape_once(event, logger)
-                return False
-            if not adapter_name:
-                self._typing_skip("no_adapter_name",
-                                  "事件里没有适配器名（adapter.name 为空）")
-                self._dump_c2c_shape_once(event, logger)
-                return False
-            adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
-            if adapter is None:
-                self._typing_skip("no_adapter", "适配器 %s 还没就绪", adapter_name)
-                return False
-            # ★ 统一走 `_typing_kick`（与「消息刚到时」那条路共用同一套门禁）
-            return self._typing_kick(adapter, target, source="llm")
-        except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
         # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
         try:
             target = self._c2c_target_of(event)
@@ -1154,6 +1243,36 @@ class QQOfficialGroupBridge(BasePlugin):
                 profile = detect_profile(adapter)
             types = message_types_of(adapter, profile) or ["text"]
             ts = int(time.time())
+            # ★★ 2026-10-10（用户实测）：按钮点击这类**合成事件**以前
+            #   `sender.nickname=None`、群名也可能取不到 ⇒ 日志与历史里全是 openid，
+            #   模型分不清"是谁、在哪个群"。现在复用与正常消息**同一套来源**：
+            #     * 昵称：跨场景通讯录（IdentityStore）→ 兜底 stable_alias(uid)；
+            #     * 群名：群名缓存；取不到就**后台补拉一次**（下次点击就有名字）。
+            _nick = ""
+            try:
+                _nick = self.identities.remember(
+                    adapter_name, "gm" if is_group else "dm", str(sender_id), "") or ""
+            except Exception:
+                _nick = ""
+            if not _nick:
+                try:
+                    from identity_shared import stable_alias as _stable_alias
+
+                    _nick = _stable_alias(str(sender_id))
+                except Exception:
+                    _nick = str(sender_id)
+            _gname = ""
+            if is_group:
+                try:
+                    _gname = self.group_names.lookup(adapter_name, str(target_id)) or ""
+                except Exception:
+                    _gname = ""
+                if not _gname:
+                    try:
+                        self._prefetch_group_names(
+                            adapter, adapter_name, getattr(adapter, "client", None))
+                    except Exception:
+                        pass
             try:
                 event = KiraMessageEvent(
                     adapter=adapter.info,
@@ -1162,10 +1281,9 @@ class QQOfficialGroupBridge(BasePlugin):
                         timestamp=ts,
                         group=Group(
                             group_id=str(target_id),
-                            group_name=self.group_names.lookup(adapter_name, str(target_id))
-                            or str(target_id),
+                            group_name=_gname or str(target_id),
                         ) if is_group else None,
-                        sender=User(user_id=str(sender_id), nickname=None),
+                        sender=User(user_id=str(sender_id), nickname=_nick),
                         is_mentioned=True,
                         is_notice=is_notice,
                         # ★ 非空占位：空串会被渲染成 `[message_id: ]`，
@@ -1176,6 +1294,12 @@ class QQOfficialGroupBridge(BasePlugin):
                     ),
                     timestamp=ts,
                 )
+                # ★ message_str 是 init=False 的字段：不显式写，日志/提示词那行末尾
+                #   就会是 `| None`（正文丢失）。这里直接补上。
+                try:
+                    event.message.message_str = str(text)
+                except Exception:
+                    pass
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 构造合成事件失败: %s", exc)
                 return False
@@ -2414,6 +2538,68 @@ class QQOfficialGroupBridge(BasePlugin):
     #: 「事件形状」诊断只打一次（用户实测"明明是单聊却报不是单聊"时，一次定位）
     _c2c_shape_dumped = False
 
+    @staticmethod
+    def _bare_id_from_session(sid: Any) -> str:
+        """从**会话 id**里取出实体 id（群号 / openid）。
+
+        `qq:gm:<gid>` / `qqo:group:<gid>` → `<gid>`；`qq:dm:<openid>` → `<openid>`；
+        本来就是裸 id 则原样返回。
+
+        ★ 为什么必须有它（2026-10-10 用户提问顺带挖出的真 bug）：
+          群名缓存 / 群名接口 / 通讯录的 key 都是**裸 id**，而会话 id 带场景前缀
+          （`qq:gm:…`）⇒ 回填时拿会话 id 去查缓存**永远 miss**，
+          会话名一直停在 openid（"补拉"其实一次都没成功过）。
+        """
+        text = str(sid or "")
+        if not text:
+            return ""
+        parts = [p for p in text.replace("/", ":").split(":") if p]
+        if not parts:
+            return ""
+        for i, p in enumerate(parts):
+            if p.lower() in ("gm", "group", "guild", "channel",
+                             "dm", "c2c", "direct", "private"):
+                return parts[i + 1] if i + 1 < len(parts) else ""
+        return parts[-1]
+
+    @staticmethod
+    def _event_is_group(event) -> bool:
+        """这个事件**明确是群聊**吗？（把"正常跳过"与"认不出形状"分开）
+
+        判据（任一成立即认为是群）：
+          * 批次事件自带 `is_group_message()`（核心：`messages[-1].group is not None`）；
+          * `message.group` 有非空 `group_id`；
+          * 会话 id 形如 `qq:gm:…` / `qq:group:…`；
+          * 批次消息里出现过真群。
+        """
+        try:
+            fn = getattr(event, "is_group_message", None)
+            if callable(fn):
+                try:
+                    if fn():
+                        return True
+                except Exception:
+                    pass
+            msg = getattr(event, "message", None)
+            grp = getattr(msg, "group", None) if msg is not None else None
+            if grp is not None and str(getattr(grp, "group_id", "") or ""):
+                return True
+            for holder in (getattr(event, "session", None), event, msg):
+                if holder is None:
+                    continue
+                sid = getattr(holder, "session_id", None) or getattr(holder, "sid", None)
+                if isinstance(sid, str) and sid:
+                    parts = [p.lower() for p in sid.replace("/", ":").split(":") if p]
+                    if any(p in ("gm", "group", "guild", "channel") for p in parts):
+                        return True
+            for m in (getattr(event, "messages", None) or []):
+                g = getattr(m, "group", None)
+                if g is not None and str(getattr(g, "group_id", "") or ""):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _c2c_target_of(self, event) -> str:
         """这个事件是不是**单聊**？是就返回对方 openid，否则返回空串。
 
@@ -2644,6 +2830,13 @@ class QQOfficialGroupBridge(BasePlugin):
             target = self._c2c_target_of(event)
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
             if not target:
+                # ★ 2026-10-10：**群聊**是"正常跳过"，不该报成"认不出单聊目标"
+                #   （用户实测：群里每次 LLM 请求都刷一条假警 + 一份现场诊断）。
+                if self._event_is_group(event):
+                    self._typing_skip(
+                        "not_c2c_group",
+                        "这是**群聊**（官方 msg_type=6 只支持单聊）—— 正常跳过，无需处理")
+                    return False
                 self._typing_skip(
                     "not_c2c",
                     "认不出单聊目标（官方 msg_type=6 只支持单聊）—— 已附带现场诊断，"
@@ -2679,6 +2872,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._typing_skip("disabled", "配置 typing_enabled=关")
                 return False
             if not target:
+                # （调用方已解析出 target；这里兜底，正常不会走到）
                 self._typing_skip("not_c2c", "认不出单聊目标（官方 msg_type=6 只支持单聊）")
                 return False
             client = adapter.get_client() if adapter is not None else None
@@ -2893,7 +3087,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 return val
         return default
 
-    def _backfill_session_titles(self, name: str, adapter) -> None:
+    def _backfill_session_titles(self, name: str, adapter, force: bool = False) -> None:
         """把**已存在**会话的名字补成中文（群名 / 私聊昵称）。
 
         ★ 解决什么：会话名在**建立那一刻**就定死了。以前装插件时群名还拉不到
@@ -2914,7 +3108,11 @@ class QQOfficialGroupBridge(BasePlugin):
         """
         if not getattr(self, "backfill_session_titles", True):
             return
-        if name in self._backfilled:
+        # ★ 2026-10-10（用户提问）：原来这里是"一辈子只跑一次"——
+        #   之后新学到的群名就永远回填不到 WebUI 会话标题了。
+        #   现在 `force=True`（由巡检在"有新名字"时触发）可以重跑；
+        #   安全边界不变：仍然只改"标题还是 openid"的会话。
+        if name in self._backfilled and not force:
             return
         self._backfilled.add(name)
         try:
@@ -2979,18 +3177,24 @@ class QQOfficialGroupBridge(BasePlugin):
         for stype, sid in todo:
             try:
                 new_title = None
+                # ★ 会话 id（qq:gm:<gid> / qq:dm:<openid>）与缓存/通讯录的 key
+                #   （裸 id）不是一回事 —— 统一取裸 id，否则永远查不到（老 bug）。
+                bare = self._bare_id_from_session(sid) or str(sid)
                 if stype == "gm":
-                    # 先看缓存；没有就排队拉一次（复用已有的分批限流）
-                    new_title = self.group_names.lookup(name, sid)
+                    # 先看缓存（裸 id，兼容旧写法的会话 id）；没有就排队拉一次
+                    new_title = (self.group_names.lookup(name, bare)
+                                 or self.group_names.lookup(name, sid))
                     if not new_title and client is not None:
                         try:
-                            self.group_names.schedule_fetch(adapter, name, sid, client, logger)
+                            self.group_names.schedule_fetch(
+                                adapter, name, bare, client, logger)
                         except Exception:
                             pass
                         continue          # 这次先跳过，等下一轮缓存里有值再写
                 else:
                     if self.identities is not None:
-                        new_title = self.identities.lookup(name, sid)
+                        new_title = (self.identities.lookup(name, bare)
+                                     or self.identities.lookup(name, sid))
                 if not new_title or str(new_title) == sid:
                     continue
                 key = f"{name}:{stype}:{sid}"
