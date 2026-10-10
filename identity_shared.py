@@ -112,6 +112,31 @@ class IdentityStore:
         store[key] = (item[0], now)         # 刷新热度，避免被 LRU 淘汰
         return item[0]
 
+    def lookup_any(self, uid: str) -> Optional[str]:
+        """跨适配器找一个 id 的昵称（key 形如 `adapter|uid`；适配器名不一致时兜底）。
+
+        ★ 2026-10-10：学习端用的适配器名（`adapter.info.name`，线上是 `qq`）与
+        发送端注册名（如 `qqo`）可能不一致 ⇒ 只按单个适配器查会 miss、
+        昵称就显示成 None。这里扫一遍所有适配器前缀。
+        """
+        if not uid:
+            return None
+        suffix = "|" + str(uid)
+        try:
+            items = list(self._store.items())
+        except Exception:
+            return None
+        for key, item in items:
+            if not str(key).endswith(suffix):
+                continue
+            try:
+                name = item[0] if isinstance(item, (tuple, list)) else item
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+            except Exception:
+                continue
+        return None
+
     def lookup(self, adapter: str, uid: str) -> Optional[str]:
         """只查不写（给需要"顺带看一眼"的地方用）。"""
         item = self._store.get(self._key(adapter, uid))

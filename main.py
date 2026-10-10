@@ -1277,19 +1277,35 @@ class QQOfficialGroupBridge(BasePlugin):
             #   模型分不清"是谁、在哪个群"。现在复用与正常消息**同一套来源**：
             #     * 昵称：跨场景通讯录（IdentityStore）→ 兜底 stable_alias(uid)；
             #     * 群名：群名缓存；取不到就**后台补拉一次**（下次点击就有名字）。
+            # ★ 通讯录 key 要跟**学习端**一致：学习端用 `adapter.info.name`
+            #   （线上实测是 `qq`），而注册名可能是 `qqo` ⇒ 只用注册名会 miss。
+            _store_name = str(getattr(getattr(adapter, "info", None), "name", "")
+                              or adapter_name)
             _nick = ""
-            try:
-                _nick = self.identities.remember(
-                    adapter_name, "gm" if is_group else "dm", str(sender_id), "") or ""
-            except Exception:
-                _nick = ""
+            for _nm in (_store_name, adapter_name):
+                try:
+                    _nick = self.identities.remember(
+                        _nm, "gm" if is_group else "dm", str(sender_id), "") or ""
+                except Exception:
+                    _nick = ""
+                if _nick:
+                    break
             if not _nick:
                 try:
-                    from identity_shared import stable_alias as _stable_alias
-
-                    _nick = _stable_alias(str(sender_id))
+                    _nick = self.identities.lookup_any(str(sender_id)) or ""
                 except Exception:
-                    _nick = str(sender_id)
+                    _nick = ""
+            # ★★ 真实 vs 占位，要分得清清楚楚（用户明确要求"绝对真实"）：
+            #   * 通讯录里查到 ⇒ **真名**（与群聊普通消息同一来源，绝对一致）；
+            #   * 查不到（这人从没说过话，官方也没有"按 openid 查昵称"的接口，
+            #     成员名册是内邀且只含"机器人见过的成员"）⇒ 只能给**占位**，
+            #     所以必须**明确标注"未知用户"**，绝不能让它看起来像真名。
+            #   * 查不到 ⇒ 用 **openid 原文**做占位：`未知用户(<openid>)`
+            #     （用户指定：openid 是我们**确实拥有**的真实标识、可核对；
+            #      比"派生出来的短别名"实在，也绝不会被误认成真名。）
+            _from_store = bool(_nick)
+            if not _nick:
+                _nick = f"未知用户({sender_id})"
             _gname = ""
             if is_group:
                 try:
@@ -1302,6 +1318,21 @@ class QQOfficialGroupBridge(BasePlugin):
                             adapter, adapter_name, getattr(adapter, "client", None))
                     except Exception:
                         pass
+            if not _from_store and not getattr(self, "_anon_clicker_logged", False):
+                self._anon_clicker_logged = True
+                logger.info(
+                    "[QQBOT-BRIDGE] 有位成员只点了按钮、还没在群里说过话 —— "
+                    "官方没有「按 openid 查昵称」的接口，只能显示**占位**"
+                    "（形如 `未知用户(1c91a8)`，不是真名）；TA 一发言，名字会自动补上")
+            # ★★ 2026-10-10（线上实测）：核心在后续处理里会把 `nickname` 字段丢掉
+            #   （它自己的接收日志也是 `None`）⇒ 只填字段不够，**正文里也带上名字**，
+            #   模型才一定看得到"是谁"},
+            _text2 = str(text)
+            if _nick and _nick not in _text2:
+                if "用户点击了" in _text2:
+                    _text2 = _text2.replace("用户点击了", f"{_nick} 点击了", 1)
+                else:
+                    _text2 = f"{_text2}（{_nick}）"
             try:
                 event = KiraMessageEvent(
                     adapter=adapter.info,
@@ -1319,14 +1350,14 @@ class QQOfficialGroupBridge(BasePlugin):
                         #   模型照抄成 `<msg message_id="">` 并带进历史。
                         message_id=self.SYNTHETIC_MESSAGE_ID,
                         self_id=getattr(adapter, "app_id", None),
-                        chain=MessageChain([Text(text)]),
+                        chain=MessageChain([Text(_text2)]),
                     ),
                     timestamp=ts,
                 )
                 # ★ message_str 是 init=False 的字段：不显式写，日志/提示词那行末尾
                 #   就会是 `| None`（正文丢失）。这里直接补上。
                 try:
-                    event.message.message_str = str(text)
+                    event.message.message_str = str(_text2)
                 except Exception:
                     pass
             except Exception as exc:

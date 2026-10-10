@@ -709,8 +709,39 @@ async def main():
         check("★★ 群名用缓存里的真名（不是群号）",
               _group18 is not None and getattr(_group18, "group_name", None) == "🌟 KiraAI",
               f"group_name={getattr(_group18, 'group_name', None)!r}")
-        check("★ 单聊合成事件：昵称至少是可读别名（不再 None）",
-              True)
+        check("★ 单聊合成事件：昵称至少是可读别名（不再 None）", True)
+
+        # ★★ 线上实测的两个坑：
+        #   ① 学习端用 `adapter.info.name`（qq），发送端注册名可能是 `qqo`
+        #      ⇒ 只按一个名字查会 miss、昵称变 None；
+        #   ② 核心后续处理会把 `nickname` 字段丢掉 ⇒ **身份必须写进正文**。
+        _names18 = [str(getattr(_a18.info, "name", "qqo")), "qq"]
+        _p18b.identities.remember("qq", "gm", "XADAPTER1", "周武")
+        _cap2 = []
+        _a18.publish = lambda ev: _cap2.append(ev)
+        _ok18b = _p18b.publish_synthetic_event(
+            target_id="GROUPX", sender_id="XADAPTER1", is_group=True,
+            text="[按钮] 用户点击了：fin-9")
+        _m18b = _cap2[-1].message if _cap2 else None
+        check("★★ 跨适配器名也能查到昵称（学习端 qq / 发送端注册名不同）",
+              _m18b is not None and getattr(_m18b.sender, "nickname", None) == "周武",
+              f"nickname={getattr(getattr(_m18b, 'sender', None), 'nickname', None)!r}")
+        check("★★ 身份**写进正文**（核心丢 nickname 字段也不影响模型看到是谁）",
+              _m18b is not None and "周武 点击了" in str(_m18b.message_str),
+              f"message_str={getattr(_m18b, 'message_str', None)!r}")
+        _cap2.clear()
+        _p18b.publish_synthetic_event(target_id="GROUPX", sender_id="NOBODY-KNOWN",
+                                      is_group=True, text="[按钮] 用户点击了：fin-9")
+        _m18c = _cap2[-1].message if _cap2 else None
+        check("★★ 完全没记录 ⇒ 占位是「未知用户(<openid>)」（不是真名、可核对）",
+              _m18c is not None
+              and str(getattr(_m18c.sender, "nickname", "")).startswith("未知用户(")
+              and "NOBODY-KNOWN" in str(getattr(_m18c.sender, "nickname", "")),
+              f"nickname={getattr(getattr(_m18c, 'sender', None), 'nickname', None)!r}")
+        check("★ 正文同样带上兜底身份",
+              _m18c is not None and "点击了" in str(_m18c.message_str)
+              and "用户点击了" not in str(_m18c.message_str),
+              f"message_str={getattr(_m18c, 'message_str', None)!r}")
     except Exception as exc:
         check("★ 合成事件用例无异常", False, f"{type(exc).__name__}: {exc}")
 
