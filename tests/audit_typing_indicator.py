@@ -134,13 +134,28 @@ async def main():
     check("★ 群事件直接返回 False",
           plugin._maybe_send_typing(event(True, "OPENID")) is False)
 
-    print("\n[4] 没有入站 msg_id ⇒ 不发")
+    print("\n[4] 没有入站 msg_id ⇒ 默认改发**主动帧**（关掉开关才跳过）")
     adapter2 = Adapter(Client(), {})
     mgr2 = SimpleNamespace(get_adapter=lambda n: adapter2, get_adapters=lambda: {"qqo": adapter2})
     plugin2 = bridge_main.QQOfficialGroupBridge(
         SimpleNamespace(adapter_mgr=mgr2),
-        {"section_basic": {"enabled": True, "typing_enabled": True}})
-    check("★ 无 msg_id ⇒ 不排队", plugin2._maybe_send_typing(event(False, "OPENID")) is False)
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_delay_seconds": 0}})
+    check("★★ 无 msg_id ⇒ 发主动帧（默认开；主动回复也能显示状态）",
+          plugin2._maybe_send_typing(event(False, "OPENID")) is True)
+    for _t in list(plugin2._typing_tasks):
+        await _t
+    _c4 = adapter2.get_client().api._http.calls
+    check("★ 主动帧不带 msg_id（与被动帧区分）",
+          bool(_c4) and _c4[-1]["json"].get("msg_type") == 6
+          and "msg_id" not in _c4[-1]["json"], str(_c4[-1]["json"])[:120])
+
+    plugin2b = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=mgr2),
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_allow_proactive": False}})
+    check("★ 关掉 typing_allow_proactive ⇒ 无 msg_id 时不发",
+          plugin2b._maybe_send_typing(event(False, "OPENID")) is False)
 
     print("\n[5] 开关关掉 ⇒ 不发")
     plugin3 = bridge_main.QQOfficialGroupBridge(
@@ -246,8 +261,9 @@ async def main():
     plugin11 = bridge_main.QQOfficialGroupBridge(
         SimpleNamespace(adapter_mgr=SimpleNamespace(
             get_adapter=lambda n: Adapter(Client(), {}))),
-        {"section_basic": {"enabled": True, "typing_enabled": True}})
-    check("★ 没有入站 msg_id ⇒ 记下 no_msg_id",
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_allow_proactive": False}})
+    check("★ 没有入站 msg_id（且主动帧关掉）⇒ 记下 no_msg_id",
           plugin11._maybe_send_typing(event(False, "NOPE")) is False
           and "typing_skip_no_msg_id" in plugin11._typing_skip_done,
           str(plugin11._typing_skip_done))
@@ -299,7 +315,7 @@ async def main():
             SimpleNamespace(adapter_mgr=SimpleNamespace(
                 get_adapter=lambda n: Adapter(Client(), {}))),
             {"section_basic": {"enabled": True, "typing_enabled": True}})
-        _p13._maybe_send_typing(event(False, "NOPE2"))
+        _p13._maybe_send_typing(event(True, "NOPE2"))       # 群聊：必然跳过（官方只支持单聊）
         _skip_msgs = [m for m in _cap.msgs if "【输入中】" in m]
         check("★★ 未发送的原因也带同一前缀（一条 grep 就能定位）",
               any("本次未发送" in m for m in _skip_msgs), str(_cap.msgs[-2:]))
@@ -537,6 +553,83 @@ async def main():
     check("★ 发消息路径确实接了取消钩子（源码断言）",
           "_typing_cancel_pending(str(target_id))" in open(_BR() + "/main.py",
                                                            encoding="utf-8").read())
+
+    print("\n[17] ★★ 防抖重做（默认 3 秒 / 0=关 / 发消息即清）+ 主动帧")
+
+    # ---- 17a. 默认防抖是 3 秒，不再是 50 ----
+    _ad17 = Adapter(Client(), {"DB1": "MSGID-DB1"})
+    _p17 = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad17)),
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_delay_seconds": 0}})
+    check("★★ 默认防抖 = 3 秒（原来写死 50）",
+          abs(_p17.typing_debounce_seconds - 3.0) < 1e-6,
+          str(_p17.typing_debounce_seconds))
+    check("★ 开关常量也同步为 3 秒",
+          abs(bridge_main.QQOfficialGroupBridge._TYPING_DEBOUNCE - 3.0) < 1e-6,
+          str(bridge_main.QQOfficialGroupBridge._TYPING_DEBOUNCE))
+
+    # ---- 17b. 发消息会把防抖清掉（用户实测的现场：机器人回过话后下一句没状态）----
+    _p17._typing_kick(_ad17, "DB1", source="llm")
+    for _t in list(_p17._typing_tasks):
+        await _t
+    check("★ 第一帧发出（占住防抖）",
+          len(_ad17.get_client().api._http.calls) == 1,
+          str(len(_ad17.get_client().api._http.calls)))
+    check("★ 紧接着再踢 ⇒ 被防抖挡住", _p17._typing_kick(_ad17, "DB1", source="llm") is False)
+    _p17._typing_sent_at.pop("DB1", None)      # 模拟「机器人发了一条消息」时的清理
+    check("★★ 清掉防抖后立刻能再发（= 发消息时清防抖的效果）",
+          _p17._typing_kick(_ad17, "DB1", source="llm") is True)
+    check("★★ 源码：发消息路径确实同时清了防抖时间戳",
+          "_typing_sent_at.pop(str(target_id), None)" in open(_BR() + "/main.py",
+                                                             encoding="utf-8").read())
+
+    # ---- 17c. 防抖=0 ⇒ 不防抖 ----
+    _ad17b = Adapter(Client(), {"DB2": "MSGID-DB2"})
+    _p17b = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad17b)),
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_delay_seconds": 0, "typing_debounce_seconds": 0,
+                           "typing_max_frames": 3}})
+    _r1 = _p17b._typing_kick(_ad17b, "DB2", source="llm")
+    for _t in list(_p17b._typing_tasks):
+        await _t
+    _r2 = _p17b._typing_kick(_ad17b, "DB2", source="llm")
+    for _t in list(_p17b._typing_tasks):
+        await _t
+    check("★★ 防抖=0 ⇒ 连续两帧都放行（不再被 50 秒摁住）",
+          _r1 is True and _r2 is True
+          and len(_ad17b.get_client().api._http.calls) == 2,
+          f"{_r1}/{_r2} calls={len(_ad17b.get_client().api._http.calls)}")
+
+    # ---- 17d. 主动帧：没有被动 msg_id 也能发（DM Sustain 场景）----
+    _ad17c = Adapter(Client(), {})              # 空回复表 = 没有入站 msg_id
+    _p17c = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad17c)),
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_delay_seconds": 0}})
+    _ok17c = _p17c._typing_kick(_ad17c, "PROACTIVE-OPENID", source="llm")
+    for _t in list(_p17c._typing_tasks):
+        await _t
+    _c17c = _ad17c.get_client().api._http.calls
+    _body17c = _c17c[-1]["json"] if _c17c else {}
+    check("★★ 主动回复（无 msg_id）⇒ 也发出状态帧",
+          _ok17c is True and _body17c.get("msg_type") == 6
+          and _body17c.get("input_notify") == {"input_type": 1, "input_second": 60},
+          str(_body17c)[:140])
+    check("★★ 主动帧**不带** msg_id / msg_seq（与被动帧区分）",
+          "msg_id" not in _body17c and "msg_seq" not in _body17c, str(_body17c)[:120])
+
+    # ---- 17e. 关掉主动帧 ⇒ 不发明（保留提示）----
+    _ad17d = Adapter(Client(), {})
+    _p17d = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad17d)),
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_delay_seconds": 0, "typing_allow_proactive": False}})
+    check("★ typing_allow_proactive=关 ⇒ 没 msg_id 时不发（有原因日志）",
+          _p17d._typing_kick(_ad17d, "X", source="llm") is False
+          and "typing_skip_no_msg_id" in _p17d._typing_skip_done,
+          str(_p17d._typing_skip_done))
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

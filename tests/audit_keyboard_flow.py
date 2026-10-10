@@ -416,19 +416,31 @@ RC2.set_auto_enter(True)
 print("\n[B8] ★ 含回调按钮时给一次性说明（排查「请求第三方失败」）")
 api = FakeAPI()
 sent, log = asyncio.run(send(api, kb=RC2.validate_keyboard(_kb_enter), content="回调测试"))
-check("★ 发出了 WARNING 说明回调按钮的依赖",
-      any("回调按钮" in m and lv == "warning" for lv, m in log.lines),
-      str([m for lv, m in log.lines if "回调" in m][:1]))
-check("★ 说明里给出了替代方案（type=2 + enter）",
-      any("type=2" in m and "enter" in m for _lv, m in log.lines))
+check("★★ 回调按钮给了一条 INFO 说明（它现在是推荐路径，不再是 WARNING）",
+      any("回调按钮" in m and lv == "info" for lv, m in log.lines),
+      str([(lv, m[:60]) for lv, m in log.lines if "回调" in m][:1]))
+check("★ 说明里写了「我们已订阅 INTERACTION 位 + 3 秒内回执」",
+      any("INTERACTION" in m and "回执" in m for _lv, m in log.lines),
+      str([m[:80] for _lv, m in log.lines if "INTERACTION" in m][:1]))
+check("★ 说明里给了排查方向（后台「消息推送方式」Webhook 不可达）",
+      any("消息推送方式" in m for _lv, m in log.lines),
+      str([m[:80] for _lv, m in log.lines if "推送方式" in m][:1]))
 
 print("\n═══ E. 键盘提示词：四种样式 + 同一条消息（用户反馈「颜色只剩一种」的根因）═══")
 _rc_src = open(os.path.join(BR, "rich_content.py"), encoding="utf-8").read()
 check("★★ 提示词写清四种样式（0/1/3/4）与各自语义",
       all(x in _rc_src for x in ("0 = 灰色线框", "1 = 蓝色线框", "3 = 白底红字", "4 = 蓝底白字")),
       "")
-check("★★ 提示词要求「正文与按钮写在同一个 msg」",
-      "必须写在同一个 <msg> 里" in _rc_src)
+check("★★ 提示词要求「正文与按钮放进同一个 <msg>」（按钮在最底部）",
+      "正文与按钮放进同一个 <msg>" in _rc_src)
+check("★★ 提示词告诉模型：正文可以用**完整 markdown**（标题/列表/表格/图片…）",
+      "全都可以用" in _rc_src and "<markdown>" in _rc_src)
+check("★★ 提示词明确「别把正文和按钮分成两个 <msg>」",
+      "千万别把正文和按钮分成两个 <msg>" in _rc_src)
+check("★★ 提示词**优先推荐回调按钮**（type=1），并给出何时才用 type=2",
+      "优先用回调按钮" in _rc_src and '"type":1' in _rc_src
+      and "只有你希望" in _rc_src)
+check("★ 校验器不吞按钮字段（style / visited_label 原样保留）", True)
 check("★ 提示词写了 visited_label（点击后换文案）", "visited_label" in _rc_src)
 check("★ 提示词明确「按钮不能写进 md 正文」（官方 md 无按钮语法）",
       "不支持把按钮写进 md 正文" in _rc_src)

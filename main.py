@@ -409,6 +409,20 @@ class QQOfficialGroupBridge(BasePlugin):
             self.typing_delay_seconds = 2.0
         if not (0.0 <= self.typing_delay_seconds <= 30.0):
             self.typing_delay_seconds = 2.0
+        #: ★ 2026-10-10：防抖（同一会话两次「输入中」的最小间隔）。
+        #:   原来写死 50 秒 —— 实测问题：机器人刚回过话，客户端的状态已被清掉，
+        #:   而防抖还摁着 ⇒ 用户的新消息再也不显示。现在默认 3 秒、可调、0=关闭；
+        #:   并且**机器人一发消息就把防抖清掉**（见 _send_message_inner）。
+        try:
+            self.typing_debounce_seconds = float(
+                basic.get("typing_debounce_seconds", self._TYPING_DEBOUNCE) or 0.0)
+        except Exception:
+            self.typing_debounce_seconds = self._TYPING_DEBOUNCE
+        if not (0.0 <= self.typing_debounce_seconds <= 120.0):
+            self.typing_debounce_seconds = self._TYPING_DEBOUNCE
+        #: ★ 主动回复（没有被动 msg_id，例如「一段时间没消息就主动找话」）时，
+        #:   是否也发一帧「输入中」（不带 msg_id 的**主动状态帧**，占主动消息额度）。
+        self.typing_allow_proactive = bool(basic.get("typing_allow_proactive", True))
         try:
             self.typing_max_frames = int(basic.get("typing_max_frames", 2) or 2)
         except Exception:
@@ -2392,8 +2406,10 @@ class QQOfficialGroupBridge(BasePlugin):
     # ------------------------------------------------------------------ #
     #: 官方限制：`input_second` 最大 60 秒（腾讯 Node SDK 默认 30，Hermes 用 60）
     _TYPING_SECONDS = 60
-    #: 刷新防抖：官方 SDK 建议在到期前刷新；Hermes 实测用 50 秒
-    _TYPING_DEBOUNCE = 50.0
+    #: 防抖默认值（秒）。★ 2026-10-10：原来写死 50 秒 —— 实测问题：
+    #:   机器人刚回过话，客户端的「正在输入」已被清掉，而防抖还摁着
+    #:   ⇒ 用户的新消息再也不显示状态。现在收到 **3 秒**、可在配置里调、0 = 关闭。
+    _TYPING_DEBOUNCE = 3.0
 
     #: 「事件形状」诊断只打一次（用户实测"明明是单聊却报不是单聊"时，一次定位）
     _c2c_shape_dumped = False
@@ -2613,32 +2629,18 @@ class QQOfficialGroupBridge(BasePlugin):
             pass
 
     def _maybe_send_typing(self, event) -> bool:
-        """模型开始思考时，给**私聊**会话发一个「输入中」状态。返回是否已排队。
+        """模型开始思考时，给**私聊**会话发一帧「输入中」状态（薄封装）。
 
-        ## 为什么加这个（核心没有，官方两家都有）
-
-        * 腾讯官方 Node SDK：`bot.sendTyping(target, 30)`
-          —— 注释写明「**仅在 `target.scope === "c2c"` 时可用**」，载荷
-          `{msg_type: 6, msg_id, input_notify: {input_type: 1, input_second: N}}`；
-        * QQ 官方推荐的 Hermes（`gateway/platforms/qqbot/adapter.py`）：
-          `send_typing()` —— C2C-only、60 秒时长、50 秒防抖、必须有入站 `msg_id`。
-
-        对聊天机器人来说这是**最直观的体验提升**：模型跑 10~20 秒时，
-        用户看到的是「对方正在输入…」，而不是发呆。
-
-        ## 三条自我约束
-
-        1. **只做单聊**（官方明确只支持 C2C；群里发会被拒）；
-        2. **必须有入站 msg_id**（被动窗口内才有效）；
-        3. **发失败绝不影响这一轮**：整个调用丢进 create_task，异常只写 debug。
-
-        挂点选在 `ON_LLM_REQUEST`（= "这一轮开始跑模型"的那一瞬间），
-        用同一个会话 50 秒防抖，避免多步 agent 循环每个 step 都发一次。
+        实际门禁与发送**统一在** :meth:`_typing_kick` —— 与「消息刚到时」那条路
+        共用同一套：配置开关 / 防抖（`typing_debounce_seconds`）/ 每 msg_id 帧数上限 /
+        延时（`typing_delay_seconds`）/ 无 msg_id 时的主动帧（`typing_allow_proactive`）。
+        （2026-10-10：原来这里是**另一份独立实现**，与 `_typing_kick` 分叉 ⇒
+         改配置不生效、防抖行为不一致，用户实测踩到。现在只剩一份。）
         """
-        if not self.typing_enabled or not self.enabled:
-            self._typing_skip("disabled", "配置 typing_enabled=关")
-            return False
         try:
+            if not self.typing_enabled or not self.enabled:
+                self._typing_skip("disabled", "配置 typing_enabled=关")
+                return False
             target = self._c2c_target_of(event)
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
             if not target:
@@ -2657,44 +2659,11 @@ class QQOfficialGroupBridge(BasePlugin):
             if adapter is None:
                 self._typing_skip("no_adapter", "适配器 %s 还没就绪", adapter_name)
                 return False
-            client = adapter.get_client()
-            if client is None:
-                self._typing_skip("no_client", "适配器 %s 还没连上（client 为空）", adapter_name)
-                return False
-            reply_ids = self._adapter_attr(adapter, "_direct_reply_ids") or {}
-            msg_id = str(reply_ids.get(target) or "")
-            if not msg_id:
-                self._typing_skip("no_msg_id",
-                                  "还没有入站 msg_id（被动回复窗口未就绪）——"
-                                  "输入中状态必须挂在一条收到的消息上")
-                return False                      # 没有新鲜的入站 msg_id ⇒ 发了也没用
-            now = time.time()
-            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
-                self._typing_skip("debounced", "同一会话距上次发送不足 %.0f 秒（防抖）",
-                                  self._TYPING_DEBOUNCE)
-                return False
-            # ★ 额度保护（见 `typing_max_frames` 的注释）：同一条入站消息最多花 N 帧
-            frame_key = (target, msg_id)
-            used = int(self._typing_frames.get(frame_key, 0))
-            if used >= self.typing_max_frames:
-                self._typing_skip(
-                    "frame_cap",
-                    "本条入站消息的输入中帧数已达上限 %d（保护被动回复额度："
-                    "同一 msg_id 最多 4 次，留给真实回复）", self.typing_max_frames)
-                return False
-            if len(self._typing_frames) > 64:     # 有界，防长会话里无限增长
-                self._typing_frames.clear()
-            self._typing_frames[frame_key] = used + 1
-            self._typing_sent_at[target] = now    # 先占位（并发时不会重复排）
-            task = asyncio.ensure_future(
-                self._send_typing(adapter, client, target, msg_id)
-            )
-            self._typing_tasks.append(task)
-            self._typing_tasks = [t for t in self._typing_tasks if not t.done()][-8:]
-            return True
+            return self._typing_kick(adapter, target, source="llm")
         except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 输入中状态：调度失败（忽略）: %s", exc)
+            logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
             return False
+
 
     def _typing_kick(self, adapter, target: str, *, source: str = "llm") -> bool:
         """按门禁发一帧「输入中」（**共享实现**：LLM 请求前 / 消息刚到时都用它）。
@@ -2718,17 +2687,24 @@ class QQOfficialGroupBridge(BasePlugin):
                 return False
             reply_ids = self._adapter_attr(adapter, "_direct_reply_ids") or {}
             msg_id = str(reply_ids.get(target) or "")
+            proactive = False
             if not msg_id:
-                self._typing_skip("no_msg_id",
-                                  "还没有入站 msg_id（被动回复窗口未就绪）——"
-                                  "输入中状态必须挂在一条收到的消息上")
-                return False
+                # ★ 主动回复（DM Sustain / 主动消息通道）没有被动 msg_id。
+                #   官方 msg_type=6 的示意是"挂在收到的消息上"，但主动发一帧状态
+                #   实测平台也收（响应 {}）；占主动消息额度，所以可关。
+                if not getattr(self, "typing_allow_proactive", True):
+                    self._typing_skip("no_msg_id",
+                                      "还没有入站 msg_id（被动回复窗口未就绪），"
+                                      "且主动状态帧被关掉了（typing_allow_proactive=关）")
+                    return False
+                proactive = True
             now = time.time()
-            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
-                self._typing_skip("debounced", "同一会话距上次发送不足 %.0f 秒（防抖）",
-                                  self._TYPING_DEBOUNCE)
+            _deb = float(getattr(self, "typing_debounce_seconds", 3.0) or 0.0)
+            if _deb > 0 and now - self._typing_sent_at.get(target, 0.0) < _deb:
+                self._typing_skip("debounced", "同一会话距上次发送不足 %.0f 秒（防抖；"
+                                  "可用 typing_debounce_seconds 调整，0=关闭）", _deb)
                 return False
-            frame_key = (target, msg_id)
+            frame_key = (target, msg_id or "proactive")
             used = int(self._typing_frames.get(frame_key, 0))
             if used >= self.typing_max_frames:
                 self._typing_skip(
@@ -2837,14 +2813,25 @@ class QQOfficialGroupBridge(BasePlugin):
             #   官方 Node SDK 的做法就是**同一个计数器供所有发送共用**（`getNextMsgSeq`）
             #   ⇒ 这里改成：读框架的计数器、用掉一格、**再写回去**，
             #   这样我们的状态帧与框架的回复处在同一条递增序列里，不可能互相踩。
-            seq = self._shared_msg_seq(adapter, target, msg_id)
             route = Route("POST", "/v2/users/{openid}/messages", openid=target)
-            result = await http.request(route, json={
-                "msg_type": 6,
-                "msg_id": msg_id,
-                "msg_seq": seq,
-                "input_notify": {"input_type": 1, "input_second": self._TYPING_SECONDS},
-            })
+            if msg_id:
+                seq = self._shared_msg_seq(adapter, target, msg_id)
+                body = {
+                    "msg_type": 6,
+                    "msg_id": msg_id,
+                    "msg_seq": seq,
+                    "input_notify": {"input_type": 1,
+                                     "input_second": self._TYPING_SECONDS},
+                }
+            else:
+                # ★ 主动回复：没有被动 msg_id ⇒ 发**主动状态帧**（不带 msg_id/msg_seq）
+                seq = "-"
+                body = {
+                    "msg_type": 6,
+                    "input_notify": {"input_type": 1,
+                                     "input_second": self._TYPING_SECONDS},
+                }
+            result = await http.request(route, json=body)
             try:
                 self._typing_count = int(getattr(self, "_typing_count", 0)) + 1
             except Exception:
@@ -3252,6 +3239,10 @@ class QQOfficialGroupBridge(BasePlugin):
             if not is_group:
                 try:
                     self._typing_cancel_pending(str(target_id))
+                    # ★ 关键：机器人一发声，客户端那边的「正在输入」就被清掉了
+                    #   ⇒ 防抖时间戳也要一起清，否则用户下一条消息会被"防抖"挡住、
+                    #     状态再也不显示（用户实测踩到）。
+                    self._typing_sent_at.pop(str(target_id), None)
                 except Exception:
                     pass
             ref = self._quote_ref_for(adapter, target_id, send_message_obj, is_group) \
