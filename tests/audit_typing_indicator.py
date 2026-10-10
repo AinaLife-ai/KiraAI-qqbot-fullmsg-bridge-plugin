@@ -486,8 +486,9 @@ async def main():
 
     _mf = _json.load(open(_BR() + "/manifest.json", encoding="utf-8"))
     _tags = _mf.get("tags") or []
-    check("★★ manifest 有 tags（核心 manager 会读取并展示）",
-          isinstance(_tags, list) and len(_tags) >= 5, str(_tags))
+    check("★★ manifest 有 tags（核心 manager 会读取并展示；对齐生态惯例：短英文 3-4 个）",
+          isinstance(_tags, list) and 3 <= len(_tags) <= 5
+          and all(t.isascii() and t.islower() for t in _tags), str(_tags))
     check("★ tags 都是非空字符串且无重复",
           all(isinstance(t, str) and t.strip() for t in _tags)
           and len(set(_tags)) == len(_tags), str(_tags))

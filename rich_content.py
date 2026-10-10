@@ -404,12 +404,19 @@ MARKDOWN_TAG_DESCRIPTION = (
 
 KEYBOARD_TAG_DESCRIPTION = (
     "<keyboard>JSON</keyboard> "
-    "# 在消息下方挂内联按钮。JSON 形如 "
-    '{"content":{"rows":[{"buttons":[{"id":"b1","render_data":{"label":"点我","style":1},'
-    '"action":{"type":2,"data":"/签到","permission":{"type":2}}}]}]}}。'
+    "# 在消息**最底部**挂一排内联按钮（平台不支持把按钮写进 md 正文里，"
+    "按钮永远是消息底部整排）。JSON 形如 "
+    '{"content":{"rows":[{"buttons":[{"id":"b1","render_data":{"label":"点我","style":1,'
+    '"visited_label":"已点"},"action":{"type":2,"data":"/签到","permission":{"type":2}}}]}]}}。'
     "最多 5 行、每行最多 5 个按钮，按钮的 action.data 不超过 100 字符。"
-    "必须和 <text> 或 <markdown> 放在同一个 <msg> 里。用户点击后会以消息形式回来。"
-    "★ 可以和图片/语音放在同一条 <msg> 里 —— 系统会自动拆成两条（先媒体、后按钮），两边都正常。"
-    "★ 指令按钮（action.type=2）默认带 enter=true：用户点一下就**直接发送**，不用再按发送键"
-    "（仅单聊生效；想让它只插进输入框、由用户自己按发送，就显式写 \"enter\": false）。"
+    "★ 按钮文字用 render_data.label（不超过 10 字符）；想在被点过之后换文案，"
+    "就再写 render_data.visited_label。"
+    "★ 按钮样式（render_data.style）有四种，**按语义挑，不要都用同一种**："
+    "0 = 灰色线框（次要/取消）；1 = 蓝色线框（普通）；"
+    "3 = 白底红字（危险/删除）；4 = 蓝底白字（主推/推荐）。"
+    "★ **正文和按钮必须写在同一个 <msg> 里**，例如 "
+    "<msg><text>说明文字</text><keyboard>{…}</keyboard></msg>；"
+    "分成两个 <msg> 发的话，按钮会单独占一条消息（用户看着很割裂）。"
+    "★ 也可以和图片/语音放在同一条 <msg> 里 —— 系统会自动拆成两条（先媒体、后按钮），"
+    "两边都正常。用户点击后，这次点击会作为一条消息回到你这里，你可以接着接话。"
 )

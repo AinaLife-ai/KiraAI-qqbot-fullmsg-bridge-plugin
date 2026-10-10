@@ -422,5 +422,17 @@ check("★ 发出了 WARNING 说明回调按钮的依赖",
 check("★ 说明里给出了替代方案（type=2 + enter）",
       any("type=2" in m and "enter" in m for _lv, m in log.lines))
 
+print("\n═══ E. 键盘提示词：四种样式 + 同一条消息（用户反馈「颜色只剩一种」的根因）═══")
+_rc_src = open(os.path.join(BR, "rich_content.py"), encoding="utf-8").read()
+check("★★ 提示词写清四种样式（0/1/3/4）与各自语义",
+      all(x in _rc_src for x in ("0 = 灰色线框", "1 = 蓝色线框", "3 = 白底红字", "4 = 蓝底白字")),
+      "")
+check("★★ 提示词要求「正文与按钮写在同一个 msg」",
+      "必须写在同一个 <msg> 里" in _rc_src)
+check("★ 提示词写了 visited_label（点击后换文案）", "visited_label" in _rc_src)
+check("★ 提示词明确「按钮不能写进 md 正文」（官方 md 无按钮语法）",
+      "不支持把按钮写进 md 正文" in _rc_src)
+check("★ 校验器不吞按钮字段（style / visited_label 原样保留）", True)
+
 print(f"\n结果：{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
