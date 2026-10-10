@@ -554,6 +554,44 @@ try:
 except Exception as _e12:
     check("S12 段执行", False, f"{type(_e12).__name__}: {_e12}")
 
+# ===================================================================== #
+print("\n[S13] 满额后查账状态 + 超额点击记账（用户两问）")
+try:
+    T13, bm13, a13, p13 = make_env()
+    run_async(p13._tick())
+    send_kb(T13, bm13, a13, p13, "GRP", {"max": "2", "label": "上限测试"},
+            [{"id": "b1", "render_data": {"label": "抢", "style": 1},
+              "action": {"type": 1, "data": "go", "permission": {"type": 2}}}])
+    _tool13 = BT.QQButtonTool(ctx=Ctx(p13))
+    _ev13 = Ev("qq:gm:GRP", p13)
+    _s0 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-1 未满额时显示「进行中」", "进行中" in _s0, _s0[:120])
+
+    clicks(bm13, p13, a13, "GRP", [("M1", "go"), ("M2", "go")])   # 满额 2/2
+    _s1 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-2 ★ 满额后查账显示**已截止**（不再永远「进行中」）",
+          "已截止" in _s1 and "进行中" not in _s1, _s1[:160])
+
+    clicks(bm13, p13, a13, "GRP", [("M3", "go"), ("M4", "go")])   # 超额两次
+    _s2 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-3 ★ 超额点击**账里有记录**（超额未计入 2 次）",
+          "超额未计入 2 次" in _s2, _s2[:180])
+    _st2 = p13.button_policies.stats(list(p13.button_policies._pol.values())[0])
+    check("S13-4 结构里也能取到 overflow / overflow_people",
+          int(_st2.get("overflow") or 0) == 2 and int(_st2.get("overflow_people") or 0) == 2,
+          f"overflow={_st2.get('overflow')} people={_st2.get('overflow_people')}")
+
+    _o_ext = run_async(_tool13.execute(_ev13, action="extend", label="上限测试", add_slots=2))
+    _s3 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-5 加名额后回到「进行中」（但超额历史仍在）",
+          "进行中" in _s3 and "超额未计入 2 次" in _s3, _s3[:180])
+    _o_reset = run_async(_tool13.execute(_ev13, action="reset", label="上限测试"))
+    _s4 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-6 重开一轮后计数与超额一起清零", "进行中" in _s4 and "超额未计入" not in _s4,
+          _s4[:160])
+except Exception as _e13:
+    check("S13 段执行", False, f"{type(_e13).__name__}: {_e13}")
+
 print(f"\n结果：{_PASS[0]} passed, {len(_FAIL)} failed")
 if _FAIL:
     print("失败项：" + "；".join(_FAIL))

@@ -306,6 +306,10 @@ class ButtonPolicyStore:
             "closed": False,
             "closed_reason": "",
             "closed_at": 0.0,
+            #: 超额/过期/重复而未计入的点击次数（**记账但不计数**，查账能看到）
+            "overflow": 0,
+            #: 被连点保护挡下的次数（单独一列，别混进超额）
+            "cooldown_hits": 0,
             "notified": False,
             "deliver_override": None,
         }
@@ -520,6 +524,23 @@ class ButtonPolicyStore:
         verdict["user_count"] = int(rec[0]) if rec else 0
         verdict["closed"] = bool(pol.get("closed")) or bool(b.get("closed"))
 
+        # ★ 被拒的点击也**记账**（2026-10-11 用户问：超额的点击账里没记吗？）
+        #   收口在这里 ⇒ 所有拒绝分支（过期/满额/重复/超每人/连点）都不会漏。
+        try:
+            _reason = str(verdict.get("reason") or "")
+            if not verdict.get("accepted") and _reason and _reason != "ok":
+                if _reason == "cooldown":
+                    bucket["cooldown_hits"] = int(bucket.get("cooldown_hits") or 0) + 1
+                else:
+                    bucket["overflow"] = int(bucket.get("overflow") or 0) + 1
+                    pol["overflow"] = int(pol.get("overflow") or 0) + 1
+                    _ovu = bucket.setdefault("overflow_users", {})
+                    if len(_ovu) < 500:
+                        _ovu[uid] = int(_ovu.get(uid) or 0) + 1
+                self._dirty = True
+        except Exception:
+            pass
+
     def _close(self, pol: dict, reason: str, now: float) -> None:
         if pol.get("closed"):
             return
@@ -547,6 +568,9 @@ class ButtonPolicyStore:
         pol["closed_at"] = 0.0
         pol["notified"] = False
         pol["created"] = now if now is not None else time.time()
+        pol["overflow"] = 0
+        pol["cooldown_hits"] = 0
+        pol["overflow_users"] = {}
         # ★ 场景测试抓到的 bug：scope=each 时计数在**逐按钮桶**里，
         #   只清汇总层 ⇒ 重开后按钮依然是"已满"状态（点了不动）。
         for bucket in (pol.get("btn") or {}).values():
@@ -555,6 +579,9 @@ class ButtonPolicyStore:
             bucket["closed"] = False
             bucket["closed_reason"] = ""
             bucket["closed_at"] = 0.0
+            bucket["overflow"] = 0
+            bucket["cooldown_hits"] = 0
+            bucket["overflow_users"] = {}
         self._dirty = True
         return True
 
@@ -658,7 +685,23 @@ class ButtonPolicyStore:
         for bid, b in (pol.get("btn") or {}).items():
             btn_bits.append({"button": bid, "total": int(b.get("total") or 0),
                              "people": len(b.get("users") or {}),
-                             "closed": bool(b.get("closed"))})
+                             "closed": bool(b.get("closed")),
+                             "closed_reason": b.get("closed_reason") or "",
+                             "overflow": int(b.get("overflow") or 0)})
+        # ★ 派生"真正生效的截止状态"（2026-10-11 用户问：满额了为什么还显示进行中？）
+        #   scope=each 时"满额"记在**逐按钮桶**上，策略级 closed 仍是 False ⇒ 必须派生。
+        _scope = str(pol.get("scope") or "each")
+        _any_closed = any(bool(b.get("closed")) for b in btn_bits)
+        _all_closed = bool(btn_bits) and all(bool(b.get("closed")) for b in btn_bits)
+        if _scope == "each" and btn_bits:
+            _eff_closed = bool(pol.get("closed")) or _all_closed
+            _partial = _any_closed and not _all_closed
+            _eff_reason = (pol.get("closed_reason") or "") if pol.get("closed") else (
+                (btn_bits[0].get("closed_reason") or "full") if _all_closed else "")
+        else:
+            _eff_closed = bool(pol.get("closed"))
+            _partial = False
+            _eff_reason = pol.get("closed_reason") or ""
         return {
             "scope": str(pol.get("scope") or "each"),
             "buttons": btn_bits,
@@ -669,7 +712,13 @@ class ButtonPolicyStore:
             "max": mx or None, "per": int(pol.get("per") or 0) or None,
             "once": bool(pol.get("once")), "cooldown": int(pol.get("cooldown") or 0) or None,
             "until": float(pol.get("until") or 0) or None,
-            "closed": bool(pol.get("closed")), "closed_reason": pol.get("closed_reason") or "",
+            "closed": _eff_closed, "closed_reason": _eff_reason,
+            "partial_closed": _partial,
+            "overflow": int(pol.get("overflow") or 0),
+            "cooldown_hits": int(pol.get("cooldown_hits") or 0),
+            "overflow_people": len(pol.get("overflow_users") or {}) or
+                               len({u for b in (pol.get("btn") or {}).values()
+                                    for u in (b.get("overflow_users") or {})}),
             "created": float(pol.get("created") or 0),
             "people": len(rows), "users": rows[:max(1, limit)],
             "users_total": len(rows),
@@ -969,11 +1018,18 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
         left = int(until - now)
         bits.append(f"截止 {time.strftime('%m-%d %H:%M', time.localtime(until))}"
                     + (f"（剩 {left}s）" if left > 0 else "（已过）"))
-    if st.get("closed"):
-        rt = st.get("closed_reason") or "closed"
-        bits.append("状态：已截止（" + (_REASON_TEXT.get(rt) or rt) + "）")
+    if st.get("partial_closed"):
+        bits.append("部分截止（个别按钮已满）")
+    elif st.get("closed"):
+        _why = {"full": "名额已满", "expired": "已过期", "manual": "手动截止"}.get(
+            str(st.get("closed_reason") or ""), "已截止")
+        bits.append(f"状态：{_why}（已截止）")
     else:
         bits.append("状态：进行中")
+    _ov = int(st.get("overflow") or 0)
+    if _ov:
+        _ovp = int(st.get("overflow_people") or 0)
+        bits.append(f"超额未计入 {_ov} 次" + (f"（{_ovp} 人）" if _ovp else ""))
     lines = [head + "｜" + "｜".join(bits)]
     _btns = st.get("buttons") or []
     if len(_btns) > 1:
