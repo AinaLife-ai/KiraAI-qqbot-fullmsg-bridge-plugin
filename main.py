@@ -280,38 +280,61 @@ def _identity_src_ok(src: str):
 
 
 def _identity_code_selfcheck() -> str:
-    """运行时自检：**当前真正加载的** `publish_synthetic_event` 里有没有身份改写。
+    """运行时自检：**内存里真正在跑的**代码 + **磁盘上的文件**，两边都看。
 
-    为什么要它：线上出现过"我装的是新版，日志却是旧行为"的情形。
-    版本号来自 manifest（文件级），而真正执行的是**加载进内存的函数**；
-    只有当场读它的源码，才能证明跑的是哪一份。
+    为什么要两边都看（2026-10-10 实测）：热重载时会出现
+    「磁盘已是新版、内存里还挂着旧实例」——只报一个会让人误判。
+    两者不一致时，这里会**直接点破该怎么做**。
     """
-    src = ""
-    how = ""
-    _cls = globals().get("QQOfficialBridge")
-    if _cls is not None:
+    # ---- ① 内存里正在跑的（优先；读不到就算了，不报假错）----
+    ok_mem = None
+    _lines_mem = 0
+    cls = globals().get("QQOfficialBridge")
+    if cls is None:
+        try:
+            import sys as _sys
+
+            for _m in list(_sys.modules.values()):
+                _c = getattr(_m, "QQOfficialBridge", None)
+                if isinstance(_c, type) and hasattr(_c, "publish_synthetic_event"):
+                    cls = _c
+                    break
+        except Exception:                        # noqa: BLE001
+            cls = None
+    if cls is not None:
         try:
             import inspect
 
-            src = inspect.getsource(_cls.publish_synthetic_event)
-            how = "内存中的函数"
+            _src_mem = inspect.getsource(cls.publish_synthetic_event)
+            ok_mem, _ = _identity_src_ok(_src_mem)
+            _lines_mem = len(_src_mem.splitlines())
         except Exception:                        # noqa: BLE001
-            src = ""
-    if not src:
-        try:
-            with open(os.path.join(_PLUGIN_DIR, "main.py"), encoding="utf-8") as _fh:
-                src = _fh.read()
-            how = "磁盘 main.py"
-        except Exception as exc:                 # noqa: BLE001
-            return f"?（读不到: {type(exc).__name__}）"
-    _ok, _bad = _identity_src_ok(src)
-    if _ok:
-        # 再报一个指纹：源码行数（对照安装包能立刻发现"其实是旧文件"）
-        return f"✅（{how}，{len(src.splitlines())} 行）"
-    return f"❌ 缺失={','.join(_bad)} ⇒ **加载的是旧 main.py**（或装到了别的副本）"
+            ok_mem = None
 
+    # ---- ② 磁盘上的文件 ----
+    _src_disk = ""
+    try:
+        with open(os.path.join(_PLUGIN_DIR, "main.py"), encoding="utf-8") as _fh:
+            _src_disk = _fh.read()
+    except Exception:                            # noqa: BLE001
+        _src_disk = ""
+    ok_disk, _bad_disk = _identity_src_ok(_src_disk) if _src_disk else (None, [])
 
-_remember_import_fingerprint()
+    # ---- ③ 组合结论 ----
+    if ok_mem is True and ok_disk is True:
+        return f"✅（内存={_lines_mem} 行 / 磁盘一致）"
+    if ok_mem is False and ok_disk is True:
+        return ("⚠ 磁盘已是新版，但**内存里还在跑旧代码** ⇒ "
+                "禁用再启用插件（或重启核心）即可 —— 这正是「更新了却没变化」的现场")
+    if ok_mem is True and ok_disk is False:
+        return "⚠ 内存是新版、磁盘却是旧文件（多半装错目录/刚回滚过）"
+    if ok_disk is True:
+        return (f"✅（磁盘 main.py，{len(_src_disk.splitlines())} 行；"
+                "内存源码读不到，通常是文件刚被替换）")
+    if ok_mem is True:
+        return "✅（内存中的函数；磁盘读不到）"
+    _miss = ",".join(_bad_disk) or "读不到 main.py"
+    return f"❌ {_miss} ⇒ **装的是旧版 / 装到了别的副本**"
 
 
 def _log_banner_once() -> None:

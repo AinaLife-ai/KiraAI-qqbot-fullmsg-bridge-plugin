@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.30
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.31
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -526,6 +526,18 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.31</b> — 自检升级：内存 + 磁盘两边都看，不一致直接点破</summary>
+
+* 启动横幅的「身份改写」自检改为**双源**：
+  * **内存里的函数**（真正在跑的那份，`inspect.getsource`）；
+  * **磁盘上的 main.py**（你刚装进去的那份）；
+  * 两者不一致 ⇒ 明确写出该做什么（典型：`磁盘已是新版，但内存里还在跑旧代码 ⇒ 禁用再启用插件`），
+    这正是「更新了却没变化」的现场；
+* 顺带把内存侧取类的方式做稳（`globals()` 取不到时扫 `sys.modules`）。
+
+</details>
+
+<details>
 <summary><b>v1.6.30</b> — 四问落地：补丁彻底还原（不用再开关适配器）+ 陈旧模块检测 + 点击者真名尽力查 + 按钮权限/上限口径</summary>
 
 * **修「更新必须开关适配器/重载插件」根因**：`terminate()` 彻底还原补丁
