@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.38
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.41
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,47 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.41</b> — 查账文本列出**超额的人**（谁试过没算）；会话标签/键做紧凑</summary>
+
+* 超额不再只报数量，而是**列出是谁**（最多 6 个，超出显示"等 N 人"）：
+  `超额未计入 2 次（周武、未知用户(DEADBEEF…)）`；同一个人多次超额会带 `×N`；
+  没说过话的人仍如实显示 `未知用户(<openid>)`（绝不伪造名字）；
+* 会话标签去冗余（标签本身就是 id 前缀时不再重复显示）；
+* 文本里的键只显示 `短会话id|序号`（完整 sid 保留在结构化字段里）⇒ 省 token。
+
+</details>
+
+<details>
+<summary><b>v1.6.40</b> — 修两个「账本显示」真问题：满额后仍显示「进行中」+ 超额点击不记账</summary>
+
+### ① 满额后查账永远「进行中」（用户实测）
+**根因**：`scope=each` 时"满额"记在**逐按钮桶**上，而查账只看策略级的 `closed`
+（它一直是 False）⇒ 永远显示进行中 ✗。
+**修**：查账时**派生**真正生效的状态 —— `已截止（名额已满/已过期/手动截止）` /
+`部分截止（个别按钮已满）` / `进行中`；逐按钮明细也各自带状态。
+
+### ② 超额/过期/重复的点击账里没记（用户实测）
+**修**：被拒的点击**记账但不计入名额**（收口在 `_fill_counts`，所有拒绝分支都不会漏）：
+* 查账直接显示 `超额未计入 N 次（M 人）`（**不需要额外参数**）；
+* 连点保护单独一列（`cooldown_hits`），不与超额混在一起；
+* `reset` 重开一轮时一起清零；`extend` 加名额后回到「进行中」但**保留超额历史**。
+
+</details>
+
+<details>
+<summary><b>v1.6.39</b> — 代际接线对齐审计 + 昵称学习补到 3.0 + 会话双标识（名称 + openid）</summary>
+
+* **修真缺口**：昵称学习器原来只挂在 2.x 的消息接管路径 ⇒ 3.0 上通讯录一直没人喂
+  （线上表现为按钮点击/查账全显示「未知用户」）⇒ 改走两代通用的 `on_llm_request`；
+* **新增 `tests/audit_generation_parity.py`**（16 项 × 两代各跑一遍）：
+  两代都必须有的 8 项能力 + 代际专属规则 + **不重复接管核心**的结构性不变量；
+* **会话区分而非隔离**：账本记名称 + openid **双标识**（`[绿岛酒吧 · D593FBB0]`），
+  支持 `scope=all` 跨会话查询、`session=<openid前缀>` 点名（防重名/防查不到）；
+* 顺带修了自己新代码里写死适配器名的问题（被自家守卫测试拦下）。
+
+</details>
+
+<details>
 <summary><b>v1.6.38</b> — `<markdown>` 标签描述也瘦身（461 → 371 字符，能力与引导零丢失）</summary>
 
 * 删掉重复表述（音视频那段的"直链"说了两遍）、压缩场景枚举；

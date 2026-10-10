@@ -448,6 +448,179 @@ try:
 except Exception as _e11:
     check("S11 段执行", False, f"{type(_e11).__name__}: {_e11}")
 
+# ===================================================================== #
+print("\n[S12] 昵称学习 / 查账回填 / 会话隔离（用户线上两问）")
+try:
+    import main as _bm12
+
+    T12, bm12, a12, p12 = make_env()
+    run_async(p12._tick())
+    send_kb(T12, bm12, a12, p12, "GRP", {"max": "2", "label": "回填"},
+            [{"id": "b1", "render_data": {"label": "报名", "style": 1},
+              "action": {"type": 1, "data": "join", "permission": {"type": 2}}}])
+    clicks(bm12, p12, a12, "GRP", [("N1", "join")])
+    _tool12 = BT.QQButtonTool(ctx=Ctx(p12))
+    _ev12 = Ev("qq:gm:GRP", p12)
+    _st1 = run_async(_tool12.execute(_ev12, action="stats", label="回填"))
+    check("S12-1 没学过的人 ⇒ 查账只能显示『未知用户』（占位，不伪造）",
+          "未知用户" in _st1, _st1[:110])
+
+    # 这个人之后在群里说话了 ⇒ 我们（3.0 的 on_llm_request 钩子）应当学到昵称
+    class _Sender12:
+        user_id = "N1"
+        nickname = "天阴"
+
+    class _Msg12:
+        sender = _Sender12()
+        chain = []
+
+    class _EvLearn12:
+        message = _Msg12()
+        adapter = type("A", (), {"name": "qqo", "platform": "QQ Official"})()
+        session = type("S", (), {"session_type": "gm", "session_id": "qq:gm:GRP"})()
+
+    p12._learn_peer_from_event(_EvLearn12())
+    check("S12-2 学到昵称（3.0 上也喂通讯录了）",
+          p12.identities.lookup_any("N1") == "天阴", str(p12.identities.lookup_any("N1")))
+
+    _st2 = run_async(_tool12.execute(_ev12, action="stats", label="回填"))
+    check("S12-3 ★ 回填：学过之后再查同一本账 ⇒ 显示真名「天阴」（账本只存 uid，名字是读时解析）",
+          "天阴" in _st2 and "未知用户" not in _st2, _st2[:160])
+
+    # ---- 会话**区分**（不是隔离）：默认查当前会话；scope=all 可跨会话且带会话名 ----
+    for _pol in p12.button_policies._pol.values():
+        if _pol.get("label") == "回填":
+            _pol["session"] = "绿岛酒吧"          # 模拟"发按钮时已知群名"
+    _st_head = run_async(_tool12.execute(_ev12, action="stats", label="回填"))
+    check("S12-4 ★ 查账结果**双标识**：会话名 + openid（防重名）",
+          "绿岛酒吧" in _st_head and "GRP" in _st_head, _st_head[:130])
+
+    # 另一个会话里也发一个带策略的按钮
+    _k12b = p12.register_button_policy("GRP2", {"max": "2", "label": "隔壁报名"},
+                                       {"content": {"rows": [{"buttons": [
+                                           {"id": "b2", "render_data": {"label": "报名"},
+                                            "action": {"type": 1, "data": "join2"}}]}]}},
+                                       is_group=True, adapter="qqo")
+    if _k12b and _k12b in p12.button_policies._pol:
+        p12.button_policies._pol[_k12b]["session"] = "隔壁群"
+    _ev_other = Ev("qq:gm:OTHER-GROUP", p12)
+    _st3 = run_async(_tool12.execute(_ev_other, action="stats", label="回填"))
+    check("S12-4a 默认（scope=session）只在当前会话找 ⇒ 别处找不到就如实说",
+          ("没有按钮账本" in _st3) or ("没找到" in _st3) or ("没有" in _st3), _st3[:120])
+    _st4 = run_async(_tool12.execute(_ev_other, action="stats", lebel=None if False else "", scope="all"))
+    check("S12-4b ★ scope=all：跨会话能查到，且**带会话名**（区分而非隔离）",
+          ("绿岛酒吧" in _st4) or ("隔壁群" in _st4), _st4[:200])
+
+    # ---- S12-6 同名会话：用 openid 前缀点名，绝不靠名字瞎猜 ----
+    for _p in p12.button_policies._pol.values():
+        if _p.get("label") == "隔壁报名":
+            _p["session"] = "绿岛酒吧"          # 故意取同名，制造"重名"场景
+    _st_same = run_async(_tool12.execute(_ev_other, action="stats", scope="all"))
+    check("S12-6a 同名会话并存时能列出多条（带各自 openid 区分）",
+          _st_same.count("绿岛酒吧") >= 2 and "GRP" in _st_same, _st_same[:200])
+    _st_pin = run_async(_tool12.execute(_ev_other, action="stats", session="GRP2"))
+    check("S12-6b ★ 用 session=<openid前缀> 点名 ⇒ 精确锁到那一本（不靠名字）",
+          ("隔壁报名" in _st_pin) and ("回填" not in _st_pin), _st_pin[:160])
+
+    # 端到端：模块级钩子（框架真正调用的那个）也会学
+    try:
+        p12.identities._store.pop("qqo|N2", None)
+        from core.agent.tool import ToolSet as _TS12
+        from core.tag import TagSet as _TAG12
+
+        class _EvLearn2:
+            message = type("M", (), {"sender": type("S", (), {"user_id": "N2",
+                                                             "nickname": "小美"})(),
+                                     "chain": []})()
+            adapter = type("A", (), {"name": "qqo", "platform": "QQ Official"})()
+            session = type("S", (), {"session_type": "gm", "session_id": "qq:gm:GRP"})()
+
+        class _Req12:
+            def __init__(self):
+                self.tool_set = _TS12()
+                self.system_prompt = []
+
+        _r12 = _Req12()
+        _hook12 = getattr(_bm12, "on_llm_request", None)
+        if callable(_hook12):
+            run_async(_hook12(p12, _EvLearn2(), _r12, _TAG12()))
+            check("S12-5 ★ 真实钩子 on_llm_request 也会学昵称（3.0 主线）",
+                  p12.identities.lookup_any("N2") == "小美",
+                  str(p12.identities.lookup_any("N2")))
+        else:
+            check("S12-5 模块级 on_llm_request 存在", False, "缺失")
+    except Exception as _e12b:
+        check("S12-5 钩子学习用例", False, f"{type(_e12b).__name__}: {_e12b}")
+except Exception as _e12:
+    check("S12 段执行", False, f"{type(_e12).__name__}: {_e12}")
+
+# ===================================================================== #
+print("\n[S13] 满额后查账状态 + 超额点击记账（用户两问）")
+try:
+    T13, bm13, a13, p13 = make_env()
+    run_async(p13._tick())
+    send_kb(T13, bm13, a13, p13, "GRP", {"max": "2", "label": "上限测试"},
+            [{"id": "b1", "render_data": {"label": "抢", "style": 1},
+              "action": {"type": 1, "data": "go", "permission": {"type": 2}}}])
+    _tool13 = BT.QQButtonTool(ctx=Ctx(p13))
+    _ev13 = Ev("qq:gm:GRP", p13)
+    _s0 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-1 未满额时显示「进行中」", "进行中" in _s0, _s0[:120])
+
+    clicks(bm13, p13, a13, "GRP", [("M1", "go"), ("M2", "go")])   # 满额 2/2
+    _s1 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-2 ★ 满额后查账显示**已截止**（不再永远「进行中」）",
+          "已截止" in _s1 and "进行中" not in _s1, _s1[:160])
+
+    clicks(bm13, p13, a13, "GRP", [("M3", "go"), ("M4", "go")])   # 超额两次
+    _s2 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-3 ★ 超额点击**账里有记录**（超额未计入 2 次）",
+          "超额未计入 2 次" in _s2, _s2[:180])
+    _st2 = p13.button_policies.stats(list(p13.button_policies._pol.values())[0])
+    check("S13-4 结构里也能取到 overflow / overflow_people",
+          int(_st2.get("overflow") or 0) == 2 and int(_st2.get("overflow_people") or 0) == 2,
+          f"overflow={_st2.get('overflow')} people={_st2.get('overflow_people')}")
+
+    _o_ext = run_async(_tool13.execute(_ev13, action="extend", label="上限测试", add_slots=2))
+    _s3 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-5 加名额后回到「进行中」（但超额历史仍在）",
+          "进行中" in _s3 and "超额未计入 2 次" in _s3, _s3[:180])
+    # ---- 其他类型：部分截止（一排两按钮，各自额度）与 过期（ttl） ----
+    T13b, bm13b, a13b, p13b = make_env()
+    run_async(p13b._tick())
+    send_kb(T13b, bm13b, a13b, p13b, "GRP", {"max": "1", "label": "两按钮"},
+            [{"id": "b1", "render_data": {"label": "A", "style": 1},
+              "action": {"type": 1, "data": "a"}},
+             {"id": "b2", "render_data": {"label": "B", "style": 1},
+              "action": {"type": 1, "data": "b"}}])
+    _tool13b = BT.QQButtonTool(ctx=Ctx(p13b))
+    _ev13b = Ev("qq:gm:GRP", p13b)
+    clicks(bm13b, p13b, a13b, "GRP", [("P1@b1", "a")])          # 只把 A 点满
+    _sp = run_async(_tool13b.execute(_ev13b, action="stats", label="两按钮"))
+    check("S13-7 ★ 一排按钮里只满了一个 ⇒ 显示「部分截止」",
+          "部分截止" in _sp and "进行中" not in _sp, _sp[:170])
+
+    T13c, bm13c, a13c, p13c = make_env()
+    run_async(p13c._tick())
+    send_kb(T13c, bm13c, a13c, p13c, "GRP", {"ttl": "60", "label": "限时账"},
+            [{"id": "b1", "render_data": {"label": "抢", "style": 1},
+              "action": {"type": 1, "data": "g"}}])
+    clicks(bm13c, p13c, a13c, "GRP", [("T1", "g")])
+    for _pl in p13c.button_policies._pol.values():
+        if _pl.get("label") == "限时账":
+            _pl["until"] = time.time() - 1
+    _tool13c = BT.QQButtonTool(ctx=Ctx(p13c))
+    _se = run_async(_tool13c.execute(_ev13b.__class__("qq:gm:GRP", p13c), action="stats", label="限时账"))
+    check("S13-8 ★ 到点后显示「已过期（已截止）」（不是永远的进行中）",
+          "已截止" in _se and ("过期" in _se), _se[:170])
+
+    _o_reset = run_async(_tool13.execute(_ev13, action="reset", label="上限测试"))
+    _s4 = run_async(_tool13.execute(_ev13, action="stats", label="上限测试"))
+    check("S13-6 重开一轮后计数与超额一起清零", "进行中" in _s4 and "超额未计入" not in _s4,
+          _s4[:160])
+except Exception as _e13:
+    check("S13 段执行", False, f"{type(_e13).__name__}: {_e13}")
+
 print(f"\n结果：{_PASS[0]} passed, {len(_FAIL)} failed")
 if _FAIL:
     print("失败项：" + "；".join(_FAIL))

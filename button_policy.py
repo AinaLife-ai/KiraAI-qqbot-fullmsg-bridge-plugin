@@ -244,7 +244,8 @@ class ButtonPolicyStore:
     def register(self, sid: str, spec: Optional[Dict[str, Any]], *,
                  now: Optional[float] = None, token: bool = False,
                  button_ids: Optional[List[str]] = None,
-                 is_group: bool = True, adapter: str = "") -> Optional[dict]:
+                 is_group: bool = True, adapter: str = "",
+                 session_label: str = "") -> Optional[dict]:
         """为一条**即将发出的**消息登记策略。没声明就返回 None（零开销路径）。"""
         if not spec:
             return None
@@ -297,12 +298,18 @@ class ButtonPolicyStore:
             "buttons": merged.get("buttons") or {},
             #: 本条消息里**所有**按钮 id（兜底匹配用；含没写逐按钮策略的）
             "button_ids": [str(b) for b in (button_ids or []) if str(b)],
+            #: 会话标签（群名 / "私聊"）—— 查账时展示，用来**区分**不同会话
+            "session": str(session_label or ""),
             "total": 0,
             "users": {},
             "msgs": [],
             "closed": False,
             "closed_reason": "",
             "closed_at": 0.0,
+            #: 超额/过期/重复而未计入的点击次数（**记账但不计数**，查账能看到）
+            "overflow": 0,
+            #: 被连点保护挡下的次数（单独一列，别混进超额）
+            "cooldown_hits": 0,
             "notified": False,
             "deliver_override": None,
         }
@@ -393,7 +400,8 @@ class ButtonPolicyStore:
         verdict: Dict[str, Any] = {
             "accepted": False, "reason": "ok", "closing": False, "hard": bool(pol.get("hard")),
             "notify": bool(pol.get("notify")), "notify_text": pol.get("notify_text") or "",
-            "label": pol.get("label") or "", "total": pol.get("total", 0),
+            "label": pol.get("label") or "",
+            "session": pol.get("session") or "", "total": pol.get("total", 0),
             "remaining": None, "user_count": 0, "closed": bool(pol.get("closed")),
             "deliver": self._effective_deliver(pol),
         }
@@ -516,6 +524,23 @@ class ButtonPolicyStore:
         verdict["user_count"] = int(rec[0]) if rec else 0
         verdict["closed"] = bool(pol.get("closed")) or bool(b.get("closed"))
 
+        # ★ 被拒的点击也**记账**（2026-10-11 用户问：超额的点击账里没记吗？）
+        #   收口在这里 ⇒ 所有拒绝分支（过期/满额/重复/超每人/连点）都不会漏。
+        try:
+            _reason = str(verdict.get("reason") or "")
+            if not verdict.get("accepted") and _reason and _reason != "ok":
+                if _reason == "cooldown":
+                    bucket["cooldown_hits"] = int(bucket.get("cooldown_hits") or 0) + 1
+                else:
+                    bucket["overflow"] = int(bucket.get("overflow") or 0) + 1
+                    pol["overflow"] = int(pol.get("overflow") or 0) + 1
+                    _ovu = bucket.setdefault("overflow_users", {})
+                    if len(_ovu) < 500:
+                        _ovu[uid] = int(_ovu.get(uid) or 0) + 1
+                self._dirty = True
+        except Exception:
+            pass
+
     def _close(self, pol: dict, reason: str, now: float) -> None:
         if pol.get("closed"):
             return
@@ -543,6 +568,9 @@ class ButtonPolicyStore:
         pol["closed_at"] = 0.0
         pol["notified"] = False
         pol["created"] = now if now is not None else time.time()
+        pol["overflow"] = 0
+        pol["cooldown_hits"] = 0
+        pol["overflow_users"] = {}
         # ★ 场景测试抓到的 bug：scope=each 时计数在**逐按钮桶**里，
         #   只清汇总层 ⇒ 重开后按钮依然是"已满"状态（点了不动）。
         for bucket in (pol.get("btn") or {}).values():
@@ -551,6 +579,9 @@ class ButtonPolicyStore:
             bucket["closed"] = False
             bucket["closed_reason"] = ""
             bucket["closed_at"] = 0.0
+            bucket["overflow"] = 0
+            bucket["cooldown_hits"] = 0
+            bucket["overflow_users"] = {}
         self._dirty = True
         return True
 
@@ -588,11 +619,11 @@ class ButtonPolicyStore:
     # 查账
     # ------------------------------------------------------------------ #
     def list_for(self, sid: str, *, active_only: bool = False,
-                 now: Optional[float] = None) -> List[dict]:
+                 now: Optional[float] = None, all_sessions: bool = False) -> List[dict]:
         now = now if now is not None else time.time()
         out = []
         for pol in self._pol.values():
-            if pol.get("sid") != sid:
+            if not all_sessions and pol.get("sid") != sid:
                 continue
             if active_only and (pol.get("closed") or
                                 (float(pol.get("until") or 0) and now > float(pol["until"]))):
@@ -602,10 +633,16 @@ class ButtonPolicyStore:
         return out
 
     def find(self, sid: str, button_id: str = "", message_id: str = "",
-             label: str = "", *, now: Optional[float] = None) -> Tuple[Optional[dict], List[dict]]:
-        """按"当前会话 + 按钮/消息/名字"定位**对应那一本账**。
+             label: str = "", *, now: Optional[float] = None,
+             scope: str = "session", sid_prefix: str = "") -> Tuple[Optional[dict], List[dict]]:
+        """按"会话 + 按钮/消息/名字"定位**对应那一本账**。
 
         返回 ``(命中, 候选列表)``：唯一命中就给策略；否则给候选让模型自己挑。
+
+        ★ 会话是**区分**而非隔离（2026-10-11 用户澄清）：
+          * `scope="session"`（默认）：优先在当前会话里找（最常见、最不容易搞错）；
+          * `scope="all"`：跨会话查找 —— **当前会话的排前面**，其余带上会话标签，
+            模型一眼能看出"这本账属于哪个群/哪次私聊"。
         """
         now = now if now is not None else time.time()
         if message_id:
@@ -613,6 +650,15 @@ class ButtonPolicyStore:
             if key and key in self._pol:
                 return self._pol[key], []
         cands = self.list_for(sid, now=now)
+        _pfx = str(sid_prefix or "").strip()
+        if _pfx:
+            # 明确按会话 openid 点名（防重名/跨会话）⇒ 在所有会话里按前缀精确挑
+            _all = self.list_for("", now=now, all_sessions=True)
+            cands = [p for p in _all if str(p.get("sid") or "").startswith(_pfx)] or _all
+        elif str(scope or "session").lower() == "all":
+            _seen = {p.get("key") for p in cands}
+            cands = cands + [p for p in self.list_for("", now=now, all_sessions=True)
+                             if p.get("key") not in _seen]
         if button_id:
             _hit = [p for p in cands
                     if button_id in (p.get("buttons") or {})
@@ -639,17 +685,66 @@ class ButtonPolicyStore:
         for bid, b in (pol.get("btn") or {}).items():
             btn_bits.append({"button": bid, "total": int(b.get("total") or 0),
                              "people": len(b.get("users") or {}),
-                             "closed": bool(b.get("closed"))})
+                             "closed": bool(b.get("closed")),
+                             "closed_reason": b.get("closed_reason") or "",
+                             "overflow": int(b.get("overflow") or 0)})
+        # ★ 超额的人（谁试过但没算）—— 用户要看的就是这个
+        _ov_map = {}
+        for _bid, _b in (pol.get("btn") or {}).items():
+            for _u, _n in (_b.get("overflow_users") or {}).items():
+                _ov_map[_u] = int(_ov_map.get(_u) or 0) + int(_n)
+        for _u, _n in (pol.get("overflow_users") or {}).items():
+            _ov_map[_u] = max(int(_ov_map.get(_u) or 0), int(_n))
+        _ov_rows = []
+        for _u, _n in sorted(_ov_map.items(), key=lambda kv: -kv[1])[:8]:
+            _nm = (names or {}).get(str(_u)) or ""
+            _ov_rows.append({"uid": str(_u), "name": _nm or f"未知用户({_u})", "count": int(_n)})
+
+        # ★ 派生"真正生效的截止状态"（2026-10-11 用户问：满额了为什么还显示进行中？）
+        #   scope=each 时"满额"记在**逐按钮桶**上，策略级 closed 仍是 False ⇒ 必须派生。
+        _scope = str(pol.get("scope") or "each")
+        # ★ 必须按**声明的按钮清单**算，而不是"已经有桶的按钮" ——
+        #   否则一排两按钮里只点满一个，另一个还没桶 ⇒ 被误判成"全部截止"（用户实测）。
+        _ids = [str(x) for x in (pol.get("button_ids") or [])] or \
+               [str(x) for x in (pol.get("buttons") or {})] or \
+               [str(x) for x in (pol.get("btn") or {})]
+        _buckets = pol.get("btn") or {}
+        _closed_cnt = sum(1 for bid in _ids if (_buckets.get(bid) or {}).get("closed"))
+        _all_closed = bool(_ids) and _closed_cnt == len(_ids)
+        _any_closed = _closed_cnt > 0
+        if _scope == "each" and _ids:
+            _eff_closed = bool(pol.get("closed")) or _all_closed
+            _partial = _any_closed and not _all_closed
+            _eff_reason = (pol.get("closed_reason") or "") if pol.get("closed") else (
+                (btn_bits[0].get("closed_reason") or "full") if _all_closed else "")
+        else:
+            _eff_closed = bool(pol.get("closed"))
+            _partial = False
+            _eff_reason = pol.get("closed_reason") or ""
+        # ★ 到点但巡检还没跑到时，查账也必须认「已过期」（用户实测：别的类型也一样）
+        _until_s = float(pol.get("until") or 0)
+        if _until_s and time.time() > _until_s and not _eff_closed:
+            _eff_closed = True
+            _partial = False
+            _eff_reason = _eff_reason or "expired"
         return {
             "scope": str(pol.get("scope") or "each"),
             "buttons": btn_bits,
             "key": pol.get("key"), "sid": pol.get("sid"), "label": pol.get("label") or "",
+            "session": pol.get("session") or "",
             "total": int(pol.get("total") or 0),
             "remaining": max(0, mx - int(pol.get("total") or 0)) if mx else None,
             "max": mx or None, "per": int(pol.get("per") or 0) or None,
             "once": bool(pol.get("once")), "cooldown": int(pol.get("cooldown") or 0) or None,
             "until": float(pol.get("until") or 0) or None,
-            "closed": bool(pol.get("closed")), "closed_reason": pol.get("closed_reason") or "",
+            "closed": _eff_closed, "closed_reason": _eff_reason,
+            "partial_closed": _partial,
+            "overflow": int(pol.get("overflow") or 0),
+            "overflow_rows": _ov_rows,
+            "cooldown_hits": int(pol.get("cooldown_hits") or 0),
+            "overflow_people": len(pol.get("overflow_users") or {}) or
+                               len({u for b in (pol.get("btn") or {}).values()
+                                    for u in (b.get("overflow_users") or {})}),
             "created": float(pol.get("created") or 0),
             "people": len(rows), "users": rows[:max(1, limit)],
             "users_total": len(rows),
@@ -921,7 +1016,26 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
     """把 `stats()` 的字典渲染成一段给模型看的**紧凑**中文。"""
     now = now if now is not None else time.time()
     label = st.get("label") or st.get("key") or "按钮"
-    head = f"【按钮账】{label}（{st.get('key')}）"
+    # ★ 会话**双标识**：名称（人看）+ openid 前 8 位（防重名、bot 也能点名）
+    _sess = str(st.get("session") or "").strip()
+    _sid_short = str(st.get("sid") or "")[:8]
+    if _sess and _sid_short and _sess.startswith(_sid_short):
+        _sess = ""                      # 标签本身就是 id 前缀 ⇒ 别重复显示
+    if _sess and _sid_short:
+        _prefix = f"[{_sess} · {_sid_short}] "
+    elif _sid_short:
+        _prefix = f"[{_sid_short}] "
+    elif _sess:
+        _prefix = f"[{_sess}] "
+    else:
+        _prefix = ""
+    #: 键只显示「短会话 id|序号」——完整的 sid 在结构化字段里，文本里省 token
+    _key = str(st.get("key") or "")
+    _key_show = _key
+    _sid_full = str(st.get("sid") or "")
+    if _key.startswith(_sid_full + "|"):
+        _key_show = _sid_short + _key[len(_sid_full):]
+    head = f"【按钮账】{_prefix}{label}（{_key_show}）"
     bits = [f"已点 {st.get('total', 0)} 次"]
     if st.get("max"):
         bits.append(f"名额 {st['total']}/{st['max']}，剩 {st.get('remaining', 0)}")
@@ -938,11 +1052,31 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
         left = int(until - now)
         bits.append(f"截止 {time.strftime('%m-%d %H:%M', time.localtime(until))}"
                     + (f"（剩 {left}s）" if left > 0 else "（已过）"))
-    if st.get("closed"):
-        rt = st.get("closed_reason") or "closed"
-        bits.append("状态：已截止（" + (_REASON_TEXT.get(rt) or rt) + "）")
+    if st.get("partial_closed"):
+        bits.append("部分截止（个别按钮已满）")
+    elif st.get("closed"):
+        _why = {"full": "名额已满", "expired": "已过期", "manual": "手动截止"}.get(
+            str(st.get("closed_reason") or ""), "已截止")
+        bits.append(f"状态：{_why}（已截止）")
     else:
         bits.append("状态：进行中")
+    _ov = int(st.get("overflow") or 0)
+    if _ov:
+        _rows = st.get("overflow_rows") or []
+        def _nm_of(r):
+            nm = str(r.get("name") or "")
+            if not nm or nm.startswith("未知用户("):
+                try:
+                    nm = (name_of(r.get("uid")) or "") if callable(name_of) else nm
+                except Exception:
+                    nm = nm
+            return nm or f"未知用户({r.get('uid')})"
+
+        _who = "、".join(
+            f"{_nm_of(r)}" + (f"×{r.get('count')}" if int(r.get("count") or 1) > 1 else "")
+            for r in _rows[:6])
+        _more = "" if len(_rows) <= 6 else f" 等 {len(_rows)} 人"
+        bits.append(f"超额未计入 {_ov} 次" + (f"（{_who}{_more}）" if _who else ""))
     lines = [head + "｜" + "｜".join(bits)]
     _btns = st.get("buttons") or []
     if len(_btns) > 1:

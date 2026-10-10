@@ -760,6 +760,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self._member_api_denied = False
         self._member_api_logged = False
         self._stale_warned = False
+        #: 学到的昵称只打前几条日志（避免刷屏）
+        self._peer_learn_logged: set = set()
         #: 把通讯录挂到 ctx 上，供 L1 的「按名字找人」工具读取
         #   （工具是独立类，只拿得到 ctx；挂载失败不影响主流程）
         try:
@@ -1126,11 +1128,24 @@ class QQOfficialGroupBridge(BasePlugin):
                 btn_ids = [str(b.get("id") or "")
                            for r in ((payload or {}).get("content") or {}).get("rows") or []
                            for b in (r.get("buttons") or []) if isinstance(r, dict)]
+            # ★ 会话标签（查账时用来**区分**是哪个群/哪次私聊）
+            _sess_label = ""
+            try:
+                if is_group:
+                    _sess_label = (self.group_names.lookup(str(adapter or ""), str(target_id))
+                                   or "").strip()
+                else:
+                    _sess_label = "私聊"
+            except Exception:
+                _sess_label = ""
+            if not _sess_label:
+                _sess_label = str(target_id)[:12] + "…"
             pol = self.button_policies.register(
                 self._policy_sid(target_id), spec,
                 button_ids=[b for b in btn_ids if b],
                 token=self.button_policy_token,
                 is_group=bool(is_group), adapter=str(adapter or ""),
+                session_label=_sess_label,
             )
             if pol is None:
                 return None
@@ -1248,6 +1263,71 @@ class QQOfficialGroupBridge(BasePlugin):
         except Exception as exc:                     # noqa: BLE001
             logger.debug("[QQBOT-BRIDGE] 截止通知整理失败（忽略）: %s", exc)
         return out
+
+    # ------------------------------------------------------------------ #
+    # 昵称学习（★ 2026-10-11 修：3.0 上原来**没人喂通讯录**）
+    #
+    # 背景：2.x 走"接管消息事件"那条路，学习器在里面；3.0 核心已自带全量群消息与真昵称，
+    #       桥接不再接管 ⇒ **学习器没被调用** ⇒ 通讯录一直是空的 ⇒
+    #       按钮点击/查账只能显示「未知用户(<openid>)」（用户线上实测到）。
+    # 做法：在我们**本来就有的** `on_llm_request(event, …)` 里学 —— 这条钩子每次请求都会跑，
+    #       `event.message.sender` 上有核心已经解析好的 user_id 与 nickname（与普通聊天同源）。
+    #       另外顺手学 At 元素里的 pid→name（消息里 @ 到的人也能提前记住）。
+    # ------------------------------------------------------------------ #
+    def _learn_peer_from_event(self, event) -> None:
+        if not self.remember_nicknames:
+            return
+        try:
+            msg = getattr(event, "message", None)
+            sender = getattr(msg, "sender", None)
+            uid = str(getattr(sender, "user_id", "") or "")
+            name = str(getattr(sender, "nickname", "") or "")
+            adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+            session = getattr(event, "session", None)
+            scope = "gm" if str(getattr(session, "session_type", "")) == "gm" else "dm"
+            learned = []
+            if uid and name and not self._is_self_uid(uid):
+                if self.identities.remember(adapter_name, scope, uid, name):
+                    learned.append((uid, name))
+            # 消息里 @ 到的人：pid → name（核心给的显示名）
+            for ele in (getattr(msg, "chain", None) or []):
+                pid = str(getattr(ele, "pid", "") or getattr(ele, "user_id", "") or "")
+                nm = str(getattr(ele, "name", "") or "")
+                if pid and nm and not self._is_self_uid(pid):
+                    self.identities.remember(adapter_name, "gm", pid, nm)
+            if learned and len(self._peer_learn_logged) < 5:
+                self._peer_learn_logged.add(learned[0][0])
+                logger.info("[QQBOT-BRIDGE] 已从消息里学到昵称：%s（uid %s…）——"
+                            "按钮点击/查账从此能显示真名", learned[0][1], learned[0][0][:12])
+        except Exception as exc:                      # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] 学昵称失败（忽略）: %s", exc)
+
+    def _is_self_uid(self, uid: str) -> bool:
+        """是不是机器人自己的 openid（自己的名字没必要学进通讯录）。"""
+        key = str(uid or "")
+        if not key:
+            return False
+        try:
+            for ident in (getattr(self, "_self_ident", None) or {}).values():
+                if str(getattr(ident, "openid", "") or "") == key:
+                    return True
+        except Exception:
+            pass
+        try:
+            for item in (getattr(self, "_self_ident_by_target", None) or {}).values():
+                if str((item or {}).get("openid") or "") == key:
+                    return True
+        except Exception:
+            pass
+        #: 适配器名**不写死**（守卫测试盯着这件事）：用探测到的 profile 名 + 空串兜底
+        _keys = [""] + [str(k) for k in (getattr(self, "profiles", {}) or {})]
+        for adapter_key in _keys:
+            try:
+                if self.identities.is_self(adapter_key, key):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _warn_if_stale_module(self) -> None:
         """磁盘上的 main.py 变了、而内存里还是旧代码 ⇒ **明确告诉用户该做什么**。
@@ -4569,6 +4649,11 @@ class KeyboardTag(_BridgeTag):
 #    `_module_to_plugin` 映射来判定插件归属，模块级函数能正确定位到本插件。
 # --------------------------------------------------------------------------- #
 async def on_llm_request(self, event, request, tag_set, *_, **__):
+    # ★ 顺手学昵称（3.0 上桥接不接管消息事件，这里是唯一能看到"谁来消息了"的地方）
+    try:
+        self._learn_peer_from_event(event)
+    except Exception:
+        pass
     """ON_LLM_REQUEST：注入 L1 工具 + markdown/keyboard 标签 + 3.0 增量。
 
     注意：函数名 `on_llm_request` **必须**与下面绑到类上的属性名一致（见上方说明）。

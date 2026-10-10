@@ -459,5 +459,5 @@ KEYBOARD_TAG_DESCRIPTION = (
     "（需要时用 qq_button 查账）。想让中途不打扰就写 deliver=\"last\"（只在截止那次带汇总给你），"
     "完全自己查账写 deliver=\"off\"。"
     "★ 查账/管理统一用 `qq_button` 工具（action=stats 查账｜close 截止｜reset 重开｜"
-    "extend 加名额或延时）。"
+    "extend 加名额或延时）；默认只查当前会话，要看别的会话加 scope=\"all\"（结果会带会话名）。"
 )
