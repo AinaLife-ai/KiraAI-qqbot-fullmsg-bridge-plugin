@@ -56,6 +56,7 @@ class V3Enhancer:
         # ★ 通讯录的 key 必须与 **2.x 那条路径**（`str(adapter.info.name)`）完全一致，
         #   否则"群里学到的名字"和"私聊要读的名字"会落在两个 bucket 里，
         #   跨场景共享就静默失效了。
+        self._adapter = adapter                        # ★ 供「输入中提前发」用
         self._adapter_name = str(
             getattr(getattr(adapter, "info", None), "name", "") or name
         )
@@ -126,12 +127,22 @@ class V3Enhancer:
         #     不接管、不造事件、不改任何返回值 —— 纯粹"旁听"。
         original_handle = getattr(im, "_handle_message", None)
         if callable(original_handle) and not getattr(original_handle, _HANDLE_MARK, False):
-            def handle(message, is_group, force_mention, _orig=original_handle):
+            async def handle(message, is_group, force_mention, _orig=original_handle):
                 try:
                     enhancer._learn_nickname(message, is_group)
                 except Exception:
                     pass                       # 学不到昵称绝不影响消息处理
-                return _orig(message, is_group, force_mention)
+                result = await _orig(message, is_group, force_mention)
+                # ★★ 2026-10-10（用户要求）：「输入中」提到**消息刚到时**发 ——
+                #   核心有**合并缓冲**（把连发的几条合成一轮），旧挂点要等缓冲结束、
+                #   模型真正开始才发 ⇒ 感觉慢半拍。这里消息一落地就踢一脚
+                #   （单聊 + 已有入站 msg_id 才发；50 秒防抖 + 每 msg_id 帧数上限兜底）。
+                try:
+                    if not is_group:
+                        enhancer._typing_early(message)
+                except Exception:
+                    pass                       # 绝不影响消息处理
+                return result
 
             setattr(handle, _HANDLE_MARK, True)
             im._handle_message = handle
@@ -268,6 +279,23 @@ class V3Enhancer:
                 gid[:12] + "…", name,
             )
         return True
+
+    def _typing_early(self, message: Any) -> None:
+        """消息**刚落地的瞬间**踢一脚「输入中」（单聊）。
+
+        比 `on_llm_request` 早：覆盖"核心合并缓冲 + 排队等 LLM"那段空窗，
+        用户一眼就能看到「正在输入…」。门禁（配置/防抖/帧数/入站 msg_id）
+        全部复用 `plugin._typing_kick` —— 这里只负责取 target。
+        """
+        plugin = getattr(self, "plugin", None)
+        adapter = getattr(self, "_adapter", None)
+        if plugin is None or adapter is None:
+            return
+        author = _field(message, "author")
+        uid = str(_field(author, "user_openid") or _field(author, "id") or "")
+        if not uid:
+            return
+        plugin._typing_kick(adapter, uid, source="ingest")
 
     def _learn_nickname(self, message: Any, is_group: bool) -> None:
         """从**原始 payload** 里学昵称，存进跨场景共享的 IdentityStore。

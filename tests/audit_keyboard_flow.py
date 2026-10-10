@@ -422,5 +422,157 @@ check("★ 发出了 WARNING 说明回调按钮的依赖",
 check("★ 说明里给出了替代方案（type=2 + enter）",
       any("type=2" in m and "enter" in m for _lv, m in log.lines))
 
+print("\n═══ E. 键盘提示词：四种样式 + 同一条消息（用户反馈「颜色只剩一种」的根因）═══")
+_rc_src = open(os.path.join(BR, "rich_content.py"), encoding="utf-8").read()
+check("★★ 提示词写清四种样式（0/1/3/4）与各自语义",
+      all(x in _rc_src for x in ("0 = 灰色线框", "1 = 蓝色线框", "3 = 白底红字", "4 = 蓝底白字")),
+      "")
+check("★★ 提示词要求「正文与按钮写在同一个 msg」",
+      "必须写在同一个 <msg> 里" in _rc_src)
+check("★ 提示词写了 visited_label（点击后换文案）", "visited_label" in _rc_src)
+check("★ 提示词明确「按钮不能写进 md 正文」（官方 md 无按钮语法）",
+      "不支持把按钮写进 md 正文" in _rc_src)
+check("★ 校验器不吞按钮字段（style / visited_label 原样保留）", True)
+
+print("\n═══ F. 逐字段往返：按钮「只剩一种颜色」到底是不是只怪提示词 ═══")
+import copy as _copy
+import inspect as _inspect
+import json as _json
+
+# 一款"官方全字段"键盘：4 种样式 + visited_label + group_id + 三种 action.type
+_FULL_KB = {
+    "content": {"rows": [
+        {"buttons": [
+            {"id": "b0", "render_data": {"label": "取消", "style": 0,
+                                         "visited_label": "已取消"},
+             "action": {"type": 2, "data": "/cancel", "permission": {"type": 2}}},
+            {"id": "b1", "render_data": {"label": "点歌", "style": 1},
+             "action": {"type": 2, "data": "/sing", "reply": True,
+                        "permission": {"type": 2}}},
+            {"id": "b3", "render_data": {"label": "删除", "style": 3},
+             "action": {"type": 2, "data": "/del", "click_limit": 3,
+                        "unsupport_tips": "请升级客户端", "permission": {"type": 2}}},
+            {"id": "b4", "render_data": {"label": "推荐", "style": 4},
+             "action": {"type": 2, "data": "/top", "anchor": 1,
+                        "permission": {"type": 2, "specify_user_ids": ["U1"]}}},
+        ]},
+        {"buttons": [
+            {"id": "b9", "render_data": {"label": "回调", "style": 1},
+             "action": {"type": 1, "data": "cb", "permission": {"type": 2}},
+             "group_id": "g1"},
+            {"id": "b8", "render_data": {"label": "打开", "style": 1},
+             "action": {"type": 0, "data": "https://example.com",
+                        "permission": {"type": 2}}},
+        ]},
+    ]}}
+
+sys.path.insert(0, os.path.join(BR, "tests"))
+sys.path.insert(0, str(_CORE_ROOT("3")))
+sys.path.insert(0, str(_BOTPY_DIR()))
+import rich_content as _RC2                                   # noqa: E402
+
+# ---- F1. 校验器必须**逐字段保真**（唯一允许的差异：type=2 默认补 enter）----
+_sent = _json.dumps(_FULL_KB, ensure_ascii=False)
+_out = _RC2.validate_keyboard(_sent)
+_expected = _copy.deepcopy(_FULL_KB)
+for _row in _expected["content"]["rows"]:
+    for _b in _row["buttons"]:
+        if _b["action"]["type"] == 2 and "enter" not in _b["action"]:
+            _b["action"]["enter"] = True                       # 我们有意补的默认
+check("★★ 全字段键盘：校验器**一字不差**（含 4 种 style / visited_label / group_id / "
+      "reply / anchor / click_limit / unsupport_tips / permission 明细）",
+      _out == _expected, _json.dumps(_out, ensure_ascii=False)[:200])
+_styles_kept = [_b["render_data"]["style"]
+                for _row in _out["content"]["rows"] for _b in _row["buttons"]]
+check("★★ 多色并存不被压成一种（0/1/3/4 全在）",
+      set(_styles_kept) >= {0, 1, 3, 4}, str(_styles_kept))
+
+# ---- F2. 端到端：真核心 + 真发送链 ⇒ 出站 payload 里 keyboard 与输入一致 ----
+try:
+    import smoke_v3 as T2                                       # noqa: E402
+    import main as _bm2                                         # noqa: E402
+    from core.chat.message_elements import Text as _T2           # noqa: E402
+    from core.chat.message_utils import MessageChain as _MC2     # noqa: E402
+
+    async def _e2e_full_kb():
+        a = T2.make_adapter()
+        try:
+            from core.adapter.capabilities import IMCapability
+
+            a.get_capability(IMCapability)._group_reply_ids["G1"] = "MSGID-X"
+        except Exception:
+            pass
+        p = T2.make_plugin(a)
+        await p._tick()
+        # ★ 走**真实路径**：模型给 JSON → KeyboardTag 校验/补默认 → KeyboardMarker → 发送
+        _tag = _bm2.KeyboardTag(None, "")
+        _markers = await _tag.handle(_json.dumps(_FULL_KB, ensure_ascii=False))
+        await a.send_group_message("G1", _MC2([_T2("正文在这"), _markers[0]]))
+        return [kw for _k, kw in a.client.api.calls]
+
+    _calls_f = asyncio.run(_e2e_full_kb())
+    _sent_kb = _calls_f[-1].get("keyboard") if _calls_f else None
+    check("★★ 端到端：出站报文带 keyboard（没被 core/api 层吃掉）", bool(_sent_kb),
+          str(_calls_f[-1])[:160] if _calls_f else "no call")
+    check("★★ 端到端：keyboard 与输入**深比较一致**（含多色样式）",
+          isinstance(_sent_kb, dict)
+          and _sent_kb.get("content", {}).get("rows") == _out["content"]["rows"],
+          _json.dumps(_sent_kb, ensure_ascii=False)[:200])
+    check("★★ 端到端：文字与按钮在**同一条**消息里（msg_type=2 + markdown 正文）",
+          _calls_f and int(_calls_f[-1].get("msg_type") or 0) == 2
+          and (_calls_f[-1].get("markdown") or {}).get("content") == "正文在这",
+          str(_calls_f[-1])[:160] if _calls_f else "")
+except Exception as exc:
+    check("★ 端到端全字段用例无异常", False, f"{type(exc).__name__}: {exc}")
+
+# ---- F3. botpy 透传：keyboard 是**声明参数**，不是被 locals() 丢掉的野字段 ----
+try:
+    import botpy as _botpy
+
+    _sig = _inspect.signature(_botpy.BotAPI.post_c2c_message)
+    check("★★ botpy 接口声明了 keyboard 参数（否则会像 input_notify 那样被静默丢掉）",
+          "keyboard" in _sig.parameters, str(list(_sig.parameters)[:12]))
+    _api_src = _inspect.getsource(_botpy.BotAPI.post_c2c_message)
+    check("★ botpy 用 payload = locals() 组装（声明了什么就发什么）",
+          "payload = locals()" in _api_src)
+except Exception as exc:
+    check("★ botpy 接口检查无异常", False, f"{type(exc).__name__}: {exc}")
+
+# ---- F4. 行列上限：5×5 通过；超限报错（官方 40034029）----
+_rows5 = [{"buttons": [{"id": "r%d_%d" % (i, j),
+                        "render_data": {"label": "x", "style": 1},
+                        "action": {"type": 2, "data": "/d", "permission": {"type": 2}}}
+                       for j in range(5)]} for i in range(5)]
+try:
+    _RC2.validate_keyboard(_json.dumps({"content": {"rows": _rows5}}))
+    _ok5 = True
+except Exception:
+    _ok5 = False
+check("★ 5 行 × 5 按钮 合法通过", _ok5)
+try:
+    _RC2.validate_keyboard(_json.dumps({"content": {"rows": _rows5 + [{"buttons": [
+        {"id": "extra", "render_data": {"label": "x", "style": 1},
+         "action": {"type": 2, "data": "/d"}}]}]}}))
+    _six = False
+except Exception:
+    _six = True
+check("★ 6 行 ⇒ 明确报错（不静默丢）", _six)
+
+# ---- F5. 短形式（模板 id）原样通过 ----
+check("★ 短形式 {\"id\": ...} 原样通过",
+      _RC2.validate_keyboard('{"id":"keyboard_id_abc"}') == {"id": "keyboard_id_abc"})
+
+# ---- F6. 非法 style：只统计、**不改值**，并给一次性告警 ----
+_st = {}
+_kb_bad = _RC2.validate_keyboard(_json.dumps({"content": {"rows": [{"buttons": [
+    {"id": "z", "render_data": {"label": "x", "style": 9},
+     "action": {"type": 2, "data": "/d"}}]}]}}), stats=_st)
+check("★★ 非官方 style(9)：统计到 bad_style，且**原值不动**（不擅自改）",
+      _st.get("bad_style") == 1
+      and _kb_bad["content"]["rows"][0]["buttons"][0]["render_data"]["style"] == 9,
+      str(_st))
+check("★ 源码里有一次性告警（提示模型/用户官方只有 0/1/3/4）",
+      "不是官方值" in open(os.path.join(BR, "main.py"), encoding="utf-8").read())
+
 print(f"\n结果：{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

@@ -418,6 +418,126 @@ async def main():
           bool(_calls14) and _calls14[-1]["json"].get("msg_id") == "MSGID-B",
           str(_calls14[-1]["json"])[:100] if _calls14 else "")
 
+    def _calls15_ok(calls):
+        return bool(calls) and calls[-1]["json"].get("msg_type") == 6
+
+    def _log15():
+        class _L:
+            def info(self, *a):
+                pass
+
+            def warning(self, *a):
+                pass
+
+            def debug(self, *a):
+                pass
+
+        return _L()
+
+    print("\n[15] ★★ 输入中提前到「消息刚到时」+ 订阅位强制全新 identify + manifest tags")
+
+    # ---- 15a. 摄入路径：_typing_kick(source="ingest") 真的发出 msg_type=6 ----
+    _ad15 = Adapter(Client(), {"EARLY1": "MSGID-E"})
+    _p15 = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad15)),
+        {"section_basic": {"enabled": True, "typing_enabled": True}})
+    _ok15 = _p15._typing_kick(_ad15, "EARLY1", source="ingest")
+    for _t in list(_p15._typing_tasks):
+        await _t
+    _c15 = _ad15.get_client().api._http.calls
+    check("★★ 摄入即发：msg_type=6 已发出（不等合并缓冲/模型启动）",
+          _ok15 is True and _calls15_ok(_c15), str(_c15[-1:])[:120])
+    check("★ 同会话立刻再来一次 ⇒ 被 50 秒防抖挡住（不会连发）",
+          _p15._typing_kick(_ad15, "EARLY1", source="ingest") is False)
+
+    # ---- 15b. v3_support._typing_early → 交给 _typing_kick(source="ingest") ----
+    import v3_support as V3
+
+    class _FakePlugin:
+        def __init__(self):
+            self.calls = []
+
+        def _typing_kick(self, adapter, target, source="llm"):
+            self.calls.append((target, source))
+            return True
+
+    _fp = _FakePlugin()
+    _enh = V3.V3Enhancer(_fp, _log15())
+    _enh._adapter = object()
+    _enh._typing_early(SimpleNamespace(author=SimpleNamespace(user_openid="EARLY-UID")))
+    check("★★ 摄入旁听会踢输入中（source=ingest、target 取自 author.user_openid）",
+          _fp.calls == [("EARLY-UID", "ingest")], str(_fp.calls))
+    _fp.calls.clear()
+    _enh._typing_early(SimpleNamespace(author=SimpleNamespace(user_openid="")))
+    check("★ 取不到 openid ⇒ 不踢（不乱发）", not _fp.calls)
+
+    # ---- 15c. 源码断言：两处关键接线 ----
+    _src_main = open(_BR() + "/main.py", encoding="utf-8").read()
+    _src_v3 = open(_BR() + "/v3_support.py", encoding="utf-8").read()
+    check("★★★ 强制重连会**清 session_id**（否则走 resume ⇒ 订阅位永不生效）",
+          'sess["session_id"] = ""' in _src_main and 'sess["last_seq"] = 0' in _src_main)
+    check("★★ 摄入点（_handle_message 旁听）确实调了 _typing_early",
+          "_typing_early(message)" in _src_v3)
+    check("★ 两条路共用同一套门禁（_maybe_send_typing 复用 _typing_kick）",
+          'self._typing_kick(adapter, target, source="llm")' in _src_main)
+
+    # ---- 15d. manifest tags ----
+    import json as _json
+
+    _mf = _json.load(open(_BR() + "/manifest.json", encoding="utf-8"))
+    _tags = _mf.get("tags") or []
+    check("★★ manifest 有 tags（核心 manager 会读取并展示；对齐生态惯例：短英文 3-4 个）",
+          isinstance(_tags, list) and 3 <= len(_tags) <= 5
+          and all(t.isascii() and t.islower() for t in _tags), str(_tags))
+    check("★ tags 都是非空字符串且无重复",
+          all(isinstance(t, str) and t.strip() for t in _tags)
+          and len(set(_tags)) == len(_tags), str(_tags))
+
+    print("\n[16] ★★ 输入中延时（默认 2 秒，对齐 QQ增强 的 typing_delay_seconds）")
+
+    async def _delay_case(delay, wait, *, via="ingest"):
+        _ad = Adapter(Client(), {"DLY": "MSGID-D"})
+        _p = bridge_main.QQOfficialGroupBridge(
+            SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad)),
+            {"section_basic": {"enabled": True, "typing_enabled": True,
+                               "typing_delay_seconds": delay}})
+        _ok = _p._typing_kick(_ad, "DLY", source=via)
+        await asyncio.sleep(0)          # 让立刻发的那条任务跑一拍（未延时的情形）
+        await asyncio.sleep(0)
+        _calls = _ad.get_client().api._http.calls
+        _n_immediate = len(_calls)
+        if wait:
+            await asyncio.sleep(wait)
+        return _p, _ok, _n_immediate, len(_calls)
+
+    _p16, _ok16, _now16, _later16 = await _delay_case(0.25, 0.5)
+    check("★★ ingest 路径：延时期间**先不发**（不会用户一发就输入中）",
+          _ok16 is True and _now16 == 0, f"immediate={_now16}")
+    check("★★ 到点后真的发出（msg_type=6）", _later16 == 1, f"later={_later16}")
+
+    _p16b, _ok16b, _now16b, _later16b = await _delay_case(0.0, 0.05)
+    check("★ 延时=0 ⇒ 立即发（旧行为，可回退）", _now16b == 1, f"immediate={_now16b}")
+
+    _p16c, _ok16c, _now16c, _later16c = await _delay_case(5.0, 0.05, via="llm")
+    check("★★ llm 路径不等延时：模型开始跑就立刻发", _now16c == 1, f"immediate={_now16c}")
+    check("★ 且不会再补发第二次（待发已被取消）", _later16c == 1, f"later={_later16c}")
+
+    # 取消：待发任务被 cancel 后不会再发
+    _ad16d = Adapter(Client(), {"DLY2": "MSGID-D2"})
+    _p16d = bridge_main.QQOfficialGroupBridge(
+        SimpleNamespace(adapter_mgr=SimpleNamespace(get_adapter=lambda n: _ad16d)),
+        {"section_basic": {"enabled": True, "typing_enabled": True,
+                           "typing_delay_seconds": 0.3}})
+    _p16d._typing_kick(_ad16d, "DLY2", source="ingest")
+    _p16d._typing_cancel_pending("DLY2")           # 模拟"机器人已经要发消息了"
+    await asyncio.sleep(0.5)
+    check("★★ 取消待发后不会再冒出「正在输入」",
+          len(_ad16d.get_client().api._http.calls) == 0,
+          str(_ad16d.get_client().api._http.calls))
+    check("★ 发消息路径确实接了取消钩子（源码断言）",
+          "_typing_cancel_pending(str(target_id))" in open(_BR() + "/main.py",
+                                                           encoding="utf-8").read())
+
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.21
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.22
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -131,6 +131,7 @@ websocket 回调最外层就被丢掉了 —— 报错是它唯一的痕迹。
 | `typing_max_frames` | 2 | **每条入站消息最多花几帧「输入中」**。官方：同一个入站消息最多 4 次被动回复，`msg_type=6` 也算一次 ⇒ 默认 2 帧（+ 1 条回复 = 3，留余量），填 1 更保守，最多 3 |
 | `keyboard_auto_enter` | 开 | **指令按钮默认“点一下就发”**：给 `action.type=2` 的按钮补 `enter: true`（官方默认 false ⇒ 点了只把 `@bot data` 插进输入框，用户常以为按钮坏了）。仅单聊 + 手机QQ 8983+ 生效；群里/低版本仍只是插进输入框。想保留官方默认可在按钮里显式写 `enter: false` |
 | `keyboard_callback_to_command` | 关 | **回调按钮自动降级**：把 `action.type=1`（回调按钮）换成 `type=2`+`enter:true` —— 平台推不了互动事件时（点按钮提示“请求第三方失败”），打开它按钮立刻“点一下就发”，不需要回调地址 |
+| `typing_delay_seconds` | 2 | **「输入中」延时几秒再显示**：不能用户一发消息就冒出「正在输入…」（同 QQ增强 的默认值 2 秒）；填 0 = 立刻。模型开始跑时若还没到点会直接发；机器人要发消息时会取消这条待发的 |
 | `c2c_stream_enabled` | 开 | **私聊流式消息**（官方 `stream_messages`）：把模型**正在生成的文字**实时写到那条消息上（约 0.5s 就能看到字，来源是提速器的 token 流）。**一条消息就是一条**：多段回复仍然是多条，绝不合并；没有预览就不接管（报文与从前完全一致）。只对单聊纯文本生效，失败一律回退普通发送 |
 | `sticker_tags` | **sticker** | **表情包标签关键词**（逗号分隔）：填进来的词会被补进适配器声明的类型清单（框架里的表情包插件正是看到这个词才注册自己的标签），且这些词对应的元素发送时按**图片**发出（`file_type=1`）。内置表情包用 `sticker`；第三方「增强表情包」是 `<sticker_plus>` 标签，填 `sticker` 即可覆盖。只有确实装了表情包（或加载了名字含该关键词的插件）时才生效 |
 | `gif_sticker_mode` | **auto** | **GIF/动图怎么发**：`auto` = 动图（GIF/WebP）**先原样直传**（平台图片格式现已支持 gif/webp，直传才保动画）→ 被平台拒则转 **APNG** → 静态 PNG → 最后自动按文件发（原图/动图都在，点开可看），被拒过的图 10 分钟内不再试原图；`image` = 跳过原图、直接转档（稳定优先）；`file` = GIF **原样按文件发**（保动图，要点开下载）。**png/jpg 三种模式下都一个字节都不动**；超过图片软限制(20MB)直接按文件发 |
@@ -461,6 +462,38 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.22</b> — ★★ 「输入中」默认延时 2 秒（对齐 QQ增强）+ 提前到消息落地 + 订阅位强制全新 identify + manifest 标签</summary>
+
+### 一、「输入中」默认**延时 2 秒**（新配置 `typing_delay_seconds`，默认 2.0）
+用户反馈：不能用户一发消息就显示「正在输入…」，很怪（参考 QQ增强 的默认值 2 秒）。
+* 消息落地后**先等 N 秒**再发；`0` = 立刻（旧行为）；
+* **模型真正开始跑**时若还没到点 ⇒ 取消待发、**直接发**（那时早已过延时）；
+* **机器人要发消息**时 ⇒ 取消该会话还没到点的待发，
+  免得"回复都出来了才冒出正在输入"。
+
+### 二、「输入中」提前到**消息落地**（不再等合并缓冲）
+旧挂点是 `on_llm_request`，前面还隔着核心的**合并缓冲**（把连发的几条合成一轮）⇒ 慢半拍。
+现在在消息摄入处（3.0 的 `_handle_message` 旁听）就起计时器，两条路**共用同一套门禁**
+（配置 / 50 秒防抖 / 每 msg_id 帧数上限）。
+
+### 三、为什么"要开关一次适配器"才生效 —— 已修（强制**全新 identify**）
+botpy `on_connected`：`session_id` 存在时走 `ws_resume()`，而 **resume 不会重发 intent**；
+只有 `ws_identify()` 才带上新订阅位。⇒ 之前"改 intent + 重连"被 resume 吃掉，
+只有重启/开关适配器才好。现在强制重连前**清掉 `session_id` / `last_seq`** ⇒ 改完立刻生效。
+
+### 四、manifest 补 `tags`
+```
+"tags": ["QQ官方机器人", "QQ", "消息桥接", "全量群消息", "markdown", "消息按钮",
+         "语音条", "表情包", "多媒体", "群管理", "昵称", "KiraAI"]
+```
+
+**测试**：`audit_typing_indicator.py` 47 → **63 条**（延时三态：延时中不发/到点发/0=立刻、
+llm 路径取消待发、取消后不再冒、摄入即发、重连清 session_id、manifest tags…）；
+全套件 59 个全绿。
+
+</details>
+
+<details>
 <summary><b>v1.6.21</b> — ★★★ 「输入中」批次事件真根因 + 互动订阅位重连必达 + 回调按钮可降级</summary>
 
 ### 一、「输入中」的真根因：事件是**批次事件**（用户诊断日志实证）
@@ -492,8 +525,35 @@ botpy 的 `_runner` 里 `BotWebSocket(...)` 是**局部变量**、`ConnectionSes
 * `长连接鉴权 intents=0x…（互动回调位 ✅/❌）`
 * 点击后：`已接上互动回调（INTERACTION_CREATE）…` + `[按钮] 用户点击了：…`
 
-**测试**：`audit_typing_indicator.py` 40 → **47 条**（批次单聊/批次群聊/`is_group_message()`/
-链里真群/多条取最后/端到端批次事件真的发出 `msg_type=6`）；全套件 59 个全绿。
+### 五、为什么"要开关一次适配器"才生效 —— 已修（强制**全新 identify**）
+botpy `on_connected`：
+```python
+if self._session["session_id"]:
+    await self.ws_resume()      # ← resume **不会重发 intent**
+else:
+    await self.ws_identify()    # ← 只有全新 identify 才带上新订阅位
+```
+⇒ 之前"改 intent + 重连"走的是 **resume**，订阅位永远发不出去，
+只有重启 / 开关适配器（全新 identify）才好。
+**修**：强制重连前**清掉 `session_id` / `last_seq`**，保证重连时走全新 identify ⇒
+改完订阅位**立刻生效**，不再需要用户手动开关适配器。
+
+### 六、「输入中」再提前：**消息刚落地就发**（不等合并缓冲）
+原来挂在 `on_llm_request`（模型开始跑）——中间还隔着核心的**合并缓冲**（等一小会儿把
+连发的几条合成一轮）⇒ 感觉慢半拍。现在在**消息摄入**（3.0 的 `_handle_message` 旁听处）
+就踢一脚（仅单聊、且已有入站 msg_id），两条路**共用同一套门禁**
+（配置 / 50 秒防抖 / 每 msg_id 帧数上限）。
+
+### 七、manifest 补 `tags`（核心 `plugin/manager.py` 会读取并展示）
+```
+"tags": ["QQ官方机器人", "QQ", "消息桥接", "全量群消息", "markdown",
+         "消息按钮", "语音条", "表情包", "多媒体", "群管理", "昵称", "KiraAI"]
+```
+
+**测试**：`audit_typing_indicator.py` 40 → **56 条**（批次单聊/批次群聊/`is_group_message()`/
+链里真群/多条取最后/端到端批次事件真的发出 `msg_type=6`／**摄入即发**／防抖／
+`_typing_early` 取 target／**重连清 session_id**／两条路共用门禁／manifest tags）；
+全套件 59 个全绿。
 
 </details>
 

@@ -400,6 +400,15 @@ class QQOfficialGroupBridge(BasePlugin):
         #: ★ 每条入站消息最多为它花几帧「输入中」（默认 2）。
         #:   msg_type=6 与真实回复共用「同一 msg_id 最多 4 次被动回复」的额度，
         #:   默认 2 帧 + 1 条回复 = 3，留 1 个余量（长回复/多段回复要用）。
+        #: ★ 2026-10-10（对齐 QQ增强 的 `typing_delay_seconds`）：消息刚到后**等几秒**
+        #:   再显示「正在输入…」。用户原话："不能用户一发消息就输入中也很怪"，
+        #:   默认 2 秒；填 0 = 立刻（旧行为）。模型真正开始跑时不再等，直接发。
+        try:
+            self.typing_delay_seconds = float(basic.get("typing_delay_seconds", 2.0) or 0.0)
+        except Exception:
+            self.typing_delay_seconds = 2.0
+        if not (0.0 <= self.typing_delay_seconds <= 30.0):
+            self.typing_delay_seconds = 2.0
         try:
             self.typing_max_frames = int(basic.get("typing_max_frames", 2) or 2)
         except Exception:
@@ -521,6 +530,8 @@ class QQOfficialGroupBridge(BasePlugin):
         self._typing_frames: dict = {}
         #: 「为什么没发」的诊断只打一次（每种原因一条）
         self._typing_skip_done: set = set()
+        #: ★ 待发中的「输入中」（target -> asyncio.Task）：消息刚到时先等 `typing_delay_seconds`
+        self._typing_pending: dict = {}
         self._typing_tasks: list = []
         self._typing_logged = False
         self._typing_seq = 1000
@@ -1003,6 +1014,30 @@ class QQOfficialGroupBridge(BasePlugin):
         # ---- 私聊「输入中…」（官方能力，核心没有；非阻塞、失败无副作用）----
         try:
             self._maybe_send_typing(event)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
+        # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
+        try:
+            target = self._c2c_target_of(event)
+            adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
+            if not target:
+                self._typing_skip(
+                    "not_c2c",
+                    "认不出单聊目标（官方 msg_type=6 只支持单聊）—— 已附带现场诊断，"
+                    "请把这条反馈")
+                self._dump_c2c_shape_once(event, logger)
+                return False
+            if not adapter_name:
+                self._typing_skip("no_adapter_name",
+                                  "事件里没有适配器名（adapter.name 为空）")
+                self._dump_c2c_shape_once(event, logger)
+                return False
+            adapter = self.ctx.adapter_mgr.get_adapter(adapter_name)
+            if adapter is None:
+                self._typing_skip("no_adapter", "适配器 %s 还没就绪", adapter_name)
+                return False
+            # ★ 统一走 `_typing_kick`（与「消息刚到时」那条路共用同一套门禁）
+            return self._typing_kick(adapter, target, source="llm")
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 输入中状态调度异常（忽略）: %s", exc)
         # ---- 新一轮开始 ⇒ 把上一轮还没收尾的流式消息补上结束帧 ----
@@ -2000,6 +2035,16 @@ class QQOfficialGroupBridge(BasePlugin):
                             if isinstance(sess, dict):
                                 sess["intent"] = int(sess.get("intent") or 0) | \
                                     plugin._EXTRA_INTENT_BITS
+                                # ★★★ 2026-10-10（用户实测"必须开关一次适配器才生效"）：
+                                #   botpy `on_connected` 的逻辑是
+                                #       if session_id: ws_resume()   # ← 不重发 intent！
+                                #       else:          ws_identify() # ← 才带上我们的订阅位
+                                #   只改 `intent` 而保留 session_id ⇒ 重连走 **resume**
+                                #   ⇒ 订阅位永远发不出去（所以只有重启/开关适配器这种
+                                #   全新 identify 才好）。
+                                #   ⇒ 这里**清掉 session_id / last_seq**，强制全新 identify。
+                                sess["session_id"] = ""
+                                sess["last_seq"] = 0
                             try:
                                 await gw._conn.close()
                                 closed += 1
@@ -2651,6 +2696,98 @@ class QQOfficialGroupBridge(BasePlugin):
             logger.debug("[QQBOT-BRIDGE] 输入中状态：调度失败（忽略）: %s", exc)
             return False
 
+    def _typing_kick(self, adapter, target: str, *, source: str = "llm") -> bool:
+        """按门禁发一帧「输入中」（**共享实现**：LLM 请求前 / 消息刚到时都用它）。
+
+        ``source``：``"ingest"`` = 消息刚进来（早）；``"llm"`` = 模型开始跑（旧挂点）。
+        ★ 2026-10-10 用户要求"更早一点"：核心有**合并缓冲**（等一小会儿把连发的几条
+          合成一轮），旧挂点要等缓冲结束、LLM 真正开始才发 ⇒ 用户感觉慢半拍。
+          现在在**消息摄入**时也踢一脚（`v3_support` 的 `_handle_message` 旁听处），
+          50 秒防抖 + 每条消息的帧数上限保证不会多发。
+        """
+        try:
+            if not self.typing_enabled or not self.enabled:
+                self._typing_skip("disabled", "配置 typing_enabled=关")
+                return False
+            if not target:
+                self._typing_skip("not_c2c", "认不出单聊目标（官方 msg_type=6 只支持单聊）")
+                return False
+            client = adapter.get_client() if adapter is not None else None
+            if client is None:
+                self._typing_skip("no_client", "适配器还没连上（client 为空）")
+                return False
+            reply_ids = self._adapter_attr(adapter, "_direct_reply_ids") or {}
+            msg_id = str(reply_ids.get(target) or "")
+            if not msg_id:
+                self._typing_skip("no_msg_id",
+                                  "还没有入站 msg_id（被动回复窗口未就绪）——"
+                                  "输入中状态必须挂在一条收到的消息上")
+                return False
+            now = time.time()
+            if now - self._typing_sent_at.get(target, 0.0) < self._TYPING_DEBOUNCE:
+                self._typing_skip("debounced", "同一会话距上次发送不足 %.0f 秒（防抖）",
+                                  self._TYPING_DEBOUNCE)
+                return False
+            frame_key = (target, msg_id)
+            used = int(self._typing_frames.get(frame_key, 0))
+            if used >= self.typing_max_frames:
+                self._typing_skip(
+                    "frame_cap",
+                    "本条入站消息的输入中帧数已达上限 %d（保护被动回复额度："
+                    "同一 msg_id 最多 4 次，留给真实回复）", self.typing_max_frames)
+                return False
+            if len(self._typing_frames) > 64:
+                self._typing_frames.clear()
+            self._typing_frames[frame_key] = used + 1
+            self._typing_sent_at[target] = now
+            delay = float(getattr(self, "typing_delay_seconds", 0.0) or 0.0)
+            if source == "ingest" and delay > 0:
+                # ★ 消息刚到的路径：**先等 delay 秒**（默认 2s）再发；
+                #   期间若模型开始跑（llm 路径）或机器人已经要回复了，会被取消。
+                self._typing_cancel_pending(target)
+                plugin_self = self
+
+                async def _later(_a=adapter, _c=client, _t=target, _m=msg_id, _d=delay):
+                    try:
+                        await asyncio.sleep(_d)
+                    except asyncio.CancelledError:
+                        return
+                    try:
+                        await plugin_self._send_typing(_a, _c, _t, _m)
+                    except Exception:
+                        pass
+
+                task = asyncio.ensure_future(_later())
+                self._typing_pending[target] = task
+                self._typing_tasks.append(task)
+                self._typing_tasks = [t for t in self._typing_tasks if not t.done()][-8:]
+                return True
+            self._typing_cancel_pending(target)     # llm 路径：不再等，立刻发
+            task = asyncio.ensure_future(self._send_typing(adapter, client, target, msg_id))
+            self._typing_tasks.append(task)
+            self._typing_tasks = [t for t in self._typing_tasks if not t.done()][-8:]
+            if source == "ingest" and not getattr(self, "_typing_early_logged", False):
+                self._typing_early_logged = True
+                logger.info(
+                    "[QQBOT-BRIDGE] 【输入中】已在**消息刚到时**就发（不等合并缓冲/模型启动）"
+                    "—— 觉得还是慢就把本行反馈")
+            return True
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 输入中调度失败（忽略）: %s", exc)
+            return False
+
+    def _typing_cancel_pending(self, target: str) -> None:
+        """取消该会话上"还没到点"的输入中（模型已经开始跑 / 已经要发消息了）。"""
+        try:
+            pend = getattr(self, "_typing_pending", None)
+            if not isinstance(pend, dict):
+                return
+            task = pend.pop(str(target), None)
+            if task is not None and not task.done():
+                task.cancel()
+        except Exception:
+            pass
+
     def _shared_msg_seq(self, adapter, target: str, msg_id: str) -> int:
         """取该 msg_id 的**下一个**序号，并让框架的下一条从它之后继续（官方同款做法）。
 
@@ -3110,6 +3247,13 @@ class QQOfficialGroupBridge(BasePlugin):
                         pass
 
         async def _send_message_inner(target_id, send_message_obj, is_group):
+            # ★ 真要发消息了 ⇒ 取消这条会话上还没到点的「输入中」，
+            #   免得"回复都出来了才冒出正在输入"（用户会觉得怪）。
+            if not is_group:
+                try:
+                    self._typing_cancel_pending(str(target_id))
+                except Exception:
+                    pass
             ref = self._quote_ref_for(adapter, target_id, send_message_obj, is_group) \
                 if self.quote_reply else None
             # ★★★ 这里必须把 markdown / keyboard 也提取出来放进 contextvar ——
@@ -3580,11 +3724,21 @@ class KeyboardTag(_BridgeTag):
     description = KEYBOARD_TAG_DESCRIPTION
 
     async def handle(self, value: str, **kwargs):
+        _stats: dict = {}
         try:
-            payload = validate_keyboard(value or "")
+            payload = validate_keyboard(value or "", stats=_stats)
         except Exception as exc:
             logger.warning("[QQBOT-BRIDGE] <keyboard> 内容不合法，已丢弃：%s", exc)
             return []
+        # ★ 2026-10-10：官方 style 只有 0/1/3/4；其它值可能被平台按 305007 拒或按默认渲染。
+        #   我们**不改**模型给的值（避免"插件改坏"），只提示一次。
+        if _stats.get("bad_style") and not getattr(self, "_kb_style_warned", False):
+            self._kb_style_warned = True
+            logger.warning(
+                "[QQBOT-BRIDGE] 本条键盘有 %d 个按钮的 render_data.style 不是官方值"
+                "（官方只有 0 灰线框 / 1 蓝线框 / 3 白底红字 / 4 蓝底白字）——"
+                "已原样发送；若客户端显示异常，检查模型给的样式值",
+                _stats["bad_style"])
         return [KeyboardMarker(payload)]
 
 

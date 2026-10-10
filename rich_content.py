@@ -74,6 +74,10 @@ def callback_to_command_enabled() -> bool:
 MAX_KEYBOARD_ROWS = 5
 MAX_BUTTONS_PER_ROW = 5
 MAX_BUTTON_DATA = 100
+#: 官方《消息按钮》里 render_data.style 的取值（其它值平台会报 305007 样式参数错误，
+#: 或按默认样式渲染 —— 型号/客户端表现不一）：0 灰线框 / 1 蓝线框 / 3 白底红字 / 4 蓝底白字。
+OFFICIAL_BUTTON_STYLES = (0, 1, 3, 4)
+
 #: markdown 正文建议上限（官方：单条建议 ≤ 4000 字符）
 MAX_MARKDOWN_CHARS = 4000
 
@@ -159,7 +163,7 @@ class KeyboardError(ValueError):
     pass
 
 
-def validate_keyboard(raw: str) -> dict:
+def validate_keyboard(raw: str, stats: Optional[dict] = None) -> dict:
     """把模型给的 JSON 校验成合法的 `keyboard` 载荷。
 
     官方两种形态：
@@ -219,7 +223,9 @@ def validate_keyboard(raw: str) -> dict:
                         f"按钮 {bid} 的 action.data 超过 {MAX_BUTTON_DATA} 字符"
                     )
     payload_out = {"content": {"rows": rows}}
-    apply_button_defaults(payload_out)          # ★ 指令按钮默认 enter:true
+    _st = apply_button_defaults(payload_out)    # ★ 指令按钮默认 enter:true
+    if isinstance(stats, dict):
+        stats.update(_st)
     return payload_out
 
 
@@ -232,7 +238,7 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
         互动事件推到机器人（长连接订阅了 INTERACTION 就行；若后台把"消息推送方式"
         设成 Webhook 而地址不可达，客户端点按钮会提示「请求第三方失败」）。
     """
-    stats = {"enter_added": 0, "callback": 0, "converted": 0}
+    stats = {"enter_added": 0, "callback": 0, "converted": 0, "bad_style": 0}
     try:
         rows = ((payload or {}).get("content") or {}).get("rows") or []
     except Exception:
@@ -244,6 +250,14 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
         for btn in (row.get("buttons") or []):
             if not isinstance(btn, dict):
                 continue
+            # 样式合法性（只统计、**不修改** —— 避免"我们改坏"的可能）
+            rd = btn.get("render_data")
+            if isinstance(rd, dict) and "style" in rd:
+                try:
+                    if int(rd.get("style")) not in OFFICIAL_BUTTON_STYLES:
+                        stats["bad_style"] += 1
+                except Exception:
+                    stats["bad_style"] += 1
             action = btn.get("action")
             if not isinstance(action, dict):
                 continue
@@ -404,12 +418,19 @@ MARKDOWN_TAG_DESCRIPTION = (
 
 KEYBOARD_TAG_DESCRIPTION = (
     "<keyboard>JSON</keyboard> "
-    "# 在消息下方挂内联按钮。JSON 形如 "
-    '{"content":{"rows":[{"buttons":[{"id":"b1","render_data":{"label":"点我","style":1},'
-    '"action":{"type":2,"data":"/签到","permission":{"type":2}}}]}]}}。'
+    "# 在消息**最底部**挂一排内联按钮（平台不支持把按钮写进 md 正文里，"
+    "按钮永远是消息底部整排）。JSON 形如 "
+    '{"content":{"rows":[{"buttons":[{"id":"b1","render_data":{"label":"点我","style":1,'
+    '"visited_label":"已点"},"action":{"type":2,"data":"/签到","permission":{"type":2}}}]}]}}。'
     "最多 5 行、每行最多 5 个按钮，按钮的 action.data 不超过 100 字符。"
-    "必须和 <text> 或 <markdown> 放在同一个 <msg> 里。用户点击后会以消息形式回来。"
-    "★ 可以和图片/语音放在同一条 <msg> 里 —— 系统会自动拆成两条（先媒体、后按钮），两边都正常。"
-    "★ 指令按钮（action.type=2）默认带 enter=true：用户点一下就**直接发送**，不用再按发送键"
-    "（仅单聊生效；想让它只插进输入框、由用户自己按发送，就显式写 \"enter\": false）。"
+    "★ 按钮文字用 render_data.label（不超过 10 字符）；想在被点过之后换文案，"
+    "就再写 render_data.visited_label。"
+    "★ 按钮样式（render_data.style）有四种，**按语义挑，不要都用同一种**："
+    "0 = 灰色线框（次要/取消）；1 = 蓝色线框（普通）；"
+    "3 = 白底红字（危险/删除）；4 = 蓝底白字（主推/推荐）。"
+    "★ **正文和按钮必须写在同一个 <msg> 里**，例如 "
+    "<msg><text>说明文字</text><keyboard>{…}</keyboard></msg>；"
+    "分成两个 <msg> 发的话，按钮会单独占一条消息（用户看着很割裂）。"
+    "★ 也可以和图片/语音放在同一条 <msg> 里 —— 系统会自动拆成两条（先媒体、后按钮），"
+    "两边都正常。用户点击后，这次点击会作为一条消息回到你这里，你可以接着接话。"
 )
