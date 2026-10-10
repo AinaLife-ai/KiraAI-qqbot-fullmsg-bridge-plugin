@@ -364,5 +364,71 @@
         "hint": "有人申请加群时提醒模型一声（只提醒、不会自动批准）。重要：官方规定「只有当机器人是群管理员时才可以收到此事件」，所以这项需要机器人是群管理员，默认关。机器人不是管理员时，平台根本不会推这个事件过来。想让它自己批准或拒绝，再打开「审批加群申请」。"
       }
     }
+  },
+  "section_button": {
+    "name": "按钮策略（限次/限人/截止/计数）",
+    "type": "section",
+    "hint": "官方 click_limit 已弃用 ⇒ 次数限制只能在插件侧做。模型在 <keyboard> 上写属性即生效；这里的值是「模型没写时」的默认。",
+    "fields": {
+      "button_policy_enabled": {
+        "name": "启用按钮策略",
+        "type": "switch",
+        "default": true,
+        "hint": "总开关。开启后：模型可以在 keyboard 标签上声明 max/once/per/ttl/until/cooldown，插件负责计数、判定、截止，并给模型提供查账工具。关闭后行为与旧版完全一致。"
+      },
+      "button_deliver_default": {
+        "name": "默认告知方式",
+        "type": "select",
+        "default": "last",
+        "options": [
+          "last",
+          "all",
+          "off"
+        ],
+        "hint": "last＝只在「触发截止的那一次」把点击转给模型（默认，最安静）；all＝每次有效点击都转；off＝都不转（模型用 qq_button_stats 查账）。"
+      },
+      "button_hard_default": {
+        "name": "默认硬拦截",
+        "type": "switch",
+        "default": true,
+        "hint": "开启：超额／过期／重复的点击不再转给模型（模型需要时自己查账）。关闭：仍然转给模型，但正文会标注「名额已满／已过期」等判定。"
+      },
+      "button_notify_default": {
+        "name": "截止时给用户发提示",
+        "type": "switch",
+        "default": false,
+        "hint": "默认关闭（机械文案一向不推荐）。开启后，超额／过期的点击会给用户发一条提示，文案取下面的自定义值。"
+      },
+      "button_notify_text": {
+        "name": "提示文案（自定义）",
+        "type": "string",
+        "default": "",
+        "hint": "例如「名额满啦，下次要快哦～」。留空则不发；也可以逐条写在 keyboard 标签的 notify_text 属性里覆盖此处。"
+      },
+      "button_default_ttl": {
+        "name": "默认有效期（秒）",
+        "type": "integer",
+        "default": 0,
+        "hint": "0＝不限。模型没写 ttl 或 until 时用这个值。"
+      },
+      "button_default_once": {
+        "name": "默认每人只限一次",
+        "type": "switch",
+        "default": false,
+        "hint": "模型没写 once 时，是否默认每人只能点一次。"
+      },
+      "button_policy_token": {
+        "name": "在按钮数据里带追踪标记",
+        "type": "switch",
+        "default": false,
+        "hint": "开启后，插件会给按钮的 action.data 加一个 6 字符前缀（用户看不到、模型看到的是原值），让计数在「消息 id 缺失」的极端情况下也能精确对应。一般不必要。"
+      },
+      "button_max_entries": {
+        "name": "账本上限",
+        "type": "integer",
+        "default": 500,
+        "hint": "最多同时记多少条按钮策略（超出按最早的淘汰）。"
+      }
+    }
   }
 }

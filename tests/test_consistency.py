@@ -47,7 +47,7 @@ for section in schema.values():
     schema_keys |= set(section.get("fields", {}))
 # 各 section 对应的读取变量名（v1.3.3 起拆成 member / admin 两组）
 code_keys = set(re.findall(
-    r'(?:basic|proactive|member|admin)\.get\("([a-z_0-9]+)"', main_py))
+    r'(?:basic|proactive|member|admin|button)\.get\("([a-z_0-9]+)"', main_py))
 
 missing_in_code = sorted(schema_keys - code_keys)
 missing_in_schema = sorted(code_keys - schema_keys)

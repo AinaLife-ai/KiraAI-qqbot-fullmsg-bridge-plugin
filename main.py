@@ -128,7 +128,9 @@ from api_send import (
     QUOTE_REF,
     ApiSendPatcher,
 )
+import button_policy
 from admin_tools import build_tools as build_admin_tools
+from button_tools import build_button_tools
 from v3_support import V3Enhancer
 
 from qqbot_bridge import (
@@ -717,6 +719,30 @@ class QQOfficialGroupBridge(BasePlugin):
 
         self.dedup = MessageDedup(ttl=self.dedup_ttl)
         self.identities = IdentityStore(path=_identity_path() if self.remember_nicknames else None)
+        # ---- 按钮策略账本（v1.6.32）----
+        #: 按钮策略段（schema 的 section_button）；旧配置没有该段时退回 basic
+        button = cfg.get("section_button") or {}
+        if not isinstance(button, dict) or not button:
+            button = basic
+        self.button_policy_enabled = bool(button.get("button_policy_enabled", True))
+        self.button_deliver_default = str(button.get("button_deliver_default") or "last")
+        self.button_hard_default = bool(button.get("button_hard_default", True))
+        self.button_notify_default = bool(button.get("button_notify_default", False))
+        self.button_notify_text = str(button.get("button_notify_text") or "")
+        self.button_policy_token = bool(button.get("button_policy_token", False))
+        self.button_policies = button_policy.ButtonPolicyStore(
+            path=_identity_path().replace("identities.json", "button_policies.json")
+            if (self.button_policy_enabled and _identity_path()) else None,
+            max_entries=int(button.get("button_max_entries") or 500),
+            defaults={
+                "deliver": self.button_deliver_default,
+                "hard": self.button_hard_default,
+                "notify": self.button_notify_default,
+                "notify_text": self.button_notify_text,
+                "ttl": int(button.get("button_default_ttl") or 0),
+                "once": bool(button.get("button_default_once", False)),
+            },
+        )
         #: 官方「获取群成员信息」接口不可用（11253/内邀）——只提示一次，之后不再重试
         self._member_api_denied = False
         self._member_api_logged = False
@@ -934,6 +960,7 @@ class QQOfficialGroupBridge(BasePlugin):
             pass
         await self._flush_identities(force=True)
         await self._flush_group_names(force=True)
+        await self._flush_button_policies(force=True)
         # ★★★ 2026-10-10 用户实测（"更新后要开关适配器/重载插件才生效"）根因：
         #   核心的加载流程是 `terminate()` → 重新 `initialize()`（manager.py:748）。
         #   旧实现**故意保留补丁**想省事，但补丁闭包里抓的是**旧模块的函数对象** ——
@@ -968,6 +995,11 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._warn_if_stale_module()
             except Exception:
                 pass
+            try:
+                await self._flush_button_policies()
+                await self._notify_policy_closes()
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 按钮策略巡检异常（忽略）: %s", exc)
             await self._flush_identities()
             await self._flush_group_names()
 
@@ -1062,6 +1094,132 @@ class QQOfficialGroupBridge(BasePlugin):
         except Exception as exc:              # noqa: BLE001
             logger.debug("[QQBOT-BRIDGE] learn_peer_names 异常（忽略）: %s", exc)
 
+    # ------------------------------------------------------------------ #
+    # 按钮策略（v1.6.32）：登记 / 匹配 / 判定 / 截止通知
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _policy_sid(target_id: str) -> str:
+        """策略账本按**原始会话 id**（群/用户 openid）索引 —— 发送端与点击端一致。"""
+        return str(target_id or "")
+
+    def register_button_policy(self, target_id: str, spec: dict, payload: dict):
+        """发送前登记策略；返回策略 key（没声明则 None）。零 I/O。"""
+        if not self.button_policy_enabled or not spec:
+            return None
+        try:
+            btn_ids = list(spec.get("button_ids") or [])
+            if not btn_ids:
+                btn_ids = [str(b.get("id") or "")
+                           for r in ((payload or {}).get("content") or {}).get("rows") or []
+                           for b in (r.get("buttons") or []) if isinstance(r, dict)]
+            pol = self.button_policies.register(
+                self._policy_sid(target_id), spec,
+                button_ids=[b for b in btn_ids if b],
+                token=self.button_policy_token,
+            )
+            if pol is None:
+                return None
+            if self.button_policy_token and pol.get("token"):
+                n = button_policy.embed_token(payload, {b: pol["token"] for b in (pol.get("button_ids") or [])})
+                if not n:
+                    pol.pop("token", None)
+                    self.button_policies._by_token.pop(str(pol.get("token") or ""), None)
+            _bits = []
+            if pol.get("max"):
+                _bits.append(f"共{pol['max']}次")
+            if pol.get("per"):
+                _bits.append(f"每人{pol['per']}次")
+            if pol.get("once"):
+                _bits.append("每人1次")
+            if pol.get("until"):
+                _bits.append("截止" + time.strftime("%m-%d %H:%M", time.localtime(pol["until"])))
+            logger.info(
+                "[QQBOT-BRIDGE] 按钮策略已登记（%s）：%s｜模式=%s%s%s",
+                pol["key"], "、".join(_bits) or "未设限",
+                self.button_policies._effective_deliver(pol),
+                "｜硬拦截" if pol.get("hard") else "｜软判定",
+                "｜截止时告知用户" if pol.get("notify") else "",
+            )
+            return pol["key"]
+        except Exception as exc:                     # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] 登记按钮策略失败（忽略）: %s", exc)
+            return None
+
+    def bind_button_policy(self, key, message_id) -> None:
+        if key and message_id:
+            try:
+                self.button_policies.bind_message(str(key), str(message_id))
+            except Exception:
+                pass
+
+    def evaluate_button_click(self, *, message_id: str = "", target_id: str = "",
+                              button_id: str = "", data: str = "",
+                              uid: str = "") -> dict:
+        """判定一次点击。返回 ``{"policy":…, "verdict":…, "data":原文, "deliver":bool}``。
+
+        **绝不抛异常、绝不阻塞**（全内存 O(1)）。
+        """
+        out = {"policy": None, "verdict": None, "data": button_policy.strip_token(data),
+               "deliver": True, "note": ""}
+        if not self.button_policy_enabled:
+            return out
+        try:
+            pol, clean = self.button_policies.resolve(
+                message_id=str(message_id or ""), sid=self._policy_sid(target_id),
+                button_id=str(button_id or ""), data=str(data or ""))
+            out["data"] = clean
+            if pol is None:
+                return out
+            verdict = self.button_policies.decide(pol, uid)
+            out["policy"], out["verdict"] = pol, verdict
+            _names: dict = {}
+            try:
+                for _u in (verdict.get("names_needed") or []):
+                    _names[_u] = self.identities.lookup_any(str(_u)) or ""
+                if not _names:
+                    _names = {str(uid): self.identities.lookup_any(str(uid)) or ""}
+            except Exception:
+                _names = {}
+            out["note"] = button_policy.render_note(pol, verdict, names=_names)
+            mode = self.button_policies._effective_deliver(pol)
+            if mode == "off":
+                out["deliver"] = False
+            elif mode == "last":
+                out["deliver"] = bool(verdict.get("closing"))
+            else:
+                out["deliver"] = bool(verdict.get("accepted"))
+            if verdict.get("accepted") and not out["deliver"] and mode == "last":
+                logger.debug("[QQBOT-BRIDGE] 按钮 %s 第 %s 次点击按「静默」策略未打扰模型",
+                             button_id or "-", verdict.get("total"))
+            # 落盘交给 15s 巡检（消息路径零 I/O）；这里只保证 dirty 已置
+            return out
+        except Exception as exc:                     # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] 按钮判定异常（按未设策略处理）: %s", exc)
+            return out
+
+    def policy_close_notices(self) -> list:
+        """巡检：把"到点截止"的策略整理成给模型的一条通知（没人点过的静默）。"""
+        if not self.button_policy_enabled:
+            return []
+        out = []
+        try:
+            for pol in self.button_policies.due_for_close():
+                names = []
+                for uid, _rec in (pol.get("users") or {}).items():
+                    try:
+                        names.append(self.identities.lookup_any(str(uid)) or f"未知用户({uid})")
+                    except Exception:
+                        names.append(f"未知用户({uid})")
+                label = pol.get("label") or "按钮"
+                txt = (f"[按钮截止] 「{label}」已到截止时间：共 {int(pol.get('total') or 0)} 次点击"
+                       f"、{len(pol.get('users') or {})} 人参与"
+                       + ("（" + "、".join(names[:8]) + ("…" if len(names) > 8 else "") + "）"
+                          if names else ""))
+                out.append({"sid": pol.get("sid"), "text": txt, "policy": pol})
+        except Exception as exc:                     # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] 截止通知整理失败（忽略）: %s", exc)
+        return out
+
     def _warn_if_stale_module(self) -> None:
         """磁盘上的 main.py 变了、而内存里还是旧代码 ⇒ **明确告诉用户该做什么**。
 
@@ -1081,6 +1239,66 @@ class QQOfficialGroupBridge(BasePlugin):
             "新代码接管后即刻生效，不必再开关适配器）",
             _IMPORT_FINGERPRINT[:8], now_fp[:8],
         )
+
+    async def send_passive_notice(self, client, *, is_group: bool, target_id: str,
+                                 text: str, msg_id: str = "") -> bool:
+        """用**点击事件 id** 发一条被动消息（官方：事件 id 可用于被动消息发送）。
+
+        只用于"截止提示"这类机械文案，**默认关闭**（机械文案一向不推荐）。
+        绝不抛异常、绝不阻塞（3s 超时；失败只记 debug）。
+        """
+        if not text:
+            return False
+        try:
+            api = getattr(client, "api", None)
+            http = getattr(api, "_http", None)
+            if http is None:
+                return False
+            from botpy.http import Route          # 延迟导入
+
+            if is_group:
+                route = Route("POST", "/v2/groups/{group_openid}/messages",
+                              group_openid=str(target_id))
+            else:
+                route = Route("POST", "/v2/users/{user_openid}/messages",
+                              user_openid=str(target_id))
+            body = {"content": str(text)[:200], "msg_type": 0, "msg_seq": 1}
+            if msg_id:
+                body["msg_id"] = str(msg_id)
+            await asyncio.wait_for(http.request(route, json=body), timeout=3.0)
+            logger.info("[QQBOT-BRIDGE] 已按策略给用户发截止提示：%s", str(text)[:60])
+            return True
+        except Exception as exc:                     # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] 截止提示发送失败（忽略）: %s", str(exc)[:160])
+            return False
+
+    async def _flush_button_policies(self, force: bool = False):
+        """按钮策略落盘（线程里做，消息路径零 I/O）。"""
+        if not self.button_policy_enabled:
+            return
+        if not force and not self.button_policies.dirty:
+            return
+        try:
+            await asyncio.to_thread(self.button_policies.save)
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 按钮策略落盘失败（忽略）: %s", exc)
+
+    async def _notify_policy_closes(self):
+        """到点截止 ⇒ 给模型一条「已截止」通知（只发一次；没人点过不发）。"""
+        for item in self.policy_close_notices():
+            try:
+                for name, adapter in self._find_adapters():
+                    try:
+                        self.publish_synthetic_event(
+                            target_id=str(item["sid"]), sender_id="system",
+                            is_group=True, text=str(item["text"]),
+                        )
+                        logger.info("[QQBOT-BRIDGE] 已发出按钮截止通知：%s", str(item["text"])[:80])
+                        break
+                    except Exception:
+                        continue
+            except Exception as exc:                 # noqa: BLE001
+                logger.debug("[QQBOT-BRIDGE] 截止通知发送失败（忽略）: %s", exc)
 
     async def _flush_group_names(self, force: bool = False):
         """群名缓存落盘 —— 同样走线程，不占事件循环。"""
@@ -1378,6 +1596,10 @@ class QQOfficialGroupBridge(BasePlugin):
                     "blacklist_enabled": self.admin_blacklist,
                 }):
                     tool_set.add(cls(ctx=self.ctx))
+                # ---- 按钮策略「查账」工具（v1.6.32）----
+                if self.button_policy_enabled:
+                    for cls in build_button_tools({"button_policy_enabled": True}):
+                        tool_set.add(cls(ctx=self.ctx))
         except Exception as exc:
             logger.debug("[QQBOT-BRIDGE] 注入 L1 工具失败: %s", exc)
 
@@ -4218,11 +4440,25 @@ class KeyboardTag(_BridgeTag):
 
     async def handle(self, value: str, **kwargs):
         _stats: dict = {}
+        # ★ v1.6.32：策略声明（标签属性 + JSON 里的 kirai）在这里被**剥离**，
+        #   藏进载荷的私有键 `__kirai__` 里，随消息走到发送层再取出登记。
+        #   平台永远看不到它（发送层会 pop 掉 + 深度清理兜底）。
+        _spec: dict = {}
         try:
             payload = validate_keyboard(value or "", stats=_stats)
+            payload, _spec = button_policy.split_keyboard_declaration(payload, kwargs or {})
         except Exception as exc:
             logger.warning("[QQBOT-BRIDGE] <keyboard> 内容不合法，已丢弃：%s", exc)
             return []
+        if _spec:
+            try:
+                _btn_ids = [str(b.get("id") or "")
+                            for r in ((payload.get("content") or {}).get("rows") or [])
+                            for b in (r.get("buttons") or []) if isinstance(r, dict)]
+                _spec["button_ids"] = [b for b in _btn_ids if b]
+                payload["__kirai__"] = _spec
+            except Exception:
+                pass
         # ★ 2026-10-10：官方 style 只有 0/1/3/4；其它值可能被平台按 305007 拒或按默认渲染。
         #   我们**不改**模型给的值（避免"插件改坏"），只提示一次。
         if _stats.get("bad_style") and not getattr(self, "_kb_style_warned", False):

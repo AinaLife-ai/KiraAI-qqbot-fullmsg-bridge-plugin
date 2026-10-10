@@ -288,6 +288,26 @@ class ApiSendPatcher:
         except Exception:
             pass
 
+        # ★★ v1.6.32：按钮策略声明（标签属性 / JSON 里的 kirai）随载荷藏着，
+        #   在这里取出来登记成账本，**然后从载荷里删掉** —— 平台永远看不到它。
+        #   同时做一次深度兜底清理：任何残留的 kirai 键都不许进入出站报文。
+        _policy_key = None
+        if isinstance(keyboard, dict):
+            _spec = keyboard.pop("__kirai__", None)
+            if not _spec:
+                _spec = keyboard.pop("kirai", None)
+            if isinstance(_spec, dict) and _spec:
+                try:
+                    _target = kwargs.get("group_openid") if is_group else kwargs.get("openid")
+                    _policy_key = self.plugin.register_button_policy(
+                        str(_target or ""), _spec, keyboard)
+                except Exception as exc:                     # noqa: BLE001
+                    self.logger.debug("[QQBOT-BRIDGE] 登记按钮策略失败（忽略）: %s", exc)
+            try:
+                _purge_private_keys(keyboard)
+            except Exception:
+                pass
+
         if keyboard:
             kwargs = dict(kwargs)
             kwargs["keyboard"] = keyboard
@@ -414,9 +434,35 @@ class ApiSendPatcher:
                 if target and sent_id:
                     self.plugin.remember_sent_ref(adapter, str(target), str(sent_id),
                                                   sent_ref, is_group)
+                # ★ v1.6.32：把"发送回执的消息 id"绑到按钮策略上 ⇒ 点击可精确匹配
+                if _policy_key and sent_id:
+                    try:
+                        self.plugin.bind_button_policy(_policy_key, str(sent_id))
+                    except Exception:
+                        pass
         except Exception as exc:
             self.logger.debug("[QQBOT-BRIDGE] 记录已发送消息的 ref_idx 失败: %s", exc)
         return result
+
+
+def _purge_private_keys(payload: Any, _depth: int = 0) -> None:
+    """深度删掉**私有键**（`kirai` / `__kirai__` / `_kirai*`）——出站报文必须只含官方字段。
+
+    这是"官方 keyboard 兼容性"的最后一道保险：即便上游漏删，这里也一定清干净
+    （官方 schema 里没有这些字段，带上可能报 40034029 键盘参数错误）。
+    """
+    if _depth > 8 or not isinstance(payload, (dict, list)):
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            _purge_private_keys(item, _depth + 1)
+        return
+    for key in list(payload.keys()):
+        if isinstance(key, str) and (key.startswith("_kirai") or key.startswith("__kirai")
+                                     or key == "kirai"):
+            payload.pop(key, None)
+            continue
+        _purge_private_keys(payload[key], _depth + 1)
 
 
 def _extract_ref_idx(result: Any) -> Optional[str]:
