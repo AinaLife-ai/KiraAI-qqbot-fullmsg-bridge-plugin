@@ -238,6 +238,17 @@ class InteractionBridge:
                 )
             return
 
+        # ★ 2026-10-10：发布前**尽力**把「这人是谁 / 这是哪个群」补全。
+        #   官方点击事件里**只有 openid、没有昵称**（这是平台不给，不是我们没做）；
+        #   成员详情接口是内邀能力 ⇒ 有权限就用真名，没权限就占位，绝不阻塞。
+        try:
+            await self.plugin.learn_peer_names(
+                client, is_group=is_group, target_id=target_id,
+                sender_id=sender_id, timeout=0.8,
+            )
+        except Exception as exc:                     # noqa: BLE001
+            self.logger.debug("[QQBOT-BRIDGE] 补全点击者信息失败（忽略）: %s", exc)
+
         self.plugin.publish_synthetic_event(
             target_id=target_id,
             sender_id=sender_id,

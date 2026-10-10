@@ -382,13 +382,24 @@ async def main():
         ("not json", "非 JSON"),
         ('{"content":{"rows":[]}}', "空 rows"),
         ('{"content":{"rows":[{"buttons":[]}]}}', "空 buttons"),
-        ('{"content":{"rows":[{"buttons":[{"action":{}}]}]}}', "缺 id"),
+        # 官方 schema 里 action 也是非必填（空 action 平台会渲染成死按钮，不报错）⇒
+        # 换成**真违规**：action.data 超过 100 字符（官方硬限制）。
+        ('{"content":{"rows":[{"buttons":[{"id":"x","action":{"type":1,"data":"' + "a" * 101 + '"}}]}]}}',
+         "data 超长"),
     ):
         try:
             bridge_main.validate_keyboard(bad)
             check(f"非法键盘被拒（{why}）", False, "竟然通过了")
         except Exception:
             check(f"非法键盘被拒（{why}）", True)
+    # 官方《发送群聊消息》schema 里 Button.id 是**非必填** ⇒ 缺了就自动补唯一 id，
+    # 不该整条被拒（旧行为是报错，模型偶尔漏写就发不出去）。
+    _auto_kb = bridge_main.validate_keyboard(
+        '{"content":{"rows":[{"buttons":[{"render_data":{"label":"A"}},'
+        '{"render_data":{"label":"B"}}]}]}}')
+    _ids = [b.get("id") for b in _auto_kb["content"]["rows"][0]["buttons"]]
+    check("缺 id ⇒ 自动补唯一 id（不拒整条）",
+          all(isinstance(i, str) and i for i in _ids) and len(set(_ids)) == 2, str(_ids))
 
     # ---------- 12. 可逆 ----------
     print("\n[12] 可逆：关掉开关后全部还原")

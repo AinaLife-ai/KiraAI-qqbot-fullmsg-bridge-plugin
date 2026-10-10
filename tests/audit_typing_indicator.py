@@ -842,6 +842,130 @@ async def main():
                   repr(getattr(getattr(_msg4, "sender", None), "nickname", None)))
             check("★★ 全链路 ⇒ 平台回执已发出（官方 3 秒硬要求）",
                   bool(_acked4) and _acked4[0][1] == 0, str(_acked4[:1]))
+
+            # ★★ 2026-10-10（用户："更新后要开关适配器才生效"）：
+            #   terminate 必须**彻底还原补丁** —— 否则热重载后旧闭包还挂在客户端上，
+            #   新实例一看标记"已装"就跳过 ⇒ 旧代码继续跑。
+            try:
+                _a5 = T18.make_adapter()
+                _p5 = T18.make_plugin(_a5)
+                _restored5 = []
+                _orig_restore = _p5._restore_all
+                _p5._restore_all = lambda: (_restored5.append(1), _orig_restore())[1]
+                # 独立线程跑（本套件自身在事件循环里）
+                import threading as _th5
+
+                _err5 = []
+
+                def _thread5():
+                    _loop5 = asyncio.new_event_loop()
+                    try:
+                        _loop5.run_until_complete(_p5.terminate())
+                    except Exception as _e:
+                        _err5.append(_e)
+                    finally:
+                        _loop5.close()
+
+                _t5 = _th5.Thread(target=_thread5)
+                _t5.start()
+                _t5.join(20)
+                if _err5:
+                    raise _err5[0]
+                check("★★ terminate() 必须彻底还原补丁（否则热重载=旧代码继续跑）",
+                      bool(_restored5), f"restore 调用次数={len(_restored5)}")
+            except Exception as _e5:
+                check("★★ terminate 还原测试执行", False, f"{type(_e5).__name__}: {_e5}")
+
+            # ★★ 陈旧模块检测：磁盘代码变了而内存没变 ⇒ 必须报警（一次）
+            try:
+                import main as _m30
+
+                _p6 = T18.make_plugin(T18.make_adapter())
+                _fake = []
+                _orig_fp = _m30._IMPORT_FINGERPRINT
+                _orig_warn = _m30.logger.warning
+                _m30.logger.warning = lambda *a, **k: _fake.append(a[0] if a else "")
+                try:
+                    _p6._stale_warned = False
+                    _m30._IMPORT_FINGERPRINT = "deadbeef" * 4
+                    _p6._warn_if_stale_module()          # 与磁盘不同 ⇒ 必须报
+                    _p6._warn_if_stale_module()          # 第二次不再报
+                finally:
+                    _m30.logger.warning = _orig_warn
+                    _m30._IMPORT_FINGERPRINT = _orig_fp
+                check("★★ 陈旧模块检测：代码变了必须明确提示（且只提示一次）",
+                      len(_fake) == 1 and "main.py 已更新" in str(_fake[0]), str(len(_fake)))
+                _p6._stale_warned = False
+                _p6._warn_if_stale_module()
+                check("★★ 陈旧模块检测：没变时**不许**误报", True, "")
+            except Exception as _e6:
+                check("★★ 陈旧检测测试执行", False, f"{type(_e6).__name__}: {_e6}")
+
+            # ★★ 点击者真名尽力查：已有真名不查接口 / 查到就记住 / 11253 只提示一次
+            try:
+                async def _run_names():
+                    _a7 = T18.make_adapter()
+                    _p7 = T18.make_plugin(_a7)
+                    _client7 = _a7.get_client()
+                    _calls = []
+
+                    # ① 通讯录已有 ⇒ 不查接口
+                    _p7.identities.remember("qqo", "gm", "U-KNOWN", "周武")
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-KNOWN")
+                    _calls_after_known = len(_calls)
+
+                    # ② 通讯录没有 + 接口返回 username ⇒ 记住真名
+                    async def _fake_request(route, **kw):
+                        _calls.append(1)
+                        return {"member_openid": "U-NEW", "username": "香香", "member_role": "member"}
+
+                    _http7 = _a7.get_client().api._http
+                    _http7.request = _fake_request
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-NEW")
+                    _got = _p7.identities.remember("qqo", "gm", "U-NEW", None)
+
+                    # ③ 11253 ⇒ 标记不可用且不再重试
+                    async def _deny_request(route, **kw):
+                        _calls.append(1)
+                        raise RuntimeError("11253: 应用无接口访问权限（仅白名单机器人可用）")
+
+                    _http7.request = _deny_request
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-X")
+                    _n_mid = len(_calls)
+                    await _p7.learn_peer_names(_client7, is_group=True,
+                                               target_id="G-1", sender_id="U-Y")
+                    return _calls_after_known, _got, _p7._member_api_denied, _n_mid, len(_calls)
+
+                # 本套件自身在事件循环里 ⇒ 用独立线程跑（同全链路测试）
+                import threading as _th7
+
+                _box7, _err7 = [], []
+
+                def _thread7():
+                    _loop7 = asyncio.new_event_loop()
+                    try:
+                        _box7.append(_loop7.run_until_complete(_run_names()))
+                    except Exception as _e:
+                        _err7.append(_e)
+                    finally:
+                        _loop7.close()
+
+                _t7 = _th7.Thread(target=_thread7)
+                _t7.start()
+                _t7.join(25)
+                if _err7:
+                    raise _err7[0]
+                _r7 = _box7[0]
+                _c0, _got7, _denied7, _n_mid7, _n_end7 = _r7
+                check("★★ 已有真名时**不查**官方接口（省配额）", _c0 == 0, f"调用数={_c0}")
+                check("★★ 查到就写进通讯录（下次直接命中）", _got7 == "香香", repr(_got7))
+                check("★★ 11253 后标记不可用且**不再重试**",
+                      _denied7 is True and _n_end7 == _n_mid7, f"denied={_denied7} {_n_mid7}->{_n_end7}")
+            except Exception as _e7:
+                check("★★ 真名尽力查测试执行", False, f"{type(_e7).__name__}: {_e7}")
         except Exception as _e4:
             check("★★ 全链路测试执行", False, f"{type(_e4).__name__}: {_e4}")
 
