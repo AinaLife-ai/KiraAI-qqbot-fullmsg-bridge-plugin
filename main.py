@@ -3724,11 +3724,21 @@ class KeyboardTag(_BridgeTag):
     description = KEYBOARD_TAG_DESCRIPTION
 
     async def handle(self, value: str, **kwargs):
+        _stats: dict = {}
         try:
-            payload = validate_keyboard(value or "")
+            payload = validate_keyboard(value or "", stats=_stats)
         except Exception as exc:
             logger.warning("[QQBOT-BRIDGE] <keyboard> 内容不合法，已丢弃：%s", exc)
             return []
+        # ★ 2026-10-10：官方 style 只有 0/1/3/4；其它值可能被平台按 305007 拒或按默认渲染。
+        #   我们**不改**模型给的值（避免"插件改坏"），只提示一次。
+        if _stats.get("bad_style") and not getattr(self, "_kb_style_warned", False):
+            self._kb_style_warned = True
+            logger.warning(
+                "[QQBOT-BRIDGE] 本条键盘有 %d 个按钮的 render_data.style 不是官方值"
+                "（官方只有 0 灰线框 / 1 蓝线框 / 3 白底红字 / 4 蓝底白字）——"
+                "已原样发送；若客户端显示异常，检查模型给的样式值",
+                _stats["bad_style"])
         return [KeyboardMarker(payload)]
 
 

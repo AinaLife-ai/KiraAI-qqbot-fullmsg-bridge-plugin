@@ -74,6 +74,10 @@ def callback_to_command_enabled() -> bool:
 MAX_KEYBOARD_ROWS = 5
 MAX_BUTTONS_PER_ROW = 5
 MAX_BUTTON_DATA = 100
+#: 官方《消息按钮》里 render_data.style 的取值（其它值平台会报 305007 样式参数错误，
+#: 或按默认样式渲染 —— 型号/客户端表现不一）：0 灰线框 / 1 蓝线框 / 3 白底红字 / 4 蓝底白字。
+OFFICIAL_BUTTON_STYLES = (0, 1, 3, 4)
+
 #: markdown 正文建议上限（官方：单条建议 ≤ 4000 字符）
 MAX_MARKDOWN_CHARS = 4000
 
@@ -159,7 +163,7 @@ class KeyboardError(ValueError):
     pass
 
 
-def validate_keyboard(raw: str) -> dict:
+def validate_keyboard(raw: str, stats: Optional[dict] = None) -> dict:
     """把模型给的 JSON 校验成合法的 `keyboard` 载荷。
 
     官方两种形态：
@@ -219,7 +223,9 @@ def validate_keyboard(raw: str) -> dict:
                         f"按钮 {bid} 的 action.data 超过 {MAX_BUTTON_DATA} 字符"
                     )
     payload_out = {"content": {"rows": rows}}
-    apply_button_defaults(payload_out)          # ★ 指令按钮默认 enter:true
+    _st = apply_button_defaults(payload_out)    # ★ 指令按钮默认 enter:true
+    if isinstance(stats, dict):
+        stats.update(_st)
     return payload_out
 
 
@@ -232,7 +238,7 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
         互动事件推到机器人（长连接订阅了 INTERACTION 就行；若后台把"消息推送方式"
         设成 Webhook 而地址不可达，客户端点按钮会提示「请求第三方失败」）。
     """
-    stats = {"enter_added": 0, "callback": 0, "converted": 0}
+    stats = {"enter_added": 0, "callback": 0, "converted": 0, "bad_style": 0}
     try:
         rows = ((payload or {}).get("content") or {}).get("rows") or []
     except Exception:
@@ -244,6 +250,14 @@ def apply_button_defaults(payload: dict, auto_enter: bool = None) -> dict:
         for btn in (row.get("buttons") or []):
             if not isinstance(btn, dict):
                 continue
+            # 样式合法性（只统计、**不修改** —— 避免"我们改坏"的可能）
+            rd = btn.get("render_data")
+            if isinstance(rd, dict) and "style" in rd:
+                try:
+                    if int(rd.get("style")) not in OFFICIAL_BUTTON_STYLES:
+                        stats["bad_style"] += 1
+                except Exception:
+                    stats["bad_style"] += 1
             action = btn.get("action")
             if not isinstance(action, dict):
                 continue
