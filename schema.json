@@ -368,7 +368,7 @@
   "section_button": {
     "name": "按钮策略（限次/限人/截止/计数）",
     "type": "section",
-    "hint": "官方 click_limit 已弃用 ⇒ 次数限制只能在插件侧做。模型在 <keyboard> 上写属性即生效；这里的值是「模型没写时」的默认。",
+    "hint": "官方 click_limit 已弃用 ⇒ 次数限制只能在插件侧做。模型在 keyboard 标签上写属性即生效；这里的值是「模型没写时」的默认。限制默认按按钮各算各的（scope=each，可写 scope=all 改成整条键盘共用额度）。",
     "fields": {
       "button_policy_enabled": {
         "name": "启用按钮策略",

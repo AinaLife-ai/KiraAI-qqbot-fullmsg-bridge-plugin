@@ -41,6 +41,12 @@ QUOTE_REF: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
 #: 这一次发送的 markdown / keyboard（同样用 contextvar，逐条传递，互不串味）
 PENDING_MD: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "qqbot_bridge_pending_md", default=None)
+#: 这一条消息的**按钮策略声明**（从 `<keyboard>` 属性 / JSON 的 kirai 解析得到）。
+#  用 contextvar 传递而不是塞进键盘载荷 —— 载荷必须**只有官方字段**
+#  （任何路径（含第三方插件的"抢先发"）拿到的载荷都得是干净的）。
+PENDING_KB_SPEC: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
+    "qqbot_bridge_kb_spec", default=None)
+
 PENDING_KB: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
     "qqbot_bridge_pending_kb", default=None)
 
@@ -293,14 +299,17 @@ class ApiSendPatcher:
         #   同时做一次深度兜底清理：任何残留的 kirai 键都不许进入出站报文。
         _policy_key = None
         if isinstance(keyboard, dict):
-            _spec = keyboard.pop("__kirai__", None)
-            if not _spec:
-                _spec = keyboard.pop("kirai", None)
+            _spec = PENDING_KB_SPEC.get()
+            if not isinstance(_spec, dict):
+                # 兼容：万一载荷里被塞了私有键（旧路径/第三方），也取出来用
+                _spec = keyboard.pop("__kirai__", None) or keyboard.pop("kirai", None)
             if isinstance(_spec, dict) and _spec:
                 try:
                     _target = kwargs.get("group_openid") if is_group else kwargs.get("openid")
+                    _adapter_name = str(getattr(getattr(adapter, "info", None), "name", "") or "")
                     _policy_key = self.plugin.register_button_policy(
-                        str(_target or ""), _spec, keyboard)
+                        str(_target or ""), _spec, keyboard,
+                        is_group=is_group, adapter=_adapter_name)
                 except Exception as exc:                     # noqa: BLE001
                     self.logger.debug("[QQBOT-BRIDGE] 登记按钮策略失败（忽略）: %s", exc)
             try:

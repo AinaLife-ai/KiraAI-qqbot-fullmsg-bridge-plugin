@@ -124,6 +124,7 @@ from rich_content import (
 from interactions import InteractionBridge
 from api_send import (
     PENDING_KB,
+    PENDING_KB_SPEC,
     PENDING_MD,
     QUOTE_REF,
     ApiSendPatcher,
@@ -267,6 +268,18 @@ def _remember_import_fingerprint() -> None:
     global _IMPORT_FINGERPRINT, _IMPORTED_AT
     _IMPORT_FINGERPRINT = _module_fingerprint()
     _IMPORTED_AT = time.time()
+
+
+def _kb_spec_of(chain) -> Optional[dict]:
+    """从消息链里找出键盘元素的**策略声明**（没有就 None）。"""
+    try:
+        for ele in (chain or []):
+            spec = getattr(ele, "kirai_spec", None)
+            if isinstance(spec, dict) and spec:
+                return spec
+    except Exception:
+        pass
+    return None
 
 
 def _identity_src_ok(src: str):
@@ -1102,7 +1115,8 @@ class QQOfficialGroupBridge(BasePlugin):
         """策略账本按**原始会话 id**（群/用户 openid）索引 —— 发送端与点击端一致。"""
         return str(target_id or "")
 
-    def register_button_policy(self, target_id: str, spec: dict, payload: dict):
+    def register_button_policy(self, target_id: str, spec: dict, payload: dict,
+                               *, is_group: bool = True, adapter: str = ""):
         """发送前登记策略；返回策略 key（没声明则 None）。零 I/O。"""
         if not self.button_policy_enabled or not spec:
             return None
@@ -1116,6 +1130,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._policy_sid(target_id), spec,
                 button_ids=[b for b in btn_ids if b],
                 token=self.button_policy_token,
+                is_group=bool(is_group), adapter=str(adapter or ""),
             )
             if pol is None:
                 return None
@@ -1170,7 +1185,7 @@ class QQOfficialGroupBridge(BasePlugin):
             out["data"] = clean
             if pol is None:
                 return out
-            verdict = self.button_policies.decide(pol, uid)
+            verdict = self.button_policies.decide(pol, uid, button_id=str(button_id or ""))
             out["policy"], out["verdict"] = pol, verdict
             _names: dict = {}
             try:
@@ -1182,12 +1197,20 @@ class QQOfficialGroupBridge(BasePlugin):
                 _names = {}
             out["note"] = button_policy.render_note(pol, verdict, names=_names)
             mode = self.button_policies._effective_deliver(pol)
+            hard = bool(pol.get("hard"))
+            accepted = bool(verdict.get("accepted"))
+            # ★★ 审计修正（真 bug）：**软模式**（hard=False）下，被拒绝的点击
+            #   （超额/过期/重复/连点）原本也被 `accepted` 判成"不转" ⇒ 软判定形同虚设。
+            #   正确语义：
+            #     * off            ⇒ 都不转；
+            #     * last           ⇒ 转"截止那一次"；软模式下被拒的也转（让模型自己接话）；
+            #     * all（默认）    ⇒ 硬模式：转"被接受的"；软模式：**全转**（带判定注记）。
             if mode == "off":
                 out["deliver"] = False
             elif mode == "last":
-                out["deliver"] = bool(verdict.get("closing"))
+                out["deliver"] = bool(verdict.get("closing")) or (not hard and not accepted)
             else:
-                out["deliver"] = bool(verdict.get("accepted"))
+                out["deliver"] = True if not hard else accepted
             if verdict.get("accepted") and not out["deliver"] and mode == "last":
                 logger.debug("[QQBOT-BRIDGE] 按钮 %s 第 %s 次点击按「静默」策略未打扰模型",
                              button_id or "-", verdict.get("total"))
@@ -1198,7 +1221,11 @@ class QQOfficialGroupBridge(BasePlugin):
             return out
 
     def policy_close_notices(self) -> list:
-        """巡检：把"到点截止"的策略整理成给模型的一条通知（没人点过的静默）。"""
+        """巡检：把"到点截止"的策略整理成给模型的一条通知（没人点过的静默）。
+
+        ★ 通知必须回到**这条按钮所在的那个会话**（群/单聊）与**适配器**，
+          不能张冠李戴（审计修正：原来固定 is_group=True、且用第一个适配器）。
+        """
         if not self.button_policy_enabled:
             return []
         out = []
@@ -1215,7 +1242,9 @@ class QQOfficialGroupBridge(BasePlugin):
                        f"、{len(pol.get('users') or {})} 人参与"
                        + ("（" + "、".join(names[:8]) + ("…" if len(names) > 8 else "") + "）"
                           if names else ""))
-                out.append({"sid": pol.get("sid"), "text": txt, "policy": pol})
+                out.append({"sid": pol.get("sid"), "text": txt, "policy": pol,
+                            "is_group": bool(pol.get("is_group", True)),
+                            "adapter": str(pol.get("adapter") or "")})
         except Exception as exc:                     # noqa: BLE001
             logger.debug("[QQBOT-BRIDGE] 截止通知整理失败（忽略）: %s", exc)
         return out
@@ -1287,16 +1316,31 @@ class QQOfficialGroupBridge(BasePlugin):
         """到点截止 ⇒ 给模型一条「已截止」通知（只发一次；没人点过不发）。"""
         for item in self.policy_close_notices():
             try:
+                if not item.get("sid"):
+                    continue
+                ok = False
                 for name, adapter in self._find_adapters():
+                    # 有记录的适配器名时**优先用它**（多适配器不会投错）
+                    want = str(item.get("adapter") or "")
                     try:
-                        self.publish_synthetic_event(
-                            target_id=str(item["sid"]), sender_id="system",
-                            is_group=True, text=str(item["text"]),
-                        )
-                        logger.info("[QQBOT-BRIDGE] 已发出按钮截止通知：%s", str(item["text"])[:80])
-                        break
+                        aname = str(getattr(getattr(adapter, "info", None), "name", "") or name)
                     except Exception:
+                        aname = str(name)
+                    if want and want not in (aname, str(name)):
                         continue
+                    ok = self.publish_synthetic_event(
+                        target_id=str(item["sid"]), sender_id="system",
+                        is_group=bool(item.get("is_group", True)),
+                        text=str(item["text"]),
+                    ) or ok
+                    if ok:
+                        break
+                if ok:
+                    logger.info("[QQBOT-BRIDGE] 已发出按钮截止通知：%s", str(item["text"])[:80])
+                elif not getattr(self, "_policy_notice_warned", False):
+                    self._policy_notice_warned = True
+                    logger.debug("[QQBOT-BRIDGE] 截止通知未发出去（适配器未匹配/未就绪），"
+                                 "账本已标记，不重复尝试")
             except Exception as exc:                 # noqa: BLE001
                 logger.debug("[QQBOT-BRIDGE] 截止通知发送失败（忽略）: %s", exc)
 
@@ -2442,6 +2486,7 @@ class QQOfficialGroupBridge(BasePlugin):
 
                 md_token = PENDING_MD.set(md_text)
                 kb_token = PENDING_KB.set(kb)
+                _spec_token = PENDING_KB_SPEC.set(_kb_spec_of(chain))
                 ref_token = QUOTE_REF.set(ref)
                 # ★ 核心的 media_elements 白名单只有 (File, Image)，漏掉
                 #   Record / Video ⇒ 语音/视频进不了发送链。这里临时换壳成 File
@@ -2455,6 +2500,7 @@ class QQOfficialGroupBridge(BasePlugin):
                     try:
                         PENDING_MD.reset(md_token)
                         PENDING_KB.reset(kb_token)
+                        PENDING_KB_SPEC.reset(_spec_token)
                         QUOTE_REF.reset(ref_token)
                     except Exception:
                         pass
@@ -3996,6 +4042,9 @@ class QQOfficialGroupBridge(BasePlugin):
 
             md_token = PENDING_MD.set(md_text)
             kb_token = PENDING_KB.set(kb)
+            # ★ 按钮策略声明（来自 <keyboard> 属性 / JSON kirai）：挂在元素上，
+            #   这里转成 contextvar 传给 api_send（**不进载荷**）。
+            _spec_token = PENDING_KB_SPEC.set(_kb_spec_of(send_message_obj))
             ref_token = QUOTE_REF.set(ref)
             try:
                 # ★★★ 2026-10-10：**富媒体 + 键盘 ⇒ 自动拆成两条发送**
@@ -4047,6 +4096,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 result = await original(target_id, send_message_obj, is_group)
             finally:
                 QUOTE_REF.reset(ref_token)
+                PENDING_KB_SPEC.reset(_spec_token)   # 审计修复：这条路径原来漏了重置
                 PENDING_KB.reset(kb_token)
                 PENDING_MD.reset(md_token)
             if result is not None and bool(getattr(result, "ok", True)):
@@ -4450,13 +4500,16 @@ class KeyboardTag(_BridgeTag):
         except Exception as exc:
             logger.warning("[QQBOT-BRIDGE] <keyboard> 内容不合法，已丢弃：%s", exc)
             return []
+        # ★ 策略**不进载荷**（载荷必须只有官方字段，任何路径拿到的都得干净）：
+        #   挂在 KeyboardMarker 元素上，由发送侧通过 contextvar 取用。
+        _marker = KeyboardMarker(payload)
         if _spec:
             try:
                 _btn_ids = [str(b.get("id") or "")
                             for r in ((payload.get("content") or {}).get("rows") or [])
                             for b in (r.get("buttons") or []) if isinstance(r, dict)]
                 _spec["button_ids"] = [b for b in _btn_ids if b]
-                payload["__kirai__"] = _spec
+                _marker.kirai_spec = _spec
             except Exception:
                 pass
         # ★ 2026-10-10：官方 style 只有 0/1/3/4；其它值可能被平台按 305007 拒或按默认渲染。
@@ -4468,7 +4521,7 @@ class KeyboardTag(_BridgeTag):
                 "（官方只有 0 灰线框 / 1 蓝线框 / 3 白底红字 / 4 蓝底白字）——"
                 "已原样发送；若客户端显示异常，检查模型给的样式值",
                 _stats["bad_style"])
-        return [KeyboardMarker(payload)]
+        return [_marker]
 
 
 # --------------------------------------------------------------------------- #

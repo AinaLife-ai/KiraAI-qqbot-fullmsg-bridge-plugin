@@ -26,6 +26,8 @@
    * `notify`    截止时给**用户**发一条机械文案（默认关；机械文案一向不推荐）
    * `notify_text` 自定义文案
    * `label`     给模型看的按钮名（查账/汇总用）
+   * `scope`     `each`（默认：**每个按钮各算各的**，一排按钮互不吃名额）/
+                 `all`（整条键盘共用一个额度）
 
 2. **JSON 内 `kirai` 对象**（精细，可逐按钮不同策略）::
 
@@ -139,6 +141,7 @@ def spec_from_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
     ttl = _as_int(a.get("ttl"), 0) or 0
     until_raw = a.get("until")
     deliver = str(a.get("deliver") or "").strip().lower()
+    scope = str(a.get("scope") or "").strip().lower()
     hard = a.get("hard")
     notify = a.get("notify")
     notify_text = a.get("notify_text") or a.get("notifyText") or ""
@@ -158,6 +161,8 @@ def spec_from_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
         spec["until_raw"] = until_raw
     if deliver in ("last", "all", "off"):
         spec["deliver"] = deliver
+    if scope in ("each", "all"):
+        spec["scope"] = scope
     if hard is not None:
         spec["hard"] = _as_bool(hard, True)
     if notify is not None:
@@ -238,7 +243,8 @@ class ButtonPolicyStore:
     # ------------------------------------------------------------------ #
     def register(self, sid: str, spec: Optional[Dict[str, Any]], *,
                  now: Optional[float] = None, token: bool = False,
-                 button_ids: Optional[List[str]] = None) -> Optional[dict]:
+                 button_ids: Optional[List[str]] = None,
+                 is_group: bool = True, adapter: str = "") -> Optional[dict]:
         """为一条**即将发出的**消息登记策略。没声明就返回 None（零开销路径）。"""
         if not spec:
             return None
@@ -280,6 +286,14 @@ class ButtonPolicyStore:
             "notify": _as_bool(merged.get("notify"), False),
             "notify_text": str(merged.get("notify_text") or "")[:120],
             "label": str(merged.get("label") or "")[:40],
+            #: 限制的作用域：`each`（默认）= **每个按钮各算各的**（一排按钮互不吃名额）；
+            #  `all` = 整条键盘共用一个额度。
+            "scope": str(merged.get("scope") or "each").lower(),
+            #: 会话类型与适配器（截止通知要发回**同一个**会话/适配器）
+            "is_group": bool(is_group),
+            "adapter": str(adapter or ""),
+            #: 逐按钮计数（scope=each 时用这一层判限）
+            "btn": {},
             "buttons": merged.get("buttons") or {},
             #: 本条消息里**所有**按钮 id（兜底匹配用；含没写逐按钮策略的）
             "button_ids": [str(b) for b in (button_ids or []) if str(b)],
@@ -353,8 +367,27 @@ class ButtonPolicyStore:
     # ------------------------------------------------------------------ #
     # 判定（核心，O(1)）
     # ------------------------------------------------------------------ #
-    def decide(self, pol: dict, uid: str, *, now: Optional[float] = None) -> Dict[str, Any]:
-        """判定一次点击并**就地计数**。返回判定结果（不抛异常）。"""
+    @staticmethod
+    def _bucket(pol: dict, button_id: str) -> dict:
+        """拿到"这次点击该算在哪一层"的计数桶。
+
+        * `scope=all`（或没给按钮 id）⇒ 直接用整条策略的计数；
+        * `scope=each`（默认）⇒ 每个按钮一个桶（**互不吃名额**）。
+        """
+        bid = str(button_id or "")
+        if not bid or str(pol.get("scope") or "each") == "all":
+            return pol
+        btn = pol.setdefault("btn", {})
+        return btn.setdefault(bid, {"total": 0, "users": {}, "closed": False,
+                                    "closed_reason": "", "closed_at": 0.0})
+
+    def decide(self, pol: dict, uid: str, *, now: Optional[float] = None,
+               button_id: str = "") -> Dict[str, Any]:
+        """判定一次点击并**就地计数**。返回判定结果（不抛异常）。
+
+        ★ 限制默认按**按钮**各算各的（`scope=each`）：一排里"取消"被点的次数
+          不会吃掉"报名"的名额。
+        """
         now = now if now is not None else time.time()
         uid = str(uid or "")
         verdict: Dict[str, Any] = {
@@ -364,41 +397,54 @@ class ButtonPolicyStore:
             "remaining": None, "user_count": 0, "closed": bool(pol.get("closed")),
             "deliver": self._effective_deliver(pol),
         }
+        bucket = self._bucket(pol, button_id)
+        verdict["scope"] = str(pol.get("scope") or "each")
+        verdict["button_id"] = str(button_id or "")
         if pol.get("closed"):
             verdict["reason"] = pol.get("closed_reason") or "closed"
-            self._fill_counts(pol, uid, verdict)
+            self._fill_counts(pol, uid, verdict, bucket)
             return verdict
         until = float(pol.get("until") or 0)
         if until and now > until:
             self._close(pol, "expired", now)
             verdict["reason"] = "expired"
             verdict["closed"] = True
-            self._fill_counts(pol, uid, verdict)
+            self._fill_counts(pol, uid, verdict, bucket)
+            return verdict
+        if bucket is not pol and bucket.get("closed"):
+            verdict["reason"] = bucket.get("closed_reason") or "full"
+            verdict["closed"] = True
+            self._fill_counts(pol, uid, verdict, bucket)
             return verdict
 
-        users = pol.setdefault("users", {})
+        users = bucket.setdefault("users", {})
         rec = users.get(uid)
         cd = int(pol.get("cooldown") or 0)
         if cd and rec and (now - float(rec[2])) < cd:
             verdict["reason"] = "cooldown"
-            self._fill_counts(pol, uid, verdict)
+            self._fill_counts(pol, uid, verdict, bucket)
             return verdict
         mx = int(pol.get("max") or 0)
-        if mx and int(pol.get("total") or 0) >= mx:
+        if mx and int(bucket.get("total") or 0) >= mx:
             verdict["reason"] = "full"
-            self._close(pol, "full", now)
+            if bucket is pol:
+                self._close(pol, "full", now)
+            else:
+                bucket["closed"] = True
+                bucket["closed_reason"] = "full"
+                bucket["closed_at"] = now
             verdict["closed"] = True
-            self._fill_counts(pol, uid, verdict)
+            self._fill_counts(pol, uid, verdict, bucket)
             return verdict
         if rec:
             if pol.get("once"):
                 verdict["reason"] = "repeat"
-                self._fill_counts(pol, uid, verdict)
+                self._fill_counts(pol, uid, verdict, bucket)
                 return verdict
             per = int(pol.get("per") or 0)
             if per and int(rec[0]) >= per:
                 verdict["reason"] = "over_user"
-                self._fill_counts(pol, uid, verdict)
+                self._fill_counts(pol, uid, verdict, bucket)
                 return verdict
 
         # ---- 接受 ---- #
@@ -412,16 +458,36 @@ class ButtonPolicyStore:
                     users.pop(next(iter(users)))
                 except Exception:
                     pass
-        pol["total"] = int(pol.get("total") or 0) + 1
+        bucket["total"] = int(bucket.get("total") or 0) + 1
+        if bucket is not pol:
+            # 汇总层（查账用）：总量与名单
+            agg_users = pol.setdefault("users", {})
+            arec = agg_users.get(uid)
+            if arec:
+                arec[0] += 1
+                arec[2] = now
+            else:
+                agg_users[uid] = [1, now, now]
+                if len(agg_users) > MAX_USERS_PER_POLICY:
+                    try:
+                        agg_users.pop(next(iter(agg_users)))
+                    except Exception:
+                        pass
+            pol["total"] = int(pol.get("total") or 0) + 1
         self._dirty = True
         self._pol.move_to_end(pol["key"])
-        if mx and int(pol["total"]) >= mx:
-            self._close(pol, "full", now)
+        if mx and int(bucket.get("total") or 0) >= mx:
+            if bucket is pol:
+                self._close(pol, "full", now)
+            else:
+                bucket["closed"] = True
+                bucket["closed_reason"] = "full"
+                bucket["closed_at"] = now
             verdict["closing"] = True
             verdict["closed"] = True
         verdict["accepted"] = True
         verdict["reason"] = "ok"
-        self._fill_counts(pol, uid, verdict)
+        self._fill_counts(pol, uid, verdict, bucket)
         return verdict
 
     def _effective_deliver(self, pol: dict) -> str:
@@ -438,14 +504,17 @@ class ButtonPolicyStore:
         return mode
 
     @staticmethod
-    def _fill_counts(pol: dict, uid: str, verdict: Dict[str, Any]) -> None:
-        total = int(pol.get("total") or 0)
+    def _fill_counts(pol: dict, uid: str, verdict: Dict[str, Any],
+                     bucket: Optional[dict] = None) -> None:
+        b = bucket if isinstance(bucket, dict) else pol
+        total = int(b.get("total") or 0)
         mx = int(pol.get("max") or 0)
-        rec = (pol.get("users") or {}).get(str(uid))
+        rec = (b.get("users") or {}).get(str(uid))
         verdict["total"] = total
+        verdict["total_all"] = int(pol.get("total") or 0)
         verdict["remaining"] = max(0, mx - total) if mx else None
         verdict["user_count"] = int(rec[0]) if rec else 0
-        verdict["closed"] = bool(pol.get("closed"))
+        verdict["closed"] = bool(pol.get("closed")) or bool(b.get("closed"))
 
     def _close(self, pol: dict, reason: str, now: float) -> None:
         if pol.get("closed"):
@@ -550,7 +619,14 @@ class ButtonPolicyStore:
                          "count": int(rec[0]), "first": float(rec[1]), "last": float(rec[2])})
         rows.sort(key=lambda r: (-r["count"], r["first"]))
         mx = int(pol.get("max") or 0)
+        btn_bits = []
+        for bid, b in (pol.get("btn") or {}).items():
+            btn_bits.append({"button": bid, "total": int(b.get("total") or 0),
+                             "people": len(b.get("users") or {}),
+                             "closed": bool(b.get("closed"))})
         return {
+            "scope": str(pol.get("scope") or "each"),
+            "buttons": btn_bits,
             "key": pol.get("key"), "sid": pol.get("sid"), "label": pol.get("label") or "",
             "total": int(pol.get("total") or 0),
             "remaining": max(0, mx - int(pol.get("total") or 0)) if mx else None,
@@ -612,6 +688,18 @@ class ButtonPolicyStore:
                 self._by_token[str(tok)] = pol["key"]
 
     def _trim(self) -> None:
+        """超上限时**优先清掉已截止/已过期**的旧账，尽量别动正在进行的按钮。"""
+        if len(self._pol) <= self.max_entries:
+            return
+        now = time.time()
+        for key, pol in list(self._pol.items()):
+            if len(self._pol) <= self.max_entries:
+                break
+            until = float(pol.get("until") or 0)
+            dead = bool(pol.get("closed")) or (until and now > until)
+            if dead:
+                self._pol.pop(key, None)
+                self._dirty = True
         while len(self._pol) > self.max_entries:
             key, _ = next(iter(self._pol.items()))
             self._pol.pop(key, None)
@@ -681,6 +769,11 @@ class ButtonPolicyStore:
             pol.setdefault("closed", False)
             pol.setdefault("closed_reason", "")
             pol.setdefault("deliver", "all")
+            #: 老数据（v1.6.32）用的是"整条键盘一个额度" ⇒ 保持 all，计数才不串
+            pol.setdefault("scope", "all")
+            pol.setdefault("btn", {})
+            pol.setdefault("is_group", True)
+            pol.setdefault("adapter", "")
             pol.setdefault("hard", True)
             pol.setdefault("notify", False)
             pol.setdefault("notify_text", "")
@@ -835,6 +928,11 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
     else:
         bits.append("状态：进行中")
     lines = [head + "｜" + "｜".join(bits)]
+    _btns = st.get("buttons") or []
+    if len(_btns) > 1:
+        lines.append("各按钮：" + "；".join(
+            f"{b.get('button')} 已点 {b.get('total')} 次/{b.get('people')} 人"
+            + ("（已满）" if b.get("closed") else "") for b in _btns[:12]))
     users = st.get("users") or []
     if users:
         lines.append(f"参与 {st.get('people', len(users))} 人（按次数排序，最多列 20）：")

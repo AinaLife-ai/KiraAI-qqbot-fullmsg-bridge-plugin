@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.33
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.34
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -496,6 +496,7 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 | deliver | `last`（默认，见下）/ `all`（每次有效点击都告诉模型）/ `off`（都不告诉）|
 | hard | `1` 硬拦截（默认，取配置）；`0` 软判定（仍转给模型，正文标注判定）|
 | `notify` / `notify_text` | 截止时给**用户**发一句提示（默认不发；机械文案一向不推荐）|
+| scope | each（默认：**每个按钮各算各的**，一排里「取消」不吃「报名」的名额）/ all（整条键盘共用额度）|
 
 **逐按钮精细策略**写在按钮的 `kirai` 字段里（同一排按钮可以有不同规则）：
 
@@ -602,6 +603,17 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.34</b> — 完整审计后的修复：软模式真 bug / 逐按钮限额 / 通知回对会话 / 载荷零污染</summary>
+
+1. **软模式（hard=0）形同虚设**（真 bug）⇒ 改为：硬模式只转被接受的；软模式**全转**（带判定注记）；off 仍不转；
+2. **逐按钮限额**（`scope=each` 默认）：一排按钮互不吃名额；`scope=all` 可整条共用；查账给逐按钮明细；
+3. **截止通知回到正确会话**（真 bug）：记录 `is_group` 与适配器名，私聊不再按群发；
+4. **策略不污染载荷**：声明挂在元素属性 + contextvar 传递 ⇒ payload 零私有键（新增深扫守卫）；
+5. **账本裁剪**：先清已截止/过期的旧账，不动进行中的。
+
+</details>
+
+<details>
 <summary><b>v1.6.33</b> — 更正默认告知方式：<b>deliver=all</b>（原来正常的方式）；硬模式只管「超过上限/过期」</summary>
 
 * 用户澄清：要的不是「中途点击不打扰」，而是**默认照旧每次点击都转达**；

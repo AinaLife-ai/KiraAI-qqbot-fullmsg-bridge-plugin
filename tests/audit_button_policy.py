@@ -287,6 +287,47 @@ check("统计字段齐全（查账工具依赖）",
       all(k in st18.stats(pG, limit=3) for k in
           ("total", "remaining", "users", "closed", "until", "label", "people")), "")
 
+print("\n[L] 逐按钮限额（scope）与裁剪策略 —— 审计修复")
+stL = BP.ButtonPolicyStore()
+pL = stL.register("SL", {"max": 1, "label": "报名行"})          # 默认 scope=each
+_v_b1 = stL.decide(pL, "U1", button_id="b1")
+_v_b2 = stL.decide(pL, "U2", button_id="b2")
+_v_b1b = stL.decide(pL, "U3", button_id="b1")
+check("★★ each（默认）：一排按钮**互不吃名额**（b2 不受 b1 用满影响）",
+      _v_b1["accepted"] and _v_b2["accepted"], f"{_v_b1['accepted']}/{_v_b2['accepted']}")
+check("★★ each：各自到上限后只拒自己那个按钮",
+      _v_b1b["reason"] == "full" and _v_b1b["accepted"] is False, str(_v_b1b["reason"]))
+check("each：汇总层仍记总数（查账用）", int(pL["total"]) == 2 and len(pL["users"]) == 2,
+      f"total={pL['total']} people={len(pL['users'])}")
+_st_L = stL.stats(pL, limit=3)
+_txt_L = BP.render_stats_text(_st_L, name_of=lambda u: None)
+check("★★ 查账文本里也能看到逐按钮明细（模型看的就是这段文本）",
+      "各按钮" in _txt_L and "b1" in _txt_L, _txt_L[:150])
+check("查账：多按钮时给出逐按钮明细",
+      bool(_st_L.get("buttons")) and {b["button"] for b in _st_L["buttons"]} == {"b1", "b2"},
+      str(_st_L.get("buttons")))
+
+stL2 = BP.ButtonPolicyStore()
+pAll = stL2.register("SL", {"max": 2, "scope": "all", "label": "整条共用"})
+_r1 = stL2.decide(pAll, "U1", button_id="b1")
+_r2 = stL2.decide(pAll, "U2", button_id="b2")
+_r3 = stL2.decide(pAll, "U3", button_id="b3")
+check("all（显式）：整条键盘共用额度 ⇒ 第 3 个按钮被拒",
+      _r1["accepted"] and _r2["accepted"] and _r3["reason"] == "full", str(_r3["reason"]))
+
+stT = BP.ButtonPolicyStore(max_entries=2)
+_p_old = stT.register("S1", {"max": 5})
+stT.close(_p_old["key"], "manual")
+_p_live1 = stT.register("S2", {"max": 5})
+_p_live2 = stT.register("S3", {"max": 5})
+stT.register("S4", {"max": 5})
+check("★ 裁剪：**先清已截止的旧账**（S1 被清），再从最早的裁到上限内",
+      _p_old["key"] not in stT._pol and len(stT._pol) == 2
+      and _p_live2["key"] in stT._pol,
+      f"还剩 {sorted(stT._pol)}")
+check("★ 裁剪：只裁够数就停（不会把进行中的全清掉）",
+      int(stT._pol.get(_p_live2["key"], {}).get("total") or 0) == 0, "")
+
 print("\n[K] 正文注记（省 token 的短文本）")
 st19 = BP.ButtonPolicyStore()
 pK = st19.register("S", {"max": 2, "label": "报名"})

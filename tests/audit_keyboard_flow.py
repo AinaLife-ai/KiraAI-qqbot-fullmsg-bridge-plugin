@@ -625,14 +625,18 @@ try:
     finally:
         _loop_g.close()
     _pl = getattr(_els[0], "keyboard", {}) if _els else {}
-    _spec_g = _pl.get("__kirai__") or {}
+    _spec_g = getattr(_els[0], "kirai_spec", {}) if _els else {}
     check("★★ 标签属性 + JSON kirai 都被采集到声明里",
           _spec_g.get("max") == 2 and _spec_g.get("once") is True
           and _spec_g.get("label") == "报名" and _spec_g.get("ttl") == 300
           and (_spec_g.get("buttons") or {}).get("b1", {}).get("per") == 1, str(_spec_g)[:160])
-    check("★★ 声明**不在**可见载荷里（只有私有 __kirai__ 携带）",
-          "kirai" not in _json.dumps({k: v for k, v in _pl.items() if k != "__kirai__"},
-                                     ensure_ascii=False), "")
+    # ★ 审计加强：策略**根本不在载荷里**（挂在元素属性上）⇒ 载荷绝对干净，
+    #   任何路径（含第三方插件"抢先发"）拿到的都只有官方字段。
+    _pk_g = set()
+    _deep_d(_pl, _pk_g)
+    check("★★★ 载荷**零污染**：键盘 payload 里连一个私有键都没有",
+          not (_pk_g - _OFF_G) and "__kirai__" not in _json.dumps(_pl, ensure_ascii=False),
+          str(sorted(_pk_g - _OFF_G)))
 
     # ---- G2. 真实发送：出站 keyboard **只含官方字段** + 策略已登记 ----
     async def _real_policy_send():
@@ -651,7 +655,7 @@ try:
         await p._tick()
         await a.send_group_message("GP", _C3([
             _T3("来报名"),
-            _bm.KeyboardMarker(_pl),          # 带着私有声明的载荷
+            _els[0],                          # ← 标签产出的元素（策略挂在它的属性上）
         ]))
         return p, [kw for _kind, kw in a.client.api.calls]
 
@@ -715,6 +719,70 @@ try:
     check("★★ 截止那次带汇总（谁点的 + 计数 + 已截止）",
           "最后一个名额" in _txt_g or "已截止" in _txt_g, _txt_g[:160])
     check("★ 回执仍照发（官方 3 秒硬要求不受策略影响）", _acks3 == 3, str(_acks3))
+
+    # ---- G3b. 软模式（hard=0）必须把"被拒绝的点击"也转给模型 ----
+    async def _soft():
+        from interactions import InteractionBridge as _IB4
+
+        async def _ack4(_i, _c):
+            return None
+
+        a = T3.make_adapter()
+        a.client.api._http = T3.FakeHTTP({"/files": {"file_info": "FI"}})
+        try:
+            from core.adapter.capabilities import IMCapability
+
+            a.get_capability(IMCapability)._group_reply_ids["GS"] = "MSG-IN"
+        except Exception:
+            pass
+        p = T3.make_plugin(a)
+        await p._tick()
+        client = a.get_client()
+        try:
+            client.api.on_interaction_result = _ack4
+        except Exception:
+            pass
+        kb, spec = _bm.button_policy.split_keyboard_declaration(
+            {"content": {"rows": [{"buttons": [
+                {"id": "q1", "render_data": {"label": "抢"},
+                 "action": {"type": 1, "data": "go"}}]}]}},
+            {"max": "1", "hard": "0", "deliver": "all", "label": "软测"})
+        m = _bm.KeyboardMarker(kb)
+        m.kirai_spec = spec
+        await a.send_group_message("GS", _C3([_T3("来"), m]))
+        caps = []
+        p.publish_synthetic_event = lambda **kw: caps.append(kw) or True
+        br = _IB4(p, __import__("logging").getLogger("plugin"))
+        body = lambda uid: {"id": f"IT-{uid}", "type": 11,
+                            "data": {"resolved": {"button_id": "q1", "button_data": "go"}},
+                            "group_openid": "GS", "group_member_openid": uid}
+        await br._on_interaction(client, body("S1"))     # 名额 1 用掉
+        await br._on_interaction(client, body("S2"))     # 超额
+        await br._on_interaction(client, body("S3"))     # 超额
+        return caps
+
+    _caps_soft = asyncio.run(_soft())
+    _n_soft = len(_caps_soft)
+    check("★★★ 软模式（hard=0）：超额点击**仍然转给模型**并带判定注记",
+          _n_soft == 3 and "名额已满" in str((_caps_soft[-1] if _caps_soft else {}).get("text")),
+          f"转达 {_n_soft} 次；末条={str((_caps_soft[-1] if _caps_soft else {}).get('text'))[:90]}")
+
+    # ---- G3c. 截止通知必须回**正确会话类型**（审计修正：原来固定 group） ----
+    try:
+        import time as _t6
+
+        _pol_dm = _p3.button_policies.register("DM-USER", {"ttl": 1, "label": "私聊限时"},
+                                               is_group=False, adapter="qqo")
+        _p3.button_policies.decide(_pol_dm, "U9")
+        check("截止通知：没到点不发", _p3.policy_close_notices() == [], "")
+        _pol_dm["until"] = _t6.time() - 1
+        _pol_dm["notified"] = False
+        _nt = _p3.policy_close_notices()
+        check("★★ 截止通知带正确会话类型（私聊 ⇒ is_group=False）且带适配器名",
+              len(_nt) == 1 and _nt[0]["is_group"] is False and _nt[0]["adapter"] == "qqo",
+              str(_nt[:1])[:170])
+    except Exception as _e6b:
+        check("截止通知用例", False, f"{type(_e6b).__name__}: {_e6b}")
 
     # ---- G4. 查账工具：能量到这本账 ----
     try:
