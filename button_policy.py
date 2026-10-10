@@ -634,7 +634,8 @@ class ButtonPolicyStore:
 
     def find(self, sid: str, button_id: str = "", message_id: str = "",
              label: str = "", *, now: Optional[float] = None,
-             scope: str = "session", sid_prefix: str = "") -> Tuple[Optional[dict], List[dict]]:
+             scope: str = "session", sid_prefix: str = "",
+             ref: str = "") -> Tuple[Optional[dict], List[dict]]:
         """按"会话 + 按钮/消息/名字"定位**对应那一本账**。
 
         返回 ``(命中, 候选列表)``：唯一命中就给策略；否则给候选让模型自己挑。
@@ -650,6 +651,14 @@ class ButtonPolicyStore:
             if key and key in self._pol:
                 return self._pol[key], []
         cands = self.list_for(sid, now=now)
+        _ref = str(ref or "").strip().lstrip("#")
+        if _ref:
+            # 按**账本编号**（查账里显示的 #N）精确定位到那一条
+            _all = self.list_for("", now=now, all_sessions=True)
+            _hit = [p for p in _all
+                    if str(p.get("key") or "").rsplit("|", 1)[-1] == _ref]
+            if _hit:
+                return _hit[0], []
         _pfx = str(sid_prefix or "").strip()
         if _pfx:
             # 明确按会话 openid 点名（防重名/跨会话）⇒ 在所有会话里按前缀精确挑
@@ -731,6 +740,8 @@ class ButtonPolicyStore:
             "scope": str(pol.get("scope") or "each"),
             "buttons": btn_bits,
             "key": pol.get("key"), "sid": pol.get("sid"), "label": pol.get("label") or "",
+            "seq": (str(pol.get("key") or "").rsplit("|", 1)[-1]
+                    if "|" in str(pol.get("key") or "") else ""),
             "session": pol.get("session") or "",
             "total": int(pol.get("total") or 0),
             "remaining": max(0, mx - int(pol.get("total") or 0)) if mx else None,
@@ -1020,23 +1031,23 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
     #: 会话名优先用**读时解析**的结果（群名后补也能显示出来 ⇒ 可回填）
     _sess = str(session_name or st.get("session") or "").strip()
     _sid_short = str(st.get("sid") or "")[:8]
-    if _sess and _sid_short and _sess.startswith(_sid_short):
-        _sess = ""                      # 标签本身就是 id 前缀 ⇒ 别重复显示
-    if _sess and _sid_short:
-        _prefix = f"[{_sess} · {_sid_short}] "
-    elif _sid_short:
-        _prefix = f"[{_sid_short}] "
+    # ★ 用户要求：群 openid **完整显示**（短码反而让模型混淆）
+    _sid_full_txt = str(st.get("sid") or "")
+    if _sess and _sid_full_txt and (
+            _sess == _sid_short
+            or _sid_full_txt.startswith(_sess.rstrip("…").strip())):
+        _sess = ""                      # 标签本身就是这个 id 的截断 ⇒ 别重复显示
+    if _sess and _sid_full_txt:
+        _prefix = f"[{_sess} · {_sid_full_txt}] "
+    elif _sid_full_txt:
+        _prefix = f"[{_sid_full_txt}] "
     elif _sess:
         _prefix = f"[{_sess}] "
     else:
         _prefix = ""
     #: 键只显示「短会话 id|序号」——完整的 sid 在结构化字段里，文本里省 token
-    _key = str(st.get("key") or "")
-    _key_show = _key
-    _sid_full = str(st.get("sid") or "")
-    if _key.startswith(_sid_full + "|"):
-        _key_show = _sid_short + _key[len(_sid_full):]
-    head = f"【按钮账】{_prefix}{label}（{_key_show}）"
+    _seq = st.get("seq") or 0
+    head = f"【按钮账】{_prefix}{label}（#{_seq}）" if _seq else f"【按钮账】{_prefix}{label}"
     bits = [f"已点 {st.get('total', 0)} 次"]
     if st.get("max"):
         bits.append(f"名额 {st['total']}/{st['max']}，剩 {st.get('remaining', 0)}")
@@ -1076,7 +1087,7 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
         def _who_one(r):
             _nm = _nm_of(r)
             _nm = "未知用户" if _nm.startswith("未知用户(") else _nm
-            _sc = str(r.get("uid") or "")[:8]
+            _sc = str(r.get("uid") or "")
             _cnt = f"×{r.get('count')}" if int(r.get("count") or 1) > 1 else ""
             return f"{_nm}（{_sc}）{_cnt}"
 
@@ -1096,9 +1107,9 @@ def render_stats_text(st: Dict[str, Any], *, now: Optional[float] = None,
             nm = (name_of(r["uid"]) if callable(name_of) else None) or r.get("name") or \
                  f"未知用户({r['uid']})"
             t = time.strftime("%H:%M", time.localtime(r["last"]))
-            _short = str(r.get("uid") or "")[:8]
+            _full = str(r.get("uid") or "")
             _nm2 = nm if nm and not nm.startswith("未知用户(") else "未知用户"
-            lines.append(f"- {_nm2}（{_short}） × {r['count']}（最后 {t}）")
+            lines.append(f"- {_nm2}（{_full}） × {r['count']}（最后 {t}）")
     else:
         lines.append("还没有人点。")
     return "\n".join(lines)

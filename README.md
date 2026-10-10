@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.42
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.43
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,36 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.43</b> — 性能修正（学名钩子 113µs→3.1µs）+ openid 全量显示 + `#N` 账本句柄</summary>
+
+### ① 性能：学名钩子从 113µs 降到 **3.1µs**（36×）
+用户问"会不会卡顿"。实测发现：`on_im_message` 钩子在前 5 个 uid 之前**每条消息都打一行日志**
+（终端 I/O ≈ 113µs/条 + 刷屏）⇒ 改成**每个 uid 只打一次**；再加**稳态早退**
+（通讯录里已是这个名字 ⇒ 不写、不标脏、不打日志）。
+
+实测（200k 次循环）：
+| 路径 | 单次耗时 |
+|---|---|
+| 学名钩子（每条 IM 消息都会跑）| **3.1 µs** |
+| 点击判定（查名字+注记+交付决策）| **9.0 µs** |
+| 查账（200 人账本）| **1.2 ms**（按需调用）|
+| 消息路径写盘 | **0 次**（只置 dirty，15s 巡检异步落盘）|
+
+所有 `await` 都有超时（成员查询 0.8s / 被动提示 3s），失败只记 debug ⇒ **不阻塞事件循环**。
+
+### ② 群 openid **完整显示**（用户要求）
+* 查账头部：`[群名 · D593FBB0F18264477911ECDCBF336D6F]`（短码会让模型混淆）；
+* 人名后也改为完整 openid：`- 天阴（78726B953A468C61669D34AB8E7F8BA7） × 1`；
+* 登记时不再造"被截断的假会话名"（拿不到群名就留空，渲染退回完整 openid）。
+
+### ③ 账本键里的 id 是干嘛的（用户问）
+* 内部键 `sid|序号` 里的 sid 部分是**冗余**的（历史设计，只便于人眼读 `button_policies.json`）；
+* **显示**已改为纯 `#N`（`报名（#1）`）—— 而且 `#N` 现在**可以当句柄用**：
+  工具新增 `ref="#1"` 参数，直接定位到那本账（显示了就能用，不会"看得见摸不着"）。
+
+</details>
+
+<details>
 <summary><b>v1.6.42</b> — 参与者/超额都带 openid；群名与私聊会话名**读时解析**（可回填）；学习钩子覆盖面加大</summary>
 
 * **参与者行也带 openid**：`- 周武（9CD54739） × 1（最后 03:04）`（超额的人同样）⇒ 重名也能区分；

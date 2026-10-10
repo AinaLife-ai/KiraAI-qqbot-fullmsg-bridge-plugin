@@ -73,6 +73,7 @@ class QQButtonTool(BaseTool):
             "scope": {"type": "string", "enum": ["session", "all"],
                       "description": "查找范围：session=当前会话（默认）；all=所有会话"},
             "session": {"type": "string", "description": "目标会话 openid 前缀（防重名时点名）"},
+            "ref": {"type": "string", "description": "账本编号（形如 #2，查账时显示的那个）"},
         },
         "required": ["action"],
     }
@@ -123,7 +124,7 @@ class QQButtonTool(BaseTool):
 
     def _locate(self, event, *, button_id: str = "", message_id: str = "",
                 label: str = "", scope: str = "session",
-                sid_prefix: str = "") -> Tuple[Optional[Any], List[Any], str]:
+                sid_prefix: str = "", ref: str = "") -> Tuple[Optional[Any], List[Any], str]:
         """定位一本账。`scope=all` 时可跨会话（候选会带会话标签，便于区分）。"""
         plugin, store = self._store(event)
         if store is None:
@@ -131,7 +132,8 @@ class QQButtonTool(BaseTool):
         _scope = str(scope or "session").lower()
         for sid in self._sids(event):
             hit, cands = store.find(sid, button_id=button_id, message_id=message_id,
-                                    label=label, scope=_scope, sid_prefix=sid_prefix)
+                                    label=label, scope=_scope, sid_prefix=sid_prefix,
+                                    ref=ref)
             if hit is not None:
                 return hit, cands, ""
             if cands:
@@ -172,17 +174,18 @@ class QQButtonTool(BaseTool):
     async def execute(self, event, *args, action: str = "stats", label: str = "",
                       button_id: str = "", message_id: str = "", limit: int = 20,
                       add_slots: int = 0, minutes: int = 0, reason: str = "",
-                      scope: str = "session", session: str = "", **kwargs) -> str:
+                      scope: str = "session", session: str = "", ref: str = "",
+                      **kwargs) -> str:
         act = str(action or "stats").strip().lower()
         if act not in ("stats", "close", "reset", "extend"):
             return f"未知 action={action}（可用：stats / close / reset / extend）"
         try:
             if act == "stats":
                 return self._stats(event, label=label, button_id=button_id,
-                                   message_id=message_id, limit=limit, scope=scope, sid_prefix=session)
+                                   message_id=message_id, limit=limit, scope=scope, sid_prefix=session, ref=ref)
             if act == "close":
                 return self._close(event, label=label, button_id=button_id,
-                                   message_id=message_id, reason=reason, scope=scope, sid_prefix=session)
+                                   message_id=message_id, reason=reason, scope=scope, sid_prefix=session, ref=ref)
             if act == "reset":
                 return self._reset(event, label=label, button_id=button_id,
                                    message_id=message_id)
@@ -194,7 +197,7 @@ class QQButtonTool(BaseTool):
 
     # ------------------------------------------------------------------ #
     def _stats(self, event, *, label, button_id, message_id, limit, scope="session",
-               sid_prefix="") -> str:
+               sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "查账失败：按钮账本未启用。"
@@ -270,7 +273,7 @@ class QQButtonTool(BaseTool):
             return ""
 
     def _close(self, event, *, label, button_id, message_id, reason, scope="session",
-               sid_prefix="") -> str:
+               sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "截止失败：按钮账本未启用。"
@@ -284,7 +287,7 @@ class QQButtonTool(BaseTool):
                 f"{int(hit.get('total') or 0)} 次、{len(hit.get('users') or {})} 人参与。")
 
     def _reset(self, event, *, label, button_id, message_id, scope="session",
-               sid_prefix="") -> str:
+               sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "重置失败：按钮账本未启用。"
@@ -298,7 +301,7 @@ class QQButtonTool(BaseTool):
         return f"已重置「{hit.get('label') or hit['key']}」（原计数 {old} 已清空，按钮重新可用）。"
 
     def _extend(self, event, *, label, button_id, message_id, add_slots, minutes,
-                scope="session", sid_prefix="") -> str:
+                scope="session", sid_prefix="", ref="") -> str:
         plugin, store = self._store(event)
         if store is None:
             return "调整失败：按钮账本未启用。"

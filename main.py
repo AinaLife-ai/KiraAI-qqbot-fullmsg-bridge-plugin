@@ -1138,8 +1138,9 @@ class QQOfficialGroupBridge(BasePlugin):
                     _sess_label = "私聊"
             except Exception:
                 _sess_label = ""
-            if not _sess_label:
-                _sess_label = str(target_id)[:12] + "…"
+            # ★ 拿不到真名就**留空**（渲染时退回完整 openid）——
+            #   以前填"被截断的 id"，查账头部就变成 `[D593FBB0F182… · D593FBB0…]` 重复又混淆。
+            #   群名是**读时解析**的：事后拿到群名，查账会立刻显示（可回填）。
             pol = self.button_policies.register(
                 self._policy_sid(target_id), spec,
                 button_ids=[b for b in btn_ids if b],
@@ -1287,15 +1288,21 @@ class QQOfficialGroupBridge(BasePlugin):
             scope = "gm" if str(getattr(session, "session_type", "")) == "gm" else "dm"
             learned = []
             if uid and name and not self._is_self_uid(uid):
-                if self.identities.remember(adapter_name, scope, uid, name):
-                    learned.append((uid, name))
+                # ★ 稳态早退：通讯录里已经是这个名字 ⇒ 不写、不 dirty、不打日志
+                #   （这条钩子**每条 IM 消息**都会跑，必须极廉价）
+                _known = self.identities.remember(adapter_name, scope, uid, None)
+                if _known != name:
+                    if self.identities.remember(adapter_name, scope, uid, name):
+                        learned.append((uid, name))
             # 消息里 @ 到的人：pid → name（核心给的显示名）
             for ele in (getattr(msg, "chain", None) or []):
                 pid = str(getattr(ele, "pid", "") or getattr(ele, "user_id", "") or "")
                 nm = str(getattr(ele, "name", "") or "")
                 if pid and nm and not self._is_self_uid(pid):
                     self.identities.remember(adapter_name, "gm", pid, nm)
-            if learned and len(self._peer_learn_logged) < 5:
+            # ★ 每个 uid 只打一次（原来"前 5 个之前每条消息都打"⇒ 刷屏 + ~100µs I/O）
+            if learned and learned[0][0] not in self._peer_learn_logged \
+                    and len(self._peer_learn_logged) < 5:
                 self._peer_learn_logged.add(learned[0][0])
                 logger.info("[QQBOT-BRIDGE] 已从消息里学到昵称：%s（uid %s…）——"
                             "按钮点击/查账从此能显示真名", learned[0][1], learned[0][0][:12])
