@@ -926,7 +926,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 "开" if self.member_notice_enabled else "关",
                 "开" if self.extra_intents else "关",
             )
-            if not self.extra_intents:
+            if not self.extra_intents or not self._wanted_extra_bits():
                 logger.info(
                     "[QQBOT-BRIDGE] 提示：成员进出 / 加群申请 事件需要打开配置项 "
                     "extra_intents（默认关，为避免个别环境下多订阅被平台拒导致连接反复失败）"
@@ -2658,7 +2658,22 @@ class QQOfficialGroupBridge(BasePlugin):
         self._upgrade_live_client(adapter, name, client)
 
     #: 额外订阅位：1<<24 成员事件（GROUP_MEMBER_EVENT）/ 1<<26 互动回调（INTERACTION）
+    _EXTRA_BIT_MEMBER = 1 << 24
+    _EXTRA_BIT_INTERACTION = 1 << 26
     _EXTRA_INTENT_BITS = (1 << 24) | (1 << 26)
+
+    def _wanted_extra_bits(self) -> int:
+        """按**实际开启的功能**算需要哪些位 —— 少订一个位就少一分被平台拒的风险。
+
+        * 互动回调位（1<<26）：按钮点击的**命脉**（interaction_enabled）；
+        * 成员事件位（1<<24）：只有"成员进出通知"开着才需要。
+        """
+        bits = 0
+        if self.member_notice_enabled:
+            bits |= self._EXTRA_BIT_MEMBER
+        if self.interaction_enabled:
+            bits |= self._EXTRA_BIT_INTERACTION
+        return bits
     #: 注入后多久开始请重连（给启动流程留时间，避免打扰初始化）
     _RECONNECT_DELAY = 4.0
     #: 还没抓到存活网关时，隔多久再看一次（心跳最长约 45s 一次）
@@ -2682,7 +2697,9 @@ class QQOfficialGroupBridge(BasePlugin):
             import botpy
             from botpy.gateway import BotWebSocket
 
-            bits = self._EXTRA_INTENT_BITS
+            bits = self._wanted_extra_bits()
+            #: 真正生效的位（分级降级时会改小 —— 闭包按这里的当前值取，不用重建补丁）
+            flag["bits"] = bits
             gateways = flag.setdefault("gateways", [])
 
             # ---- ① 正主：在 intent 真正发出去之前或上订阅位 ----
@@ -2692,7 +2709,10 @@ class QQOfficialGroupBridge(BasePlugin):
                     try:
                         sess = getattr(gw, "_session", None)
                         if isinstance(sess, dict):
-                            sess["intent"] = int(sess.get("intent") or 0) | bits
+                            _now_bits = int(flag.get("bits") or bits)
+                            if not _now_bits:
+                                return await _orig(gw)
+                            sess["intent"] = int(sess.get("intent") or 0) | _now_bits
                             # ★ 2026-10-10：把**真正发出去的** intents 打一次 ——
                             #   这是"平台推不推互动事件"的唯一硬证据：
                             #     这里 ✅ + 点按钮仍无日志 ⇒ 平台没推（去后台看推送方式）；
@@ -2850,7 +2870,7 @@ class QQOfficialGroupBridge(BasePlugin):
                             sess = getattr(gw, "_session", None)
                             if isinstance(sess, dict):
                                 sess["intent"] = int(sess.get("intent") or 0) | \
-                                    plugin._EXTRA_INTENT_BITS
+                                    int(flag.get("bits") or plugin._EXTRA_INTENT_BITS)
                                 # ★★★ 2026-10-10（用户实测"必须开关一次适配器才生效"）：
                                 #   botpy `on_connected` 的逻辑是
                                 #       if session_id: ws_resume()   # ← 不重发 intent！
@@ -2925,27 +2945,35 @@ class QQOfficialGroupBridge(BasePlugin):
         if not gateways:
             return
 
-        if any(getattr(g, "_can_reconnect", True) is False for g in gateways):
-            self._intents_reverted = True
-            logger.warning(
-                "[QQBOT-BRIDGE] 检测到平台拒绝了额外订阅（botpy 标记 _can_reconnect=False，"
-                "来自 WS_INVALID_SESSION）—— 已自动回退 intent 补丁，保证正常收发消息不受影响。"
-                "请把配置项 extra_intents 关掉（重启后生效）"
-            )
-            self._revert_extra_intents()
+        _rejected = any(getattr(g, "_can_reconnect", True) is False for g in gateways)
+        _dead = not any(not getattr(getattr(g, "_conn", None), "closed", True)
+                        for g in gateways)
+        if not (_rejected or _dead):
             return
 
-        if not any(not getattr(getattr(g, "_conn", None), "closed", True) for g in gateways):
-            self._intents_reverted = True
-            logger.warning(
-                "[QQBOT-BRIDGE] 检测到网关 socket 全部关闭且未重连（疑与额外订阅位有关）—— "
-                "已自动回退 intent 补丁以保证收发消息；若仍异常请把 extra_intents 关掉"
-            )
-            self._revert_extra_intents()
+        # ★★ 2026-10-11 用户定案：**只提醒，不自动动任何东西**。
+        #   理由（用户原话）：这类判定本来就可能是误判（换网/休眠/平台例行断线、
+        #   甚至 WS_INVALID_SESSION 也常只是"session 过期要重新 identify"），
+        #   一旦"自动回退"真的生效，就会把**互动回调位**一起撤掉 ⇒ 按钮静默失效。
+        #   "因为一次抖动就悄悄弄丢功能" 比 "多提示一句" 危险得多。
+        #   ⇒ 我们只**如实告警 + 告诉用户怎么处理**，撤不撤由人决定。
+        if getattr(self, "_intents_warned", False):
+            return
+        self._intents_warned = True
+        _why = ("平台侧判定会话无效（botpy 标记 _can_reconnect=False）"
+                if _rejected else "网关 socket 全部关闭且未重连")
+        logger.warning(
+            "[QQBOT-BRIDGE] 检测到长连接异常（%s）。"
+            "**本插件不会自动修改任何订阅位**（避免误判把你的按钮功能弄没）——"
+            "如果你确实**收不到消息**，再手动处理：把配置项 extra_intents 关掉后重启 KiraAI 即可"
+            "（代价：按钮点击/成员进出通知不再生效）。若收发正常，则无需任何操作。",
+            _why)
 
     def _revert_extra_intents(self) -> None:
         flag = self.profiles.get("__intents__")
-        if not flag or not flag.get("done"):
+        # ★ 原来这里判的是 `done` —— 而全代码**从未给 done 赋过值** ⇒ 恒真 ⇒ 回退永远是空操作。
+        #   修好后，它的唯一调用点是"禁用插件/还原"路径（**不再**由巡检自动调用）。
+        if not flag or not flag.get("patched"):
             return
         try:
             import botpy
@@ -2967,7 +2995,9 @@ class QQOfficialGroupBridge(BasePlugin):
             pass
         flag.clear()
         flag["gateways"] = []
-        logger.warning("[QQBOT-BRIDGE] 已回退额外订阅位（成员事件 / 互动回调将不再收到）")
+        logger.warning(
+            "[QQBOT-BRIDGE] 已回退额外订阅位：**互动回调位也没了 ⇒ 按钮点击事件不会再推给我们**"
+            "（成员进出通知同理）；普通消息收发与所有发送侧功能不受影响")
 
     # ------------------------------------------------------------------ #
     # 群名（2.x：构建事件时填；3.0：publish 包装，见 v3_support）
