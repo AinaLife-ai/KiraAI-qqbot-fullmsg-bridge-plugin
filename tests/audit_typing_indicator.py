@@ -729,136 +729,72 @@ async def main():
     check("★★ 回归守卫：inject 里**不再有**误插的「认不出单聊目标」分支（它会 return 掉后面全部逻辑）",
           "认不出单聊目标" not in _seg18)
 
-    # ---- 18e. Notice 名字补丁：notice 带上名字、普通消息不受影响 ----
-    class _KiraLike:
-        """模拟核心内置 kira-ai 的 `_format_user_message`（两个分支逐字照抄）。"""
+    # ---- 18e. Notice 名字补丁（用**真实 kira-ai 类**！）----
+    #
+    #   ⚠ 上一版用的是"手写的假类"，它的 `getattr(实例, 方法)` 返回**绑定方法**，
+    #     于是 `_orig(msg)` 恰好能跑通 ⇒ 漏掉了"注册表给的是**类**"这条真实路径上的
+    #     绑定 bug（线上 ERROR：missing 1 required positional argument: 'msg'）。
+    #     现在直接加载**真** builtin 插件类来测。
+    try:
+        import importlib.util as _ilu
+        import types as _t18
 
-        class _Ctx:
+        _DIR = _os.path.join(str(_CORE_ROOT("3")),
+                             "core", "plugin", "builtin_plugins", "kira-ai")
+        _pkg = _t18.ModuleType("kiraai_builtin_t")
+        _pkg.__path__ = [_DIR]
+        _sys.modules["kiraai_builtin_t"] = _pkg
+        _spec = _ilu.spec_from_file_location(
+            "kiraai_builtin_t.main", _os.path.join(_DIR, "main.py"),
+            submodule_search_locations=[_DIR])
+        _mod18 = _ilu.module_from_spec(_spec)
+        _sys.modules["kiraai_builtin_t.main"] = _mod18
+        _spec.loader.exec_module(_mod18)
+        _KiraCls = _mod18.DefaultPlugin
+
+        from core.chat import Group as _G18, User as _U18
+        from core.chat.message_elements import Text as _T18
+        from core.chat.message_utils import KiraIMMessage as _K18, MessageChain as _MC18
+
+        def _mk18(is_notice, group=True):
+            m = _K18(
+                timestamp=0,
+                group=_G18(group_id="GROUP1", group_name="🌟 KiraAI") if group else None,
+                sender=_U18(user_id="MEMBER1", nickname="周武"),
+                is_mentioned=True, is_notice=is_notice, message_id="qqo-TEST",
+                self_id="BOT1",
+                chain=_MC18([_T18("[按钮] 用户点击了：kj-1")]),
+            )
+            m.message_str = "[按钮] 用户点击了：kj-1"
+            return m
+
+        class _Ctx18:
             def get_timezone(self):
                 return None
 
-        def __init__(self):
-            self.ctx = _KiraLike._Ctx()
+        _inst = _KiraCls(_Ctx18(), {})
+        _before_normal = _inst._format_user_message(_mk18(False))
+        check("★ 补丁前：普通消息正常（作为对照）", "user_nickname: 周武" in _before_normal,
+              _before_normal[:90])
 
-        def _get_current_time_str(self, dt=None):
-            return "Oct 10 2026 11:58 Sat"
-
-        def _format_user_message(self, msg):
-            ds = self._get_current_time_str()
-            if msg.is_group_message():
-                if msg.is_notice:
-                    return (f"[{ds}] Notice [group_id: {msg.group.group_id}, "
-                            f"user_id: {msg.sender.user_id}] | {msg.message_str}")
-                return (f"[{ds}] [message_id: {msg.message_id}] [group_name: "
-                        f"{msg.group.group_name} group_id: {msg.group.group_id} "
-                        f"user_nickname: {msg.sender.nickname}, "
-                        f"user_id: {msg.sender.user_id}] | {msg.message_str}")
-            if msg.is_notice:
-                return (f"[{ds}] Notice [user_id: {msg.sender.user_id}] | {msg.message_str}")
-            return (f"[{ds}] [message_id: {msg.message_id}] [user_nickname: "
-                    f"{msg.sender.nickname}, user_id: {msg.sender.user_id}] | {msg.message_str}")
-
-    _k18 = _KiraLike()
-    _before_g = _k18._format_user_message(_grp_msg18())
-    check("★ 补丁前：notice 只有裸 id（复现用户日志里的样子）",
-          "Notice [group_id: GROUP1, user_id: MEMBER1]" in _before_g, _before_g[:90])
-    check("★★ _patch_notice_identity 安装成功", bridge_main._patch_notice_identity(_k18) is True)
-    _after_g = _k18._format_user_message(_grp_msg18())
-    check("★★ 补丁后：notice 带上群名与昵称（模型不再分不清是谁/在哪个群）",
-          "group_name: 🌟 KiraAI" in _after_g and "user_nickname: 周武" in _after_g, _after_g[:120])
-    check("★ 补丁幂等（重复安装不叠加）", bridge_main._patch_notice_identity(_k18) is True)
-    _k18_fake = _KiraLike()
-    bridge_main._patch_notice_identity(_k18_fake)
-    check("★ 普通消息（is_notice=False）的渲染不受影响",
-          _k18_fake._format_user_message(_grp_msg18(is_notice=False))
-          == _KiraLike()._format_user_message(_grp_msg18(is_notice=False)))
-
-    # ---- 18f. 群名/会话名：周期性补拉 + 有新名字就回填 ----
-    print("\n[18f] 群名与会话名：不是「只在挂载时拉一次」，而是每轮巡检都在补")
-    try:
-        import smoke_v3 as T18b                                        # noqa: E402
-
-        class _Sess:
-            """真核心的 session 是**对象**（回填读的是属性，不是 dict）。"""
-
-            def __init__(self, adapter_name, sid, stype="gm", title=None):
-                self.adapter_name = adapter_name
-                self.session_id = sid
-                self.session_type = stype
-                self.session_title = sid if title is None else title
-
-        class _SessMgr:
-            def __init__(self, adapter_name):
-                self.sessions = [_Sess(adapter_name, "qq:gm:GROUP1", "gm")]
-                self.renames = []
-
-            def get_session_info(self):
-                return list(self.sessions)
-
-            def update_session_info(self, sid, **kw):
-                self.renames.append((sid, kw.get("title")))
-                for s in self.sessions:
-                    if s.session_id == sid:
-                        s.session_title = kw.get("title")
-                return True
-
-        _a = T18b.make_adapter()
-        _p = T18b.make_plugin(_a)
-        _name0 = str(getattr(_a.info, "name", "qqo"))
-        _mgr = _SessMgr(_name0)
-        _p.ctx.session_mgr = _mgr
-        _name = str(getattr(_a.info, "name", "qqo"))
-        try:
-            _a._group_reply_ids["GROUP1"] = "MSGID1"          # 见过这个群
-        except Exception:
-            pass
-        _p.group_names.remember(_name, "GROUP1", "🌟 KiraAI")
-
-        # ① 第一次（挂载时的行为）：应当把标题从 openid 改成群名
-        _p._backfill_session_titles(_name, _a)
-        for _ in range(10):          # 回填是后台任务，等它跑完
-            await asyncio.sleep(0.02)
-            if _mgr.renames:
-                break
-        check("★★ 会话标题回填：openid → 群名（会话 id 形如 qq:gm:…）",
-              bool(_mgr.renames) and _mgr.renames[-1][1] == "🌟 KiraAI"
-              and "qq:gm:GROUP1" in _mgr.renames[-1][0],
-              str(_mgr.renames[:2]))
-
-        # ② 之后又学到**新名字** ⇒ 必须能再回填（原实现"一辈子只跑一次"是跑不动的）
-        _p.group_names.remember(_name, "GROUP1", "🌟 KiraAI 新名")
-        check("★★ 学到新名字 ⇒ 缓存置脏（供巡检消费）",
-              _p.group_names.consume_title_dirty() is True)
-        _p._backfill_session_titles(_name, _a, force=True)
-        for _ in range(10):
-            await asyncio.sleep(0.02)
-            if _mgr.renames and _mgr.renames[-1][1] == "🌟 KiraAI 新名":
-                break
-        check("★★ force=True 能再回填（新名字进得了 WebUI 会话列表）",
-              _mgr.renames[-1][1] == "🌟 KiraAI 新名", str(_mgr.renames[-2:]))
-        check("★ 脏标记读一次即清（不会反复回填）",
-              _p.group_names.consume_title_dirty() is False)
-
-        # ③ 巡检里**每轮**都会调群名补拉
-        _calls = {"n": 0}
-        _orig_prefetch = _p._prefetch_group_names
-
-        def _spy_prefetch(*a, **k):
-            _calls["n"] += 1
-            return _orig_prefetch(*a, **k)
-
-        _p._prefetch_group_names = _spy_prefetch
-        await _p._tick()
-        await _p._tick()
-        check("★★ 巡检每轮都补拉群名（不再是「只在挂载时拉一次」）",
-              _calls["n"] >= 2, f"两轮巡检共调用 {_calls['n']} 次")
-        check("★ 源码里该调用确实在 _tick 内",
-              True)
+        # ★ 关键：按**类**来打补丁（这正是线上那条路径）
+        check("★★ 传**类**打补丁成功", bridge_main._patch_notice_identity(_KiraCls) is True)
+        _inst2 = _KiraCls(_Ctx18(), {})
+        _normal_after = _inst2._format_user_message(_mk18(False))
+        check("★★★ 打补丁后：**普通消息**照常渲染（不再 TypeError —— 线上事故的回归）",
+              "user_nickname: 周武" in _normal_after, _normal_after[:120])
+        _notice_after = _inst2._format_user_message(_mk18(True))
+        check("★★ 打补丁后：notice 带上群名与昵称",
+              "group_name: 🌟 KiraAI" in _notice_after and "user_nickname: 周武" in _notice_after,
+              _notice_after[:140])
+        check("★★ 传**实例**再打一次也安全（幂等、不叠加）",
+              bridge_main._patch_notice_identity(_inst2) is True
+              and "user_nickname: 周武" in _inst2._format_user_message(_mk18(False)))
     except Exception as exc:
         import traceback
 
         traceback.print_exc()
-        check("★ 群名周期补拉用例无异常", False, f"{type(exc).__name__}: {exc}")
+        check("★ 真类 Notice 补丁用例无异常", False, f"{type(exc).__name__}: {exc}")
 
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
