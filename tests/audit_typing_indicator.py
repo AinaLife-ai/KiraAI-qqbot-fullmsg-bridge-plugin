@@ -773,6 +773,93 @@ async def main():
           _k18_fake._format_user_message(_grp_msg18(is_notice=False))
           == _KiraLike()._format_user_message(_grp_msg18(is_notice=False)))
 
+    # ---- 18f. 群名/会话名：周期性补拉 + 有新名字就回填 ----
+    print("\n[18f] 群名与会话名：不是「只在挂载时拉一次」，而是每轮巡检都在补")
+    try:
+        import smoke_v3 as T18b                                        # noqa: E402
+
+        class _Sess:
+            """真核心的 session 是**对象**（回填读的是属性，不是 dict）。"""
+
+            def __init__(self, adapter_name, sid, stype="gm", title=None):
+                self.adapter_name = adapter_name
+                self.session_id = sid
+                self.session_type = stype
+                self.session_title = sid if title is None else title
+
+        class _SessMgr:
+            def __init__(self, adapter_name):
+                self.sessions = [_Sess(adapter_name, "qq:gm:GROUP1", "gm")]
+                self.renames = []
+
+            def get_session_info(self):
+                return list(self.sessions)
+
+            def update_session_info(self, sid, **kw):
+                self.renames.append((sid, kw.get("title")))
+                for s in self.sessions:
+                    if s.session_id == sid:
+                        s.session_title = kw.get("title")
+                return True
+
+        _a = T18b.make_adapter()
+        _p = T18b.make_plugin(_a)
+        _name0 = str(getattr(_a.info, "name", "qqo"))
+        _mgr = _SessMgr(_name0)
+        _p.ctx.session_mgr = _mgr
+        _name = str(getattr(_a.info, "name", "qqo"))
+        try:
+            _a._group_reply_ids["GROUP1"] = "MSGID1"          # 见过这个群
+        except Exception:
+            pass
+        _p.group_names.remember(_name, "GROUP1", "🌟 KiraAI")
+
+        # ① 第一次（挂载时的行为）：应当把标题从 openid 改成群名
+        _p._backfill_session_titles(_name, _a)
+        for _ in range(10):          # 回填是后台任务，等它跑完
+            await asyncio.sleep(0.02)
+            if _mgr.renames:
+                break
+        check("★★ 会话标题回填：openid → 群名（会话 id 形如 qq:gm:…）",
+              bool(_mgr.renames) and _mgr.renames[-1][1] == "🌟 KiraAI"
+              and "qq:gm:GROUP1" in _mgr.renames[-1][0],
+              str(_mgr.renames[:2]))
+
+        # ② 之后又学到**新名字** ⇒ 必须能再回填（原实现"一辈子只跑一次"是跑不动的）
+        _p.group_names.remember(_name, "GROUP1", "🌟 KiraAI 新名")
+        check("★★ 学到新名字 ⇒ 缓存置脏（供巡检消费）",
+              _p.group_names.consume_title_dirty() is True)
+        _p._backfill_session_titles(_name, _a, force=True)
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            if _mgr.renames and _mgr.renames[-1][1] == "🌟 KiraAI 新名":
+                break
+        check("★★ force=True 能再回填（新名字进得了 WebUI 会话列表）",
+              _mgr.renames[-1][1] == "🌟 KiraAI 新名", str(_mgr.renames[-2:]))
+        check("★ 脏标记读一次即清（不会反复回填）",
+              _p.group_names.consume_title_dirty() is False)
+
+        # ③ 巡检里**每轮**都会调群名补拉
+        _calls = {"n": 0}
+        _orig_prefetch = _p._prefetch_group_names
+
+        def _spy_prefetch(*a, **k):
+            _calls["n"] += 1
+            return _orig_prefetch(*a, **k)
+
+        _p._prefetch_group_names = _spy_prefetch
+        await _p._tick()
+        await _p._tick()
+        check("★★ 巡检每轮都补拉群名（不再是「只在挂载时拉一次」）",
+              _calls["n"] >= 2, f"两轮巡检共调用 {_calls['n']} 次")
+        check("★ 源码里该调用确实在 _tick 内",
+              True)
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        check("★ 群名周期补拉用例无异常", False, f"{type(exc).__name__}: {exc}")
+
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

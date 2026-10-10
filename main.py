@@ -901,6 +901,32 @@ class QQOfficialGroupBridge(BasePlugin):
             patches = self._ensure_class_patch()
         for name, adapter in adapters:
             self._attach(adapter, name, patches)
+
+        # ---- ★★ 群名 / 会话名：**周期性**补拉（2026-10-10 用户提问后修）----
+        #
+        #   原来只在**挂载时**补一次 ⇒ 之后新出现的群、或首次没拉到的群，
+        #   名字永远停在 openid，直到重启/重载（用户实测的疑问）。
+        #   现在：每轮巡检（15s）
+        #     ① 调 `_prefetch_group_names`（它自带**分批 + 串行 + 失败不再重试**，
+        #        官方群名接口限 30 QPM，安全）；
+        #     ② 只要期间**学到过新名字**（缓存里的脏标记）⇒ 立刻重跑一次
+        #        "会话标题回填"，让 WebUI 会话列表及时变成中文；
+        #        仍然只改"标题还是 openid"的会话，用户改过名的一律不碰。
+        try:
+            _names_changed = self.group_names.consume_title_dirty()
+        except Exception:
+            _names_changed = False
+        for name, adapter in adapters:
+            try:
+                self._prefetch_group_names(
+                    adapter, name, getattr(adapter, "client", None))
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 周期性群名补拉异常（忽略）: %s", exc)
+            if _names_changed:
+                try:
+                    self._backfill_session_titles(name, adapter, force=True)
+                except Exception as exc:
+                    logger.debug("[QQBOT-BRIDGE] 会话标题回填异常（忽略）: %s", exc)
         names = ",".join(n for n, _ in adapters)
         if report or self._last_report != names:
             self._last_report = names
@@ -2513,6 +2539,30 @@ class QQOfficialGroupBridge(BasePlugin):
     _c2c_shape_dumped = False
 
     @staticmethod
+    def _bare_id_from_session(sid: Any) -> str:
+        """从**会话 id**里取出实体 id（群号 / openid）。
+
+        `qq:gm:<gid>` / `qqo:group:<gid>` → `<gid>`；`qq:dm:<openid>` → `<openid>`；
+        本来就是裸 id 则原样返回。
+
+        ★ 为什么必须有它（2026-10-10 用户提问顺带挖出的真 bug）：
+          群名缓存 / 群名接口 / 通讯录的 key 都是**裸 id**，而会话 id 带场景前缀
+          （`qq:gm:…`）⇒ 回填时拿会话 id 去查缓存**永远 miss**，
+          会话名一直停在 openid（"补拉"其实一次都没成功过）。
+        """
+        text = str(sid or "")
+        if not text:
+            return ""
+        parts = [p for p in text.replace("/", ":").split(":") if p]
+        if not parts:
+            return ""
+        for i, p in enumerate(parts):
+            if p.lower() in ("gm", "group", "guild", "channel",
+                             "dm", "c2c", "direct", "private"):
+                return parts[i + 1] if i + 1 < len(parts) else ""
+        return parts[-1]
+
+    @staticmethod
     def _event_is_group(event) -> bool:
         """这个事件**明确是群聊**吗？（把"正常跳过"与"认不出形状"分开）
 
@@ -3038,7 +3088,7 @@ class QQOfficialGroupBridge(BasePlugin):
                 return val
         return default
 
-    def _backfill_session_titles(self, name: str, adapter) -> None:
+    def _backfill_session_titles(self, name: str, adapter, force: bool = False) -> None:
         """把**已存在**会话的名字补成中文（群名 / 私聊昵称）。
 
         ★ 解决什么：会话名在**建立那一刻**就定死了。以前装插件时群名还拉不到
@@ -3059,7 +3109,11 @@ class QQOfficialGroupBridge(BasePlugin):
         """
         if not getattr(self, "backfill_session_titles", True):
             return
-        if name in self._backfilled:
+        # ★ 2026-10-10（用户提问）：原来这里是"一辈子只跑一次"——
+        #   之后新学到的群名就永远回填不到 WebUI 会话标题了。
+        #   现在 `force=True`（由巡检在"有新名字"时触发）可以重跑；
+        #   安全边界不变：仍然只改"标题还是 openid"的会话。
+        if name in self._backfilled and not force:
             return
         self._backfilled.add(name)
         try:
@@ -3124,18 +3178,24 @@ class QQOfficialGroupBridge(BasePlugin):
         for stype, sid in todo:
             try:
                 new_title = None
+                # ★ 会话 id（qq:gm:<gid> / qq:dm:<openid>）与缓存/通讯录的 key
+                #   （裸 id）不是一回事 —— 统一取裸 id，否则永远查不到（老 bug）。
+                bare = self._bare_id_from_session(sid) or str(sid)
                 if stype == "gm":
-                    # 先看缓存；没有就排队拉一次（复用已有的分批限流）
-                    new_title = self.group_names.lookup(name, sid)
+                    # 先看缓存（裸 id，兼容旧写法的会话 id）；没有就排队拉一次
+                    new_title = (self.group_names.lookup(name, bare)
+                                 or self.group_names.lookup(name, sid))
                     if not new_title and client is not None:
                         try:
-                            self.group_names.schedule_fetch(adapter, name, sid, client, logger)
+                            self.group_names.schedule_fetch(
+                                adapter, name, bare, client, logger)
                         except Exception:
                             pass
                         continue          # 这次先跳过，等下一轮缓存里有值再写
                 else:
                     if self.identities is not None:
-                        new_title = self.identities.lookup(name, sid)
+                        new_title = (self.identities.lookup(name, bare)
+                                     or self.identities.lookup(name, sid))
                 if not new_title or str(new_title) == sid:
                     continue
                 key = f"{name}:{stype}:{sid}"
