@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.35
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.38
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -510,7 +510,7 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 * **默认 `deliver=all`**：每次**有效**点击都会转给模型（与旧版完全一致，模型照常接话）；
 * **硬模式（默认开）**：**超过上限 / 已过期 / 重复（once、per、连点保护）**的点击
   **不再转给模型** —— 这就是「bot 收到的点击有上限」；
-  模型需要时用 `qq_button_stats` 查账（谁点了、剩几个、超额几次都能查）；
+  模型需要时用 `qq_button`（action=stats）查账（谁点了、剩几个、超额几次都能查）；
 * 触发**截止的那一次**照常转达，并**额外带上汇总**（谁点的、共几次、按钮已截止）；
 * `deliver=last`：只在截止那一次转（更安静，适合只关心「满了/结束了」的场景）；
 * `deliver=off`：一次都不转，纯记账（模型自己查账）；
@@ -521,10 +521,7 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 
 | 工具 | 作用 |
 |---|---|
-| qq_button_stats | **查对应账**：谁点了、各几次、还剩几个名额、是否已截止、什么时候截止 |
-| qq_button_close | 立刻截止（"报名结束"）|
-| qq_button_reset | 清空计数、重开一轮 |
-| qq_button_extend | 加名额 / 延长时间（"大家太热情，再加三个位置"）|
+| qq_button | **一个工具，`action` 传参**：stats 查对应账（谁点了、各几次、剩几个名额、是否截止）｜close 立刻截止｜reset 清空重开｜extend 加名额（add_slots）或延时（minutes）|
 
 ### 安全与兼容（都做了硬验证）
 
@@ -603,6 +600,58 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.38</b> — `<markdown>` 标签描述也瘦身（461 → 371 字符，能力与引导零丢失）</summary>
+
+* 删掉重复表述（音视频那段的"直链"说了两遍）、压缩场景枚举；
+* **逐项核对 23 个要点全部保留**：能力清单（标题/加粗/斜体/删除线/链接/图片/有序无序列表/
+  代码块/块引用/分割线）、适用场景、必须用 `<markdown>` 包裹、别写 `<text>`、别转义、
+  平台不支持任何 HTML 标签（audio/video/img/div）、音视频给**可点击直链**、
+  图片 `![描述](地址)` 自动转公网、不要手写 `qqbot-at-user` 之类的 @ 标记；
+* 至此我们插件占用的**静态前缀**（每轮都进提示词）合计：
+  **4704 → 2455 字符**（工具 824 + keyboard 1260 + markdown 371），
+  **省 2249 字符 ≈ 1120 tokens/轮**。
+
+</details>
+
+<details>
+<summary><b>v1.6.37</b> — 四个按钮工具**合并成一个** `qq_button`（省 56% schema 体积）+ 描述精简</summary>
+
+* **合并**：`qq_button_stats / close / reset / extend` → **`qq_button`**，用 `action` 传参
+  （stats / close / reset / extend）；工具 schema 由 **1914 → 824 字符（省 56%）**，
+  ≈950 → **≈412 tokens/轮**（工具 schema 进每一轮提示词，agent loop 多步时成倍放大）；
+* **描述精简但语义完整**：一句话讲清"查账/截止/重开/加名额"，`action` 枚举带中文提示，
+  定位方式（label / message_id）+ "不唯一会列候选"都保留；
+* **缓存友好**：工具列表顺序与文案**固定**（不含任何动态内容）⇒ 前缀缓存照常命中；
+  合并后 schema 更短 ⇒ 每次请求的**静态前缀更小**（升级那一次会刷新一次缓存属正常）；
+* 同步更新：提示词（标签描述）、运行时日志、README。
+
+</details>
+
+<details>
+<summary><b>v1.6.36</b> — 🚑 修「查账工具没进模型」（bot 说「手边没有那个工具」）</summary>
+
+**现象**（用户线上）：策略行为完全正常（第 1 次转达、第 2 次「最后一个名额」带汇总、
+之后「原因=full」不再转达），但让 bot 用 `qq_button` 查账时它回答「手边没有那个工具」。
+
+**根因**：核心 `ToolSet.add()` 只认两种对象 ——
+`isinstance(tool, type)` 实例化，或 `isinstance(tool, BaseTool)` 收下，**其余 `continue` 静默丢弃**。
+我们的查账工具当时是**裸类**（没继承 `core.utils.tool_utils.BaseTool`）⇒ 注入被静默跳过。
+（既有测试用的是"什么都能塞"的 FakeToolSet，所以没测出来。）
+
+**修复**：
+1. `button_tools._ButtonToolBase` 改为继承 `BaseTool`（带 stub 兜底，2.x/3.0 通用）；
+2. 注入处加**落地校验**：加完回查 `name in tool_set`，没进去直接 **WARNING**
+   （"按钮查账工具没能进模型…模型会说「手边没有那个工具」"）；成功则 INFO 打一行。
+
+**守卫测试**（`audit_button_scenarios.py` S10，全部用**真实**对象）：
+* S10-1 四个工具都是 `BaseTool` 子类；
+* S10-2 用**真实 `ToolSet.add`** 断言四个工具真的进去了（线上就是这里丢的）；
+* S10-3 `get_schema()` 三要素齐全；
+* S10-4 走**插件真实注入路径** `inject_tools_and_tags(event, request, 真 TagSet)` 断言注入成功。
+
+</details>
+
+<details>
 <summary><b>v1.6.35</b> — 真实场景端到端测试（25 项）+ 抓到并修掉 extend/reset 的真 bug</summary>
 
 ### 新增：真实场景测试 `tests/audit_button_scenarios.py`（走完整链路，25 项全过）
@@ -662,7 +711,7 @@ sustained_chat 不 patch 核心发送链。
 * **默认硬模式 + 安静模式**：`deliver=last` ⇒ 中途点击不打扰模型，
   只有**触发截止的那一次**带汇总转给模型；超额/过期/重复**不再转**；
 * **机械文案默认不发**（单独开关 + 可自定义文案，逐条可用 `notify_text` 覆盖）；
-* **查账工具**：`qq_button_stats` / `qq_button_close` / `qq_button_reset` / `qq_button_extend`
+* **查账工具**：`qq_button`（四合一，`action` 传参：stats/close/reset/extend）
   —— 模型能查"谁点了、各几次、剩几个、是否截止"，也能自己截止/重开/加名额；
 * **截止通知**：到点且有人参与的按钮会给模型一条「已截止」；没人点过的**静默关闭**；
 * **账本**：原子落盘（`plugins/<插件ID>/button_policies.json`）、LRU 500、消息路径零 I/O；

@@ -429,21 +429,21 @@ check("★ 说明里给了排查方向（后台「消息推送方式」Webhook �
 print("\n═══ E. 键盘提示词：四种样式 + 同一条消息（用户反馈「颜色只剩一种」的根因）═══")
 _rc_src = open(os.path.join(BR, "rich_content.py"), encoding="utf-8").read()
 check("★★ 提示词写清四种样式（0/1/3/4）与各自语义",
-      all(x in _rc_src for x in ("0 = 灰色线框", "1 = 蓝色线框", "3 = 白底红字", "4 = 蓝底白字")),
+      all(x in _rc_src for x in ("0 灰线框", "1 蓝线框", "3 白底红字", "4 蓝底白字")),
       "")
 check("★★ 提示词要求「正文与按钮放进同一个 <msg>」（按钮在最底部）",
-      "正文与按钮放进同一个 <msg>" in _rc_src)
+      "同一个 <msg>" in _rc_src and "最底部" in _rc_src)
 check("★★ 提示词告诉模型：正文可以用**完整 markdown**（标题/列表/表格/图片…）",
-      "全都可以用" in _rc_src and "<markdown>" in _rc_src)
+      "<markdown>" in _rc_src and "标题/列表/表格/图片" in _rc_src)
 check("★★ 提示词明确「别把正文和按钮分成两个 <msg>」",
-      "千万别把正文和按钮分成两个 <msg>" in _rc_src)
+      "拆成两个 <msg>" in _rc_src)
 check("★★ 提示词**优先推荐回调按钮**（type=1），并给出何时才用 type=2",
-      "优先用回调按钮" in _rc_src and '"type":1' in _rc_src
-      and "只有你希望" in _rc_src)
+      "回调按钮" in _rc_src and "action.type=1" in _rc_src
+      and "type=2" in _rc_src)
 check("★ 校验器不吞按钮字段（style / visited_label 原样保留）", True)
 check("★ 提示词写了 visited_label（点击后换文案）", "visited_label" in _rc_src)
 check("★ 提示词明确「按钮不能写进 md 正文」（官方 md 无按钮语法）",
-      "不支持把按钮写进 md 正文" in _rc_src)
+      "不能写进 md 正文" in _rc_src or "不能写进 md" in _rc_src)
 check("★ 校验器不吞按钮字段（style / visited_label 原样保留）", True)
 
 print("\n═══ F. 逐字段往返：按钮「只剩一种颜色」到底是不是只怪提示词 ═══")
@@ -797,8 +797,8 @@ try:
                     return _p3
 
         _ev = _Ev()
-        _tool = _BT3.QQButtonStatsTool(ctx=_Ev.ctx)
-        _out = asyncio.run(_tool.execute(_ev))
+        _tool = _BT3.QQButtonTool(ctx=_Ev.ctx)
+        _out = asyncio.run(_tool.execute(_ev, action="stats"))
         check('★★ 查账工具：能按会话定位到这本账（不再"乱猜"）',
               "已点" in _out and "报名" in _out, str(_out)[:160])
         check("★★ 查账内容含参与者与状态", ("U1" in _out or "未知用户" in _out)
