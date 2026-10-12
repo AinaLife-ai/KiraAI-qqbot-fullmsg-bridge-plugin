@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.44
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.45
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,43 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.45</b> — 对账 KiraAI v3.0.0-rc.1：修「会话名回填」在 3.0 全系列空转（按能力兼容，不绑版本）</summary>
+
+### 背景
+KiraAI 发布 **v3.0.0-rc.1**（相对 alpha 只有 3 个提交：会话 SQLite 化 / IM 输出能力元数据对齐 /
+注释掉未实现能力）。我们把**全套件**分别跑在 **rc1** 与 **2.x** 上对账。
+
+### 发现并修复的真问题：会话名回填在 3.0 上**一直是空转的**
+老代码用 `session_mgr.get_session_info()` / `update_session_info(...)` —— 这两个名字**只有 2.x 有**；
+**3.0（alpha 与 rc1 一致）**用的是 `get_sessions()` / `update_session(sid, title=…)`，而且是**异步**的。
+⇒ 因为外面有个 `hasattr(...)` 守卫，它会**静默跳过**（WebUI 会话列表里的 openid 名字一直补不成中文）。
+**修法（按能力，不绑版本）**：
+* `_sessions_snapshot` / `_session_snapshot` / `_set_session_title` 三个助手：**逐个试接口名**，
+  `inspect.isawaitable` ⇒ 同步异步都吃；某一接口存在但**调用失败**时**继续试下一个**；
+* 两个接口都找不到 ⇒ 打**一次性告警**（未来核心再改接口名时"看得见"，不再静默）；
+* 回填入口保持**同步**、真正读写在**后台任务**里（不阻塞）；
+* 副带修好：老名字其实是 **2.x 专属**、3.0 从来没有过 —— 现在 2.x / 3.0（含未来版本）**同一套代码通吃**。
+
+### 不绑版本号（对 3.0 及更高版本同样成立）
+* 兼容层与世代判断里**零版本字符串**（`rc1` / `3.0.0` / `alpha` 只出现在注释里，有守卫测试盯着）；
+* 世代判断仍是**结构性**的（`get_capability(IMCapability)` / `_handle_message` 等特征），不看版本号；
+* 未来核心换成**第三种**接口名 ⇒ **安全跳过**（不抛异常），并有一次性告警。
+
+### 测试侧适配（产品代码只动了会话兼容层）
+* `run_tests.py`：显式给 `KIRA_CORE` 时**推导并下发** `KIRA_CORE_GEN`（否则一批套件会按 2.x 解析核心）；
+* 新增 `_env.seed_reply_ids()`：把"被动回复锚点"种到**该世代真正读取的地方**
+  （3.0 在能力对象上，2.x 在适配器上）；
+* 上游重构导致"抓核心内部结构"的取证段（`SessionBuffer`、XML 解析段、发送顺序）**改为可跳过并说明**；
+* `audit_session_backfill`：**两套会话接口各跑一遍**（2.x 同步 / 3.0 异步）—— 这才测得出兼容层；
+* `audit_generation_parity` 新增 **[D] 段守卫**：不绑版本号 / 能力探测 / 未知接口安全跳过 / 世代判断结构性。
+
+### 结果（终验）
+* **KiraAI v3.0.0-rc.1：ALL TEST SUITES PASSED** ✅
+* **KiraAI 2.x：ALL TEST SUITES PASSED** ✅
+
+</details>
+
+<details>
 <summary><b>v1.6.44</b> — 订阅位异常改为「**只提醒、不自动动任何东西**」（用户定案）</summary>
 
 ### 背景

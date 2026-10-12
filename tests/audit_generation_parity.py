@@ -228,6 +228,131 @@ def main():
     check("C3 补丁只落在**实例**上，不动 botpy 类（避免影响其它插件/多实例）",
           not getattr(cls_fn, "_kira_bridge_owner", None), "")
 
+    # ---- [D] 兼容必须按**能力**判断，不许绑版本号（对 3.0 及更高版本同样成立） ----
+    print("\n[D] 兼容按能力判断、不绑版本号（未来 3.x 同样成立）")
+    try:
+        import inspect as _insp
+        import re as _re
+
+        import main as _bm
+
+        def _fn_src(fn) -> str:
+            try:
+                return _insp.getsource(fn)
+            except Exception:
+                return ""
+
+        # 取**整个类**的源码，剥掉注释与文档字符串后只扫"真代码"
+        _cls_src = _fn_src(_bm.QQOfficialGroupBridge)
+        _code = "\n".join(ln.split("#")[0] for ln in _cls_src.splitlines())
+        _code = _re.sub(r'"""(?:.|\n)*?"""', "", _code)
+        _code = _re.sub(r"'''(?:.|\n)*?'''", "", _code)
+        _bad = [w for w in ("rc1", "3.0.0", "alpha", "__version__") if w in _code]
+        check("★★ 兼容层**真代码**里没有任何版本字符串（绑版本 ⇒ 未来 3.x 就失效）",
+              not _bad, str(_bad))
+        check("★★ 会话接口按**能力探测**（hasattr + inspect.isawaitable，同步/异步都吃）",
+              "hasattr" in _code and "isawaitable" in _code, "")
+
+        class _Alien:
+            pass
+
+        _p = _bm.QQOfficialGroupBridge.__new__(_bm.QQOfficialGroupBridge)
+        _p._session_api_warned = True
+        _snap = _run(_p._sessions_snapshot(_Alien()))
+        _ok_set = _run(_p._set_session_title(_Alien(), "qq:gm:G1", "名字"))
+        check("★★ 未来换成第三种接口名 ⇒ **安全跳过**（不抛异常，如实返回 None/False）",
+              _snap is None and _ok_set is False, f"snap={_snap} set={_ok_set}")
+
+        # ★ 2026-10-12 复审：订阅位必须按"**事件家族**"算，不能只看单个开关 ——
+        #   否则"成员进出关着、加群申请提醒开着"时，加群申请的事件就收不到了（能力被静默弄没）。
+        _p2 = _bm.QQOfficialGroupBridge.__new__(_bm.QQOfficialGroupBridge)
+        _p2.member_notice_enabled = False
+        _p2.join_request_notice_enabled = True        # ← 只开这个
+        _p2.admin_join_approval = False
+        _p2.interaction_enabled = True
+        _bits_a = _p2._wanted_extra_bits()
+        _p2.join_request_notice_enabled = False
+        _p2.admin_join_approval = True                # ← 只开审批
+        _bits_b = _p2._wanted_extra_bits()
+        _p2.admin_join_approval = False
+        _bits_c = _p2._wanted_extra_bits()
+        check("★★ 成员家族任一开启（加群申请提醒 / 加群审批）⇒ 必须订成员事件位",
+              bool(_bits_a & _p2._EXTRA_BIT_MEMBER) and bool(_bits_b & _p2._EXTRA_BIT_MEMBER),
+              f"申请={_bits_a:#x} 审批={_bits_b:#x}")
+        check("★★ 成员家族全关 ⇒ 可以不订（省一位风险），但互动位始终在",
+              not (_bits_c & _p2._EXTRA_BIT_MEMBER) and bool(_bits_c & _p2._EXTRA_BIT_INTERACTION),
+              f"{_bits_c:#x}")
+
+        import core_profiles as _cp
+
+        _dsrc = _fn_src(_cp.detect)
+        check("★★ 世代判断是**结构性**的（看能力对象/方法，不看版本号）",
+              ("get_capability" in _dsrc or "IMCapability" in _dsrc)
+              and not _re.search(r"(rc1|3\.0\.0|alpha|__version__)", _dsrc), _dsrc[:140])
+    except Exception as _eD:
+        check("D 段执行", False, f"{type(_eD).__name__}: {_eD}")
+
+    # ---- [E] 能力清单：本该生效的能力，一个都不许被静默弄没 ----
+    print("\n[E] 能力清单（本该生效的都还在）")
+    try:
+        import types as _types
+
+        # ① Notice 名字补丁的落点匹配规则（真实核心的模块路径形状）
+        class _Reg:
+            def list_plugins(self):
+                return {"a": _types.SimpleNamespace(
+                    __module__="core.plugin.builtin_plugins.kira-ai.main"),
+                    "b": _types.SimpleNamespace(
+                        __module__="core.plugin.builtin_plugins.agent.main")}
+
+        _hit = _bm._find_kirai_plugin(_Reg())
+        check("① Notice 名字补丁找得到落点（内置 kira-ai 插件）",
+              _hit is not None and "kira" in str(getattr(_hit, "__module__", "")),
+              str(getattr(_hit, "__module__", None)))
+
+        # ② 我们自己的能力解析器（3.0 的媒体/回复落点）
+        _cap = _bm._resolve_im_capability(a)
+        check("② IMCapability 解析得到（媒体/回复落点）", _cap is not None,
+              type(_cap).__name__ if _cap else "None")
+
+        # ③ 媒体：类型修正 + HTTP 安全网（两代都要挂上）
+        check("③ 媒体类型修正已挂（Record→3 / Video→2）",
+              bool(p._media_types_holders), str(list(p._media_types_holders)))
+        check("③ 媒体安全网已挂（HTTP 层）", bool(p._media_guards), str(len(p._media_guards)))
+
+        # ④ 3.0 增量（群名回填 / 引用自识别 / 输入中提前发）
+        _v3ok = True
+        try:
+            _v3ok = bool(p.v3.installed("qqo"))
+        except Exception:
+            _v3ok = False
+        if prof.is_v3:
+            check("④ 3.0 增量已装（群名回填 / 自识别引用 / 输入中）", _v3ok, "")
+        else:
+            print("      （2.x 不适用 3.0 增量，跳过 —— 它有各自的事件接管实现）")
+
+        # ⑤ 会话名回填：**3.0 形态**（只有异步 get_sessions）也必须可用
+        class _M3:
+            async def get_sessions(self, include_content=True):
+                return []
+
+        _inst = _bm.QQOfficialGroupBridge.__new__(_bm.QQOfficialGroupBridge)
+        _inst._session_api_warned = True
+        _snap = _run(_inst._sessions_snapshot(_M3()))
+        check("⑤ 会话名回填在 3.0 形态（异步 get_sessions）下可用", _snap == [], str(_snap))
+
+        # ⑥ 订阅位家族（成员家族任一开 ⇒ 订成员位；互动位始终在）
+        _i = _bm.QQOfficialGroupBridge.__new__(_bm.QQOfficialGroupBridge)
+        _i.member_notice_enabled = False
+        _i.join_request_notice_enabled = True
+        _i.admin_join_approval = False
+        _i.interaction_enabled = True
+        _b = _i._wanted_extra_bits()
+        check("⑥ 加群申请提醒开着 ⇒ 成员事件位必须订（否则该能力被静默弄没）",
+              bool(_b & _i._EXTRA_BIT_MEMBER) and bool(_b & _i._EXTRA_BIT_INTERACTION), hex(_b))
+    except Exception as _eE:
+        check("E 段执行", False, f"{type(_eE).__name__}: {_eE}")
+
     print("\n[矩阵] 功能 × 世代")
     for feat, where, ok, note in rows:
         print(f"  {feat:14s} {where:5s} {'✅' if ok else '❌'} {note}")

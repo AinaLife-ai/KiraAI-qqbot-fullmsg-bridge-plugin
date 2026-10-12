@@ -162,8 +162,14 @@ def main():
     check("★ 核心确实把 message_id 无条件渲染进提示词（空串会显示为空）",
           "[message_id: {str(msg.message_id)}]" in ki)
     mm2 = (CORE / "core/message_manager.py").read_text(encoding="utf-8")
-    check("★ 核心回填时失败会写空串（所以更不该教模型抄空 id）",
-          'message_id = ""' in mm2)
+    # ★ 2026-10-12（rc1 对账）：上游已不再写空串 ⇒ 这条从"断言核心行为"改为
+    #   "信息提示 + 断言**我们自己的不变量**"（我们始终用非空占位，与核心怎么写无关）。
+    print(f"      （参考：核心源码里{'仍会' if chr(39) + 'message_id = ""' + chr(39)[:0] + chr(39) or 'message_id = ""' in mm2 else '已不再'}写空串）"
+          if False else
+          "      （参考：核心回填失败的写法随版本变化；我们自己的合成事件**始终**用非空占位）")
+    _ours = (ROOT / "main.py").read_text(encoding="utf-8")
+    check("★ 我们的合成事件始终用**非空占位**（不依赖核心怎么写）",
+          'SYNTHETIC_MESSAGE_ID = "system"' in _ours)
 
     print()
     print("=" * 74)

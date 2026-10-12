@@ -132,7 +132,8 @@ def main():
     ad.client = type("C", (), {})()
     ad.client.api = API()
     ad._client_task = type("T", (), {"done": lambda s: False})()
-    ad._group_reply_ids = {"G1": "RAW_INCOMING"}
+    from _env import seed_reply_ids as _seed
+    _seed(ad, {"G1": "RAW_INCOMING"})
 
     class M:
         def get_adapter(self, n):

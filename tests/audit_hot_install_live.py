@@ -123,7 +123,8 @@ def main():
     adapter.get_client = lambda: client
     adapter._client_task = type("T", (), {"done": lambda s: False})()
     # 让"已连接"成立
-    adapter._group_reply_ids = {"G1": "RAW1"}
+    from _env import seed_reply_ids as _seed
+    _seed(adapter, {"G1": "RAW1"})
     print("      ✓ 适配器已连（client 有 _connection.state、解析表为空）")
 
     # ---------- ② 此刻才加载插件 ----------

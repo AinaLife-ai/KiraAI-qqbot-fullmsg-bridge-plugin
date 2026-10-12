@@ -125,12 +125,23 @@ def main():
     # ---------------- 3. 顺带确认：核心 buffer 没有去重 ----------------
     print("\n[3] 背景确认：核心 SessionBuffer 不去重（所以重复会直达模型）")
     mm = (CORE / "core/message_manager.py").read_text(encoding="utf-8")
-    buf = mm.split("class SessionBuffer:")[1].split("class SessionBufferManager")[0]
-    check("★ SessionBuffer.add 只是 append（无去重）",
-          "self.buffer.append(message)" in buf and "dup" not in buf.lower(),
-          buf[:200])
-    check("★ 所以去重必须由上游（我们/核心 dedup）负责 ⇒ 更要修好上游",
-          "message_dedup" in mm or True)
+    if "class SessionBuffer:" not in mm:
+        # ★ 2026-10-12（rc1 对账）：核心 v3.0.0-rc.1 把会话改为 SQLite 持久化
+        #   （`core/db/mixins/sessions.py`），`message_manager.SessionBuffer` 已不存在
+        #   ⇒ 这段"核心不去重"的取证不再适用，**自动跳过**（不影响插件任何行为）。
+        print("      skip 核心已改用 SQLite 会话持久化（SessionBuffer 不在 message_manager）"
+              "—— 该取证段跳过（仅取证，不影响插件行为）")
+        buf = None
+    else:
+        buf = mm.split("class SessionBuffer:")[1].split("class SessionBufferManager")[0]
+    if buf is None:
+        pass
+    else:
+        check("★ SessionBuffer.add 只是 append（无去重）",
+              "self.buffer.append(message)" in buf and "dup" not in buf.lower(),
+              buf[:200])
+        check("★ 所以去重必须由上游（我们/核心 dedup）负责 ⇒ 更要修好上游",
+              "message_dedup" in mm or True)
 
     print()
     print("=" * 76)
