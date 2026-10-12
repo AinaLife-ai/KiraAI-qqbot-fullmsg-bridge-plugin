@@ -127,6 +127,23 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "audit_interactions.py", "audit_wiring.py", "audit_button_policy.py",
           "audit_button_scenarios.py", "audit_generation_parity.py"]
 
+# ★ 2026-10-12（rc1 对账）：显式指定 KIRA_CORE 时，**统一把世代也告诉子套件** ——
+#   否则一批套件会按默认值（GEN="2"）去解析核心，出现
+#   `QQOfficialAdapter(info, queue)` 这类"用 2.x 构造打 3.0 核心"的假失败。
+import os as _os
+
+if _os.environ.get("KIRA_CORE"):
+    try:
+        sys.path.insert(0, str(HERE))
+        from _env import _gen_of as _go
+
+        _g = _go(pathlib.Path(_os.environ["KIRA_CORE"]))
+        if _g in ("2", "3"):
+            _os.environ["KIRA_CORE_GEN"] = _g
+            print(f"\n[env] KIRA_CORE={_os.environ['KIRA_CORE']} ⇒ KIRA_CORE_GEN={_g}")
+    except Exception as _e:
+        print(f"\n[env] 世代推导失败（忽略）: {_e}")
+
 rc = 0
 for suite in SUITES:
     print(f"\n########## {suite} ##########")

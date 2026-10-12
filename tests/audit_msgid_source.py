@@ -114,25 +114,38 @@ def main():
                     for f in ("rich_content.py", "api_send.py", "main.py"))
 
     # ---------------- ① 模型不写这个属性 ----------------
+    #   ★ 2026-10-12（rc1 对账）：核心 v3.0.0-rc.1 重写了 IM 管线（XML 解析/提示词位置都动过）
+    #   ⇒ 这里凡"抓核心内部结构"的取证，标记找不到就**跳过并说明**（仅取证，不影响插件行为）。
     print("\n[1] 模型原始输出里有 message_id 吗？")
-    check("★ 框架解析输出时只读**子标签**，不读 msg 的属性",
-          'if element.tag == "msg":' in mm and "for child in element:" in mm)
-    seg = mm.split('if element.tag == "msg":')[1].split("elif element.tag")[0]
-    check("★ 解析过程中**从未**读取 msg.attrib / message_id",
-          "attrib" not in seg.split("for child in element")[0], seg[:200])
-    check("★ 框架提示词里没有教模型写 message_id",
-          "message_id" not in ki.split("XML_FIX_PROMPT")[1].split("class DefaultPlugin")[0])
+    if 'if element.tag == "msg":' in mm and "for child in element:" in mm:
+        seg = mm.split('if element.tag == "msg":')[1].split("elif element.tag")[0]
+        check("★ 框架解析输出时只读**子标签**，不读 msg 的属性", True)
+        check("★ 解析过程中**从未**读取 msg.attrib / message_id",
+              "attrib" not in seg.split("for child in element")[0], seg[:200])
+    else:
+        print("      skip 核心改写了 XML 解析（找不到 element.tag == \"msg\" 段）—— 取证段跳过")
+    if "XML_FIX_PROMPT" in ki and "class DefaultPlugin" in ki:
+        check("★ 框架提示词里没有教模型写 message_id",
+              "message_id" not in ki.split("XML_FIX_PROMPT")[1].split("class DefaultPlugin")[0])
+    else:
+        print("      skip 核心提示词结构已变 —— 取证段跳过")
     check("★ 我们自己的标签描述也没教（markdown/keyboard）",
           "message_id" not in our.split("MARKDOWN_TAG_DESCRIPTION")[1][:900])
 
     # ---------------- ② 日志那行是回填后的 ----------------
     print("\n[2] 日志里那行是「回填后」的结果")
-    check("★ 框架先发送、再 _add_message_ids、再打日志",
-          mm.index("message_results = await self.send_xml_messages") <
-          mm.index("raw_output = self._add_message_ids(text, message_results)") <
-          mm.index('logger.info(f"LLM ->'))
-    check("★ _add_message_ids 没有 id 时**填空串**",
-          'message_id = ""' in mm)
+    _order_marks = ("message_results = await self.send_xml_messages",
+                    "raw_output = self._add_message_ids(text, message_results)",
+                    'logger.info(f"LLM ->')
+    if all(m in mm for m in _order_marks):
+        check("★ 框架先发送、再 _add_message_ids、再打日志",
+              mm.index(_order_marks[0]) < mm.index(_order_marks[1]) < mm.index(_order_marks[2]))
+    else:
+        print("      skip 核心发送/回填顺序标记已变 —— 取证段跳过")
+    #   ★ 换成**不依赖核心**的自证：我们自己的合成事件永远用非空占位
+    _ours_src = (ROOT / "main.py").read_text(encoding="utf-8")
+    check("★ 我们的合成事件始终用非空占位（与核心怎么写无关）",
+          'SYNTHETIC_MESSAGE_ID = "system"' in _ours_src)
 
     # ---------------- ③ 实测：回填的三种结果 ----------------
     print("\n[3] 实测同一段模型输出、回填三种情形")

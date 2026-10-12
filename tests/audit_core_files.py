@@ -133,7 +133,8 @@ def main():
     fake_task = type("T", (), {"done": lambda self: False})()
     adapter._client_task = fake_task
     try:
-        adapter._group_reply_ids = {"G1": "ROBOT1.0_realmsgid"}
+        from _env import seed_reply_ids as _seed
+        _seed(adapter, {"G1": "ROBOT1.0_realmsgid"})
     except Exception:
         pass
 

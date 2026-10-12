@@ -77,6 +77,29 @@ class FakeMgr:
             self._s[session].session_title = title
 
 
+class FakeMgrV3:
+    """模拟 **3.0（alpha 与 rc1）**：**没有** 2.x 的老方法，只有异步新接口。
+
+    （忠实照抄真实核心：rc1 里 `get_session_info`/`update_session_info` 已不存在。）
+    """
+
+    def __init__(self, sessions):
+        self._s = {f"{s.adapter_name}:{s.session_type}:{s.session_id}": s
+                   for s in sessions}
+        self.writes = []
+
+    async def get_sessions(self, include_content: bool = True):
+        return list(self._s.values())
+
+    async def get_session(self, session: str, **kw):
+        return self._s.get(session)
+
+    async def update_session(self, session, title=None, **kw):
+        self.writes.append((session, title))
+        if session in self._s and title is not None:
+            self._s[session].session_title = title
+
+
 def main():
     print("=" * 76)
     print("## 会话名回填：安全边界与效果实测")
@@ -174,20 +197,37 @@ def main():
     check("★ 私聊·陌生人**不挑**（官方无查资料接口）",
           ("dm", DM_STRANGE) not in picked)
 
-    print("\n[2] 真实跑一遍 worker，看写回了什么")
+    print("\n[2] 真实跑一遍 worker（**两套会话接口各一遍**），看写回了什么")
     plugin._backfill_worker = types.MethodType(
         B.QQOfficialGroupBridge._backfill_worker, plugin)
-    loop.run_until_complete(plugin._backfill_worker(
-        "qqo", adapter, mgr, picked))
-    print(f"      实际写入：{mgr.writes}")
-    written = dict(mgr.writes)
-    check("★ 群会话名字变成中文群名",
-          written.get(f"qqo:gm:{G_OPENID}") == "香里、周武", str(written))
-    check("★ 私聊昵称写成真名",
-          written.get(f"qqo:dm:{DM_KNOWN}") == "周武", str(written))
-    check("★ 没有写任何「已改过名」的会话",
-          not any(k.endswith(":gm:OTHER") or k.endswith(f":gm:{G_RAW}")
-                  for k, _ in mgr.writes), str(mgr.writes))
+
+    def _run_worker(mgr_obj, tag):
+        mgr_obj.writes.clear()
+        loop.run_until_complete(plugin._backfill_worker("qqo", adapter, mgr_obj))
+        written_ = dict(mgr_obj.writes)
+        print(f"      [{tag}] 实际写入：{mgr_obj.writes}")
+        check(f"★[{tag}] 群会话名字变成中文群名",
+              written_.get(f"qqo:gm:{G_OPENID}") == "香里、周武", str(written_))
+        check(f"★[{tag}] 私聊昵称写成真名",
+              written_.get(f"qqo:dm:{DM_KNOWN}") == "周武", str(written_))
+        check(f"★[{tag}] 没有写任何「已改过名」的会话",
+              not any(k.endswith(":gm:OTHER") or k.endswith(f":gm:{G_RAW}")
+                      for k, _ in mgr_obj.writes), str(mgr_obj.writes))
+
+    # 2.x：同步 get_session_info / update_session_info
+    _run_worker(mgr, "2.x 同步接口")
+    # 3.0（alpha 与 rc1）：异步 get_sessions / update_session（名字不同 ⇒ 兼容层必须换挡）
+    #   ★ 必须用**全新会话对象**：上面 2.x 那一遍已经把原对象的 title 改掉了，
+    #     复用会命中"已改过名 ⇒ 跳过"（那是正确的幂等行为，但测不到 3.0 这段）。
+    import copy as _copy
+    _fresh = []
+    for _s in sessions:
+        _c = _copy.copy(_s)
+        _c.session_title = ""
+        _fresh.append(_c)
+    mgr3 = FakeMgrV3(_fresh)
+    plugin._backfilled.clear()
+    _run_worker(mgr3, "3.0 异步接口")
     check("★ 没写入陌生人私聊",
           not any(k.endswith(f":dm:{DM_STRANGE}") for k, _ in mgr.writes),
           str(mgr.writes))
@@ -216,12 +256,28 @@ def main():
     plugin3._backfill_session_titles("qqo", adapter)
     check("★ 开关关闭时不挑任何会话", len(plugin3._backfilled) == 0)
 
-    print("\n[5] 核心接口一致（两版都支持）")
+    print("\n[5] 会话接口：两代都能用（★ 2026-10-12 rc1 对账）")
     sm = (CORE / "core/chat/session_manager.py").read_text(encoding="utf-8")
-    check("★ 有 get_session_info()", "def get_session_info" in sm)
-    check("★ 有 update_session_info(...)", "def update_session_info" in sm)
-    check("★ 会话名存在 chat_memory 的 title 字段",
-          '"title"' in sm or "'title'" in sm)
+    # 2.x：get_session_info / update_session_info（同步）
+    # 3.0（alpha 与 rc1 一致）：get_sessions / update_session（异步）
+    _has_v2 = ("def get_session_info" in sm) and ("def update_session_info" in sm)
+    _has_v3 = ("def get_sessions" in sm) and ("def update_session" in sm)
+    check("★ 核心提供会话列表+改名接口（2.x 的 get_session_info / 3.0 的 get_sessions 任一）",
+          _has_v2 or _has_v3, f"v2={_has_v2} v3={_has_v3}")
+    check("★ 会话名存在 title 字段", '"title"' in sm or "'title'" in sm)
+
+    # 我们的兼容层必须**同时**覆盖两套（否则又会出现"某世代静默空转"）
+    msrc = (ROOT / "main.py").read_text(encoding="utf-8")
+    check("★★ 兼容层两套接口名都在（get_session_info + get_sessions）",
+          "get_session_info" in msrc and "get_sessions" in msrc)
+    check("★★ 改名接口两套都在（update_session_info + update_session）",
+          "update_session_info" in msrc and "update_session" in msrc)
+    check("★★ 兼容层会 await 异步接口（inspect.isawaitable）",
+          "inspect.isawaitable" in msrc)
+    check("★ 回填入口是同步、真正读写在后台任务里（不阻塞）",
+          "def _backfill_session_titles" in msrc
+          and "async def _backfill_worker" in msrc
+          and "create_task" in msrc)
 
     print()
     print("=" * 76)

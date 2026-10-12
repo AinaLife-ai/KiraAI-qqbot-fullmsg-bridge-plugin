@@ -88,6 +88,22 @@ def botpy_parent() -> str:
         return "/nonexistent/botpy"
 
 
+def seed_reply_ids(adapter, mapping: dict, is_group: bool = True) -> None:
+    """把"被动回复锚点"表种到**该世代真正读取的地方**。
+
+    * 2.x：适配器实例上（`adapter._group_reply_ids`）；
+    * 3.0（alpha 与 rc1 同构）：能力对象上（`adapter.im._group_reply_ids`）。
+
+    桩对象若两种都没有，就退回挂适配器（老行为）。
+    """
+    attr = "_group_reply_ids" if is_group else "_direct_reply_ids"
+    im = getattr(adapter, "im", None)
+    if im is not None and hasattr(im, attr):
+        setattr(im, attr, dict(mapping))
+        return
+    setattr(adapter, attr, dict(mapping))
+
+
 def peers() -> pathlib.Path:
     """对照用的第三方插件源码目录（不存在时调用方应跳过）。"""
     env = os.environ.get("KIRA_PEERS")

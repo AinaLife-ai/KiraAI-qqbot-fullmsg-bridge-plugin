@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -2666,10 +2667,14 @@ class QQOfficialGroupBridge(BasePlugin):
         """按**实际开启的功能**算需要哪些位 —— 少订一个位就少一分被平台拒的风险。
 
         * 互动回调位（1<<26）：按钮点击的**命脉**（interaction_enabled）；
-        * 成员事件位（1<<24）：只有"成员进出通知"开着才需要。
+        * 成员事件位（1<<24）：**所有"群成员家族"事件**都要它 —— 不只是"成员进出通知" ✗
+          （2026-10-12 复审修正：**加群申请提醒**与**加群审批**同样靠这条事件线，
+           原实现只看成员进出 ⇒ 会出现"成员进出关着、加群申请提醒开着 ⇒ 该能力被静默弄没"）。
         """
         bits = 0
-        if self.member_notice_enabled:
+        if (self.member_notice_enabled
+                or getattr(self, "join_request_notice_enabled", False)
+                or getattr(self, "admin_join_approval", False)):
             bits |= self._EXTRA_BIT_MEMBER
         if self.interaction_enabled:
             bits |= self._EXTRA_BIT_INTERACTION
@@ -3795,45 +3800,104 @@ class QQOfficialGroupBridge(BasePlugin):
                 return val
         return default
 
+    # ------------------------------------------------------------------ #
+    # 会话名回填（★ 2026-10-12 兼容 3.0 rc1：会话 API 改名 + 变 async）
+    #
+    # 两代核心的会话接口（字段名相同，`Session` 都有
+    # `adapter_name/session_type/session_id/session_title`）：
+    #   * 2.x：`mgr.get_session_info()` / `mgr.update_session_info(sid, title=…)` —— **同步**；
+    #   * 3.0（alpha 与 rc1 一致）：`await mgr.get_sessions()` /
+    #     `await mgr.update_session(sid, title=…)` —— **异步**。
+    # ⇒ 用下面两个小助手抹平（同步/异步都兼容），回填逻辑本身不变。
+    # ------------------------------------------------------------------ #
+    async def _sessions_snapshot(self, mgr):
+        """取会话列表（兼容两代）；拿不到返回 None。"""
+        for meth in ("get_session_info", "get_sessions"):
+            fn = getattr(mgr, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                raw = fn()
+                if inspect.isawaitable(raw):
+                    raw = await raw
+            except Exception as exc:
+                # ★ 老接口在但**调用失败**（换世代/桩对象/权限）⇒ 继续试下一个，
+                #   而不是直接放弃 —— 否则又会变成"某世代静默空转"。
+                logger.debug("[QQBOT-BRIDGE] 读取会话列表失败（%s）: %s", meth, exc)
+                continue
+            return raw if isinstance(raw, list) else None
+        # ★ 两个接口都没有 ⇒ 数量为 0 的"静默空转"最难查（本次 rc1 对账就是这么发现的）
+        #   ⇒ 打**一次性**告警：未来核心若再改接口名，日志里立刻看得见。
+        if not getattr(self, "_session_api_warned", False):
+            self._session_api_warned = True
+            logger.warning(
+                "[QQBOT-BRIDGE] 找不到会话列表接口（既没有 get_session_info，也没有 get_sessions）"
+                " ⇒ 会话名回填暂停。若你用的是**新核心**、且这里确实换了接口名，请反馈；"
+                "不影响收发消息与其它功能")
+        return None
+
+    async def _session_snapshot(self, mgr, sid: str):
+        """取单个会话（兼容两代）；拿不到返回 None。"""
+        for meth in ("get_session_info", "get_session"):
+            fn = getattr(mgr, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                raw = fn(sid)
+                if inspect.isawaitable(raw):
+                    raw = await raw
+                return raw
+            except Exception:
+                continue
+        return None
+
+    async def _set_session_title(self, mgr, sid: str, title: str) -> bool:
+        """改会话标题（兼容两代 + 同步/异步）。"""
+        for meth in ("update_session_info", "update_session"):
+            fn = getattr(mgr, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn(sid, title=str(title))
+                if inspect.isawaitable(res):
+                    await res
+                return True
+            except Exception as exc:
+                logger.debug("[QQBOT-BRIDGE] 写会话标题失败（%s）: %s", meth, exc)
+                continue
+        return False
+
     def _backfill_session_titles(self, name: str, adapter, force: bool = False) -> None:
-        """把**已存在**会话的名字补成中文（群名 / 私聊昵称）。
+        """把**已存在**会话的名字补成中文（群名 / 私聊昵称）—— 同步入口，后台执行。
 
-        ★ 解决什么：会话名在**建立那一刻**就定死了。以前装插件时群名还拉不到
-        （或那时还没这功能），于是名字里存的就是那串 openid，一直显示到现在
-        （用户在 WebUI 会话列表里看到的就是这些）。
-
-        ★ 数据在哪：`data/memory/chat_memory.json` 的 `title` 字段；
-        读全部会话用 `session_mgr.get_session_info()`（无参），
-        改写用 `session_mgr.update_session_info(sid, title=...)` —— 两版核心接口一致。
-
+        ★ 数据在哪：会话表/chat_memory 的 `title` 字段（`session_title`）。
         ★ 安全边界（用户明确要求）：
           * **只改「名字还是 openid」的会话** —— 用户自己改过名的一律不碰；
-          * **只群聊拉群名**；私聊**只在通讯录里认得这个人**时才补昵称
-            （官方没有任何"按 openid 查资料"的接口，好友/单聊事件也不带昵称）；
+          * **只群聊拉群名**；私聊**只在通讯录里认得这个人**时才补昵称；
           * 拉不到就**保持原样，绝不编造**；
-          * 只跑**一次**（`_backfilled` 标记），不反复拉；
+          * 只跑**一次**（`_backfilled` 标记），有新名字时可由巡检 `force=True` 重跑；
           * 全程后台任务 + 复用群名缓存的分批限流，不阻塞、不撞限流。
         """
         if not getattr(self, "backfill_session_titles", True):
             return
-        # ★ 2026-10-10（用户提问）：原来这里是"一辈子只跑一次"——
-        #   之后新学到的群名就永远回填不到 WebUI 会话标题了。
-        #   现在 `force=True`（由巡检在"有新名字"时触发）可以重跑；
-        #   安全边界不变：仍然只改"标题还是 openid"的会话。
         if name in self._backfilled and not force:
             return
         self._backfilled.add(name)
+        mgr = getattr(self.ctx, "session_mgr", None)
+        if mgr is None:
+            return
         try:
-            mgr = getattr(self.ctx, "session_mgr", None)
-            if mgr is None or not hasattr(mgr, "get_session_info"):
-                return
-            sessions = mgr.get_session_info()
-        except Exception as exc:
-            logger.debug("[QQBOT-BRIDGE] 读取会话列表失败（忽略）: %s", exc)
-            return
-        if not isinstance(sessions, list):
-            return
+            asyncio.get_running_loop().create_task(
+                self._backfill_worker(name, adapter, mgr))
+        except RuntimeError:
+            pass
 
+    async def _backfill_worker(self, name: str, adapter, mgr) -> None:
+        """后台把会话名补成中文：群聊走群名缓存，私聊走通讯录。"""
+        fixed = 0
+        sessions = await self._sessions_snapshot(mgr)
+        if not sessions:
+            return
         todo = []
         for s in sessions:
             try:
@@ -3851,7 +3915,6 @@ class QQOfficialGroupBridge(BasePlugin):
                 if stype == "gm":
                     todo.append(("gm", sid))
                 elif stype == "dm":
-                    # 私聊：只有通讯录里认得这个人才补（官方无查资料接口）
                     nick = None
                     try:
                         if self.identities is not None:
@@ -3868,15 +3931,6 @@ class QQOfficialGroupBridge(BasePlugin):
             "[QQBOT-BRIDGE] %s: 发现 %d 个会话的名字还是乱码，开始后台补成中文"
             "（只改这类，已改过名的不动）", name, len(todo),
         )
-        try:
-            asyncio.get_running_loop().create_task(
-                self._backfill_worker(name, adapter, mgr, todo))
-        except RuntimeError:
-            pass
-
-    async def _backfill_worker(self, name: str, adapter, mgr, todo: list) -> None:
-        """后台把会话名补成中文：群聊走群名缓存，私聊走通讯录。"""
-        fixed = 0
         client = None
         try:
             client = adapter.get_client()
@@ -3885,11 +3939,8 @@ class QQOfficialGroupBridge(BasePlugin):
         for stype, sid in todo:
             try:
                 new_title = None
-                # ★ 会话 id（qq:gm:<gid> / qq:dm:<openid>）与缓存/通讯录的 key
-                #   （裸 id）不是一回事 —— 统一取裸 id，否则永远查不到（老 bug）。
                 bare = self._bare_id_from_session(sid) or str(sid)
                 if stype == "gm":
-                    # 先看缓存（裸 id，兼容旧写法的会话 id）；没有就排队拉一次
                     new_title = (self.group_names.lookup(name, bare)
                                  or self.group_names.lookup(name, sid))
                     if not new_title and client is not None:
@@ -3908,14 +3959,14 @@ class QQOfficialGroupBridge(BasePlugin):
                 key = f"{name}:{stype}:{sid}"
                 # 二次确认：写之前再看一眼，确保名字仍是 openid（防覆盖用户改动）
                 try:
-                    cur = mgr.get_session_info(key)
+                    cur = await self._session_snapshot(mgr, key)
                     cur_title = str(getattr(cur, "session_title", "") or "")
                     if cur_title and cur_title != sid:
                         continue
                 except Exception:
                     pass
-                mgr.update_session_info(key, title=str(new_title))
-                fixed += 1
+                if await self._set_session_title(mgr, key, new_title):
+                    fixed += 1
             except Exception as exc:
                 logger.debug("[QQBOT-BRIDGE] 会话名回填失败（%s）: %s", sid, exc)
         if fixed:
