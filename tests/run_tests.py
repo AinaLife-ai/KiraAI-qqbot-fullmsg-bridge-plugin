@@ -125,7 +125,8 @@ SUITES = ["test_version_bump.py", "test_consistency.py", "test_bridge.py",
           "audit_llm_stream_bridge.py", "audit_sticker.py",
           "audit_media_guard.py", "audit_voice_trim.py", "audit_keyboard_flow.py",
           "audit_interactions.py", "audit_wiring.py", "audit_button_policy.py",
-          "audit_button_scenarios.py", "audit_generation_parity.py"]
+          "audit_button_scenarios.py", "audit_generation_parity.py",
+          "audit_button_limits_live.py"]
 
 # ★ 2026-10-12（rc1 对账）：显式指定 KIRA_CORE 时，**统一把世代也告诉子套件** ——
 #   否则一批套件会按默认值（GEN="2"）去解析核心，出现
