@@ -733,6 +733,10 @@ class QQOfficialGroupBridge(BasePlugin):
 
         self.dedup = MessageDedup(ttl=self.dedup_ttl)
         self.identities = IdentityStore(path=_identity_path() if self.remember_nicknames else None)
+        # ★ 2026-10-13：清掉历史污染（例如 `system → 未知用户(system)`）——
+        #   判据很保守：**名字等于我们自己的占位** 或 **uid 是哨兵** ⇒ 删；
+        #   真人真名一律不动。
+        self._purge_junk_identities()
         # ---- 按钮策略账本（v1.6.32）----
         #: 按钮策略段（schema 的 section_button）；旧配置没有该段时退回 basic
         button = cfg.get("section_button") or {}
@@ -1284,6 +1288,13 @@ class QQOfficialGroupBridge(BasePlugin):
             sender = getattr(msg, "sender", None)
             uid = str(getattr(sender, "user_id", "") or "")
             name = str(getattr(sender, "nickname", "") or "")
+            # ★ 2026-10-13 线上日志：**我们自己的"截止通知"**（sender_id="system"）也被学了名，
+            #   通讯录里多出 `system → 未知用户(system)` 这种垃圾 ⇒ 跳过非用户来源：
+            #     * 哨兵 uid（system/unknown/空）；
+            #     * 我们自己造的合成消息（message_id == SYNTHETIC_MESSAGE_ID）。
+            if self._is_non_user_uid(uid) or \
+                    str(getattr(msg, "message_id", "") or "") == self.SYNTHETIC_MESSAGE_ID:
+                return
             adapter_name = str(getattr(getattr(event, "adapter", None), "name", "") or "")
             session = getattr(event, "session", None)
             scope = "gm" if str(getattr(session, "session_type", "")) == "gm" else "dm"
@@ -1309,6 +1320,38 @@ class QQOfficialGroupBridge(BasePlugin):
                             "按钮点击/查账从此能显示真名", learned[0][1], learned[0][0][:12])
         except Exception as exc:                      # noqa: BLE001
             logger.debug("[QQBOT-BRIDGE] 学昵称失败（忽略）: %s", exc)
+
+    #: 非用户来源的哨兵 uid（我们自己的系统通知、占位等）
+    _NON_USER_UIDS = ("", "system", "unknown", "none", "null", "0")
+
+    def _is_non_user_uid(self, uid: str) -> bool:
+        """是不是"不是人"的来源（系统通知/占位）——这类不该进通讯录、也不该带身份后缀。"""
+        u = str(uid or "").strip().lower()
+        return (not u) or u in self._NON_USER_UIDS or u.startswith("system")
+
+    def _purge_junk_identities(self) -> None:
+        """删掉通讯录里的**历史垃圾**（占位名 / 哨兵 uid）。保守：真人真名不动。"""
+        try:
+            store = getattr(self.identities, "_store", None)
+            if not isinstance(store, dict):
+                return
+            junk = []
+            for k, v in list(store.items()):
+                name = str((v or [""])[0] or "")
+                uid = str(k).split("|")[-1]
+                if name.startswith("未知用户(") or self._is_non_user_uid(uid):
+                    junk.append(k)
+            for k in junk:
+                store.pop(k, None)
+            if junk:
+                try:
+                    self.identities._dirty = True
+                except Exception:
+                    pass
+                logger.info("[QQBOT-BRIDGE] 通讯录清理：删除 %d 条历史脏数据（占位名/系统来源）",
+                            len(junk))
+        except Exception as exc:
+            logger.debug("[QQBOT-BRIDGE] 通讯录清理异常（忽略）: %s", exc)
 
     def _is_self_uid(self, uid: str) -> bool:
         """是不是机器人自己的 openid（自己的名字没必要学进通讯录）。"""
@@ -1909,8 +1952,14 @@ class QQOfficialGroupBridge(BasePlugin):
             #   * 查不到 ⇒ 用 **openid 原文**做占位：`未知用户(<openid>)`
             #     （用户指定：openid 是我们**确实拥有**的真实标识、可核对；
             #      比"派生出来的短别名"实在，也绝不会被误认成真名。）
-            _from_store = bool(_nick)
-            if not _nick:
+            # ★ 2026-10-13 线上日志：截止通知（sender_id="system"）被当成"某个成员"——
+            #   正文末尾多出 `（未知用户(system)）`、日志里还多学了一条垃圾名。
+            #   系统来源 ⇒ 昵称就叫「系统」，并且**不追加身份后缀**。
+            _sys_sender = self._is_non_user_uid(str(sender_id))
+            _from_store = True if _sys_sender else bool(_nick)
+            if _sys_sender:
+                _nick = "系统"
+            elif not _nick:
                 _nick = f"未知用户({sender_id})"
             _gname = ""
             if is_group:
@@ -1934,7 +1983,9 @@ class QQOfficialGroupBridge(BasePlugin):
             #   （它自己的接收日志也是 `None`）⇒ 只填字段不够，**正文里也带上名字**，
             #   模型才一定看得到"是谁"},
             _text2 = str(text)
-            if _nick and _nick not in _text2:
+            if _sys_sender:
+                pass                      # 系统通知：正文原样，不加"是谁"
+            elif _nick and _nick not in _text2:
                 if "用户点击了" in _text2:
                     _text2 = _text2.replace("用户点击了", f"{_nick} 点击了", 1)
                 else:

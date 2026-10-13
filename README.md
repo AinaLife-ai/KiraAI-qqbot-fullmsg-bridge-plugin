@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.46
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.47
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,30 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.47</b> — 修「系统截止通知被当成某个成员」+ 清理通讯录历史脏数据</summary>
+
+### 用户日志发现的两处不符合预期（都在"系统通知"这条线上）
+1. **截止通知正文末尾多了 `（未知用户(system)）`** ✗ —— 那是"身份写进正文"规则被套到了**系统来源**上；
+2. **学名钩子把 `system` 当人学进了通讯录** ✗ —— 日志原文：
+   `已从消息里学到昵称：未知用户(system)（uid system…）`。
+
+### 修法
+* 新增哨兵判定 `_is_non_user_uid()`（`system` / `unknown` / 空 …）；
+* **学名钩子**跳过：哨兵 uid **或** 我们自己的合成消息（`message_id == SYNTHETIC_MESSAGE_ID`）；
+* **合成通知**：系统来源 ⇒ 昵称显示为「**系统**」，正文**不追加**"（是谁）"后缀；
+* **历史脏数据清理**：启动时删掉"占位名（`未知用户(…)`）/ 哨兵 uid"的条目
+  （**真人真名一律不动**）；
+* 套件 `audit_button_limits_live.py` 新增 **[6] 系统截止通知** 四条断言（含脏数据清理）。
+
+### 同一份日志里**符合预期**的部分（供对照）
+* 按钮点击逐次转达 + 计数正确（`（第 2 次；此人第 1 次）`）✓；
+* 超出/截止的点击**不再触发**（前置版本已实机验证）✓；
+* **动图 WebP 被平台拒（850019）后自动转 GIF 并成功直传** ✓（媒体安全网按预期降级）；
+* 截止通知让模型"空回"（`<msg />`）不打扰群 ✓。
+
+</details>
+
+<details>
 <summary><b>v1.6.46</b> — 实机验证「截止后真的不再触发」+ 补「成员家族」订阅位漏订</summary>
 
 ### 用户关切：到上限 / 已截止之后，再按按钮会不会**又触发**

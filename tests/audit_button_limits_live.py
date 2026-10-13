@@ -158,6 +158,60 @@ async def main():
     await click("W3", "c3", bid="k1")
     chk("reset 重开后**恢复触发**", len(delivered) == _n6 + 1, f"{_n6} → {len(delivered)}")
 
+    # ---------------- [6] 系统截止通知：不得被当成「某个成员」 ----------------
+    print("\n[6] 系统截止通知（真实日志发现的问题）")
+    # 本段用**干净的桩环境**（前面的段落改过各自的对象）
+    a6 = T.make_adapter()
+    p6 = T.make_plugin(a6)
+    await p6._tick()
+
+    class _SYSSender:
+        user_id = "system"
+        nickname = "未知用户(system)"
+
+    class _SYSMsg:
+        sender = _SYSSender()
+        chain = []
+        message_id = "system"
+
+    class _SYSEv:
+        message = _SYSMsg()
+        adapter = type("A", (), {"name": "qqo", "platform": "QQ Official"})()
+        session = type("S", (), {"session_type": "gm", "session_id": "qq:gm:GRP"})()
+
+    _before = dict(getattr(p6.identities, "_store", {}) or {})
+    p6._learn_peer_from_event(_SYSEv())
+    _after = dict(getattr(p6.identities, "_store", {}) or {})
+    chk("系统来源（sender_id=system / 合成消息）**不进通讯录**",
+        not p6.identities.lookup_any("system") and len(_after) == len(_before),
+        f"lookup={p6.identities.lookup_any('system')!r}")
+
+    # 6.2 真发一条"系统截止通知"，看它落在事件里长什么样
+    _evs = []
+    _orig = a.publish
+    a6.publish = lambda ev: _evs.append(ev) or True
+    try:
+        p6.publish_synthetic_event(target_id="GRP", sender_id="system", is_group=True,
+                                  text="[按钮截止] 「系统通知测试」已到截止时间：共 1 次点击")
+    finally:
+        a6.publish = _orig
+    _ev = _evs[-1] if _evs else None
+    _txt = str(getattr(getattr(_ev, "message", None), "message_str", "") or "")
+    _nick = str(getattr(getattr(getattr(_ev, "message", None), "sender", None), "nickname", "") or "")
+    chk("截止通知正文**不含**「未知用户(system)」这类后缀",
+        _ev is not None and "未知用户(" not in _txt and "）" not in _txt.split("：")[-1][:40],
+        _txt[:120])
+    chk("截止通知的昵称是「系统」（不是某个成员）", _nick == "系统", repr(_nick))
+
+    # 6.3 历史脏数据清理：占位名 / 哨兵 uid 删掉；真人真名保留
+    p6.identities.remember("qqo", "gm", "system", "未知用户(system)")
+    p6.identities.remember("qqo", "gm", "REAL-UID-X", "周武")
+    p6._purge_junk_identities()
+    chk("历史脏数据（占位名/哨兵）被清理，真人真名保留",
+        p6.identities.lookup_any("system") is None
+        and p6.identities.lookup_any("REAL-UID-X") == "周武",
+        f"system={p6.identities.lookup_any('system')!r} real={p6.identities.lookup_any('REAL-UID-X')!r}")
+
     print(f"\n结果：{PASS[0]} passed, {len(FAIL)} failed" + (f" ｜ 失败：{FAIL}" if FAIL else ""))
     return 1 if FAIL else 0
 
