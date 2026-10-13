@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.45
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.46
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,30 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.46</b> — 实机验证「截止后真的不再触发」+ 补「成员家族」订阅位漏订</summary>
+
+### 用户关切：到上限 / 已截止之后，再按按钮会不会**又触发**
+用**真实链路**（真策略引擎 + 真 InteractionBridge + 真发送路径）实机验证，两代核心各跑一遍：
+
+| 场景 | 结果 |
+|---|---|
+| 名额满（max）后：**新人再点** / **已点过的人再点** | ✅ **都不再转给模型**（超额记账 `overflow=3`）|
+| 到期（`ttl`/`until` 过后）再点 | ✅ 不再触发 |
+| 手动 `close` 后再点 | ✅ 不再触发 |
+| ★ **同一会话同一 `button_id` 有两条账**（旧的还开着、新的已满）| ✅ 仍**不触发**（不会回退到旧账去"重新触发"）|
+| `extend` 加名额 / `reset` 重开 | ✅ **应当恢复**触发（证明不是永久锁死）|
+| 查账显示 | ✅ 显示「已截止」，不再是"进行中" |
+
+⇒ 已固化为常驻套件 `tests/audit_button_limits_live.py`（9 项，进全量矩阵）。
+
+### 顺带修掉的真回归：成员家族订阅位漏订
+`_wanted_extra_bits()` 原来只按"成员进出通知"判断 ⇒
+**加群申请提醒 / 加群审批**（同属成员事件家族 `1<<24`）在"成员进出关着"时**收不到事件** ✗
+⇒ 已改为**家族任一开启即订位**，并加守卫（代际对齐套件 [E] 段能力清单）。
+
+</details>
+
+<details>
 <summary><b>v1.6.45</b> — 对账 KiraAI v3.0.0-rc.1：修「会话名回填」在 3.0 全系列空转（按能力兼容，不绑版本）</summary>
 
 ### 背景
