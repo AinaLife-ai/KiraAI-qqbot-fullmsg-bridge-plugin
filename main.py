@@ -4203,7 +4203,9 @@ class QQOfficialGroupBridge(BasePlugin):
             )
             return
 
-        async def _send_message(target_id, send_message_obj, is_group):
+        async def _send_message(target_id, send_message_obj, is_group, *args, **kwargs):
+            # ★ v1.6.48：签名**原样透传** —— 框架给这个发送落点加参数/换顺序时
+            #   不会再 TypeError（acc 那次线上事故就是同一个坑：把签名写死）。
             # ★★★ 核心的 media_elements 白名单只有 (File, Image)，
             #   **漏掉了 Record / Video**（两代都一样）⇒ 语音/视频根本进不了
             #   发送链，还会被 `_text_content` 填成 `[Unsupported message element]`。
@@ -4238,7 +4240,8 @@ class QQOfficialGroupBridge(BasePlugin):
             send_message_obj, _swapped = coerce_media_chain(
                 send_message_obj, self.sticker_tags)
             try:
-                return await _send_message_inner(target_id, send_message_obj, is_group)
+                return await _send_message_inner(target_id, send_message_obj, is_group,
+                                                 *args, **kwargs)
             finally:
                 restore_media_chain(send_message_obj, _swapped)
                 if _pr is not None and _pr_tok is not None:
@@ -4247,7 +4250,7 @@ class QQOfficialGroupBridge(BasePlugin):
                     except Exception:
                         pass
 
-        async def _send_message_inner(target_id, send_message_obj, is_group):
+        async def _send_message_inner(target_id, send_message_obj, is_group, *args, **kwargs):
             # ★ 真要发消息了 ⇒ 取消这条会话上还没到点的「输入中」，
             #   免得"回复都出来了才冒出正在输入"（用户会觉得怪）。
             if not is_group:
@@ -4317,7 +4320,7 @@ class QQOfficialGroupBridge(BasePlugin):
                     _t2 = PENDING_KB.set(None)
                     res_media = None
                     try:
-                        res_media = await original(target_id, _media_chain, is_group)
+                        res_media = await original(target_id, _media_chain, is_group, *args, **kwargs)
                     except Exception as _exc:
                         logger.warning(
                             "[QQBOT-BRIDGE] 拆分后**媒体那条**发送失败（%s: %s）——"
@@ -4329,7 +4332,7 @@ class QQOfficialGroupBridge(BasePlugin):
                     # 第二条：正文 + 按钮（不带引用，避免两条都挂同一条引用）
                     _t3 = QUOTE_REF.set(None)
                     try:
-                        res_kb = await original(target_id, _rest_chain, is_group)
+                        res_kb = await original(target_id, _rest_chain, is_group, *args, **kwargs)
                     finally:
                         QUOTE_REF.reset(_t3)
                     if res_kb is not None and bool(getattr(res_kb, "ok", True)):
@@ -4337,7 +4340,7 @@ class QQOfficialGroupBridge(BasePlugin):
                     if res_media is not None and bool(getattr(res_media, "ok", True)):
                         return res_media
                     return res_kb if res_kb is not None else res_media
-                result = await original(target_id, send_message_obj, is_group)
+                result = await original(target_id, send_message_obj, is_group, *args, **kwargs)
             finally:
                 QUOTE_REF.reset(ref_token)
                 PENDING_KB_SPEC.reset(_spec_token)   # 审计修复：这条路径原来漏了重置

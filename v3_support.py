@@ -127,12 +127,15 @@ class V3Enhancer:
         #     不接管、不造事件、不改任何返回值 —— 纯粹"旁听"。
         original_handle = getattr(im, "_handle_message", None)
         if callable(original_handle) and not getattr(original_handle, _HANDLE_MARK, False):
-            async def handle(message, is_group, force_mention, _orig=original_handle):
+            async def handle(message, is_group, force_mention, *args,
+                             _orig=original_handle, **kwargs):
+                # ★ v1.6.48：签名**原样透传**（核心给 _handle_message 加参数也不会炸）
                 try:
                     enhancer._learn_nickname(message, is_group)
                 except Exception:
                     pass                       # 学不到昵称绝不影响消息处理
-                result = await _orig(message, is_group, force_mention)
+                result = await _orig(message, is_group, force_mention,
+                                     *args, **kwargs)
                 # ★★ 2026-10-10（用户要求）：「输入中」提到**消息刚到时**发 ——
                 #   核心有**合并缓冲**（把连发的几条合成一轮），旧挂点要等缓冲结束、
                 #   模型真正开始才发 ⇒ 感觉慢半拍。这里消息一落地就踢一脚

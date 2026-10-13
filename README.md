@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.47
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.48
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,26 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.48</b> — 接管点签名**原样透传**（核心给发送落点加参数也不会把消息挡死）</summary>
+
+### 背景
+KiraAI **v3.0.0-rc.2** 给 `MessageDeliveryService.send_message_chain` 加了 `bot=`（把原来的
+`self_id=` 换名），并同步改了转发它的弃用入口与 `PluginContext`。这直接打死了一批
+"把框架方法签名写死"的插件 —— 而且这类落点一旦出错，**消息根本发不出去**。
+
+顺着这条线把本插件体检了一遍，发现两处**落点包装**同样把签名写死了：
+
+* `_send_message(target_id, chain, is_group)`（adapter / 能力对象上的**发送落点**）
+* `_handle_message(message, is_group, force_mention)`（旁听昵称学习用）
+
+### 修法
+两处都改成**签名原样透传**：只按位置取自己要的参数，其余 `*args/**kwargs` 一路穿到原实现
+（`_send_message_inner` 同步接收并转发；拆分"媒体 / 按钮"两条时也一并带上）。
+以后核心再加参数、或改传参顺序，都不会再触发 TypeError。
+
+### 验证
+`python3 tests/run_tests.py` 全套件通过（含 `test_version_bump` 的版本一致性检查）。
+
 <summary><b>v1.6.47</b> — 修「系统截止通知被当成某个成员」+ 清理通讯录历史脏数据</summary>
 
 ### 用户日志发现的两处不符合预期（都在"系统通知"这条线上）
