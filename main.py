@@ -100,6 +100,7 @@ if not _HOOKS_AVAILABLE:
 from core.chat import Group, User
 from core.chat.message_elements import At, File, Image, Reply, Text
 from core.chat.message_utils import KiraIMMessage, KiraMessageEvent, KiraIMSentResult
+from gen3_compat import elements_kw
 
 from core_profiles import (
     GEN_UNKNOWN,
@@ -2004,7 +2005,7 @@ class QQOfficialGroupBridge(BasePlugin):
             try:
                 event = KiraMessageEvent(
                     adapter=adapter.info,
-                    message_types=list(types),
+                    **elements_kw(KiraMessageEvent, list(types)),
                     message=KiraIMMessage(
                         timestamp=ts,
                         group=Group(

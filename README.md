@@ -1,4 +1,4 @@
-# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.48
+# KiraAI-qqbot-fullmsg-bridge-plugin/QQ官方bot增强 v1.6.49
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI-qqbot-fullmsg-bridge-plugin)
 
@@ -600,6 +600,11 @@ KIRA_CORE=/path/to/kira_fw BOTPY_PATH=/path/to/botpy python3 tests/smoke_real_co
 ## 更新日志
 
 <details open>
+<summary><b>v1.6.49</b> — 兼容 3.0 GA 弃用面（事件构造改双世代探测）</summary>
+
+  - 事件构造不再直传 `message_types=`（GA 弃用）——新增 `gen3_compat.py`，按 dataclasses 探测字段名（3.0=supported_elements，2.x=message_types）；适配器元素类型改走 `get_capability(IMCapability).get_message_metadata()`（2.x 自动回落旧属性）。
+  - 行为零变化；2.x/3.0 GA 双世代全套件通过。
+
 <summary><b>v1.6.48</b> — 接管点签名**原样透传**（核心给发送落点加参数也不会把消息挡死）</summary>
 
 ### 背景
