@@ -266,6 +266,7 @@ class MessageDedup:
 #: 把通讯录做成"按人共享"（不再按 gm/dm 隔离），群里认识过的人私聊也认得。
 #: 每次见到新名字就覆盖 ⇒ **改名自动跟随**。
 from identity_shared import IdentityStore  # noqa: E402  (同目录模块)
+from gen3_compat import adapter_supported_elements, elements_kw  # noqa: E402  (同目录模块)
 
 # --------------------------------------------------------------------------- #
 # @ 标记解析 / 机器人自我身份
@@ -977,7 +978,7 @@ def build_event(
     ts = int(now if now is not None else time.time())
     event = KiraMessageEvent(
         adapter=adapter.info,
-        message_types=adapter.message_types,
+        **elements_kw(KiraMessageEvent, adapter_supported_elements(adapter)),
         message=KiraIMMessage(
             timestamp=ts,
             group=Group(group_id=target_id,
@@ -1144,7 +1145,7 @@ def build_member_event(*, adapter, body: dict, event_name: str, Group, User,
     try:
         event = KiraMessageEvent(
             adapter=adapter.info,
-            message_types=list(getattr(adapter, "message_types", []) or ["text"]),
+            **elements_kw(KiraMessageEvent, adapter_supported_elements(adapter, fallback=["text"])),
             message=KiraIMMessage(
                 timestamp=ts,
                 group=Group(group_id=group_id, group_name=group_id),
