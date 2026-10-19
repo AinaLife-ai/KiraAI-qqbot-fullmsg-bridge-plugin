@@ -430,5 +430,30 @@
         "hint": "最多同时记多少条按钮策略（超出按最早的淘汰）。"
       }
     }
+  },
+  "section_mute": {
+    "type": "section",
+    "name": "禁言感知",
+    "collapsed": true,
+    "fields": {
+      "enabled": {
+        "name": "启用机器人禁言感知",
+        "type": "switch",
+        "default": true,
+        "hint": "官方 bot 没有 NapCat 的 group_ban 通知事件；发送被拒时会返回 40054002「机器人被禁言」。开启后，检测到该错误就在下一条群消息里注入 [System …] 提示模型（对齐 NapCat 的禁言感知），并在发送恢复后提示已解除。只做状态提示，不拦截发送、不丢消息。"
+      },
+      "ttl": {
+        "name": "禁言状态保留（秒）",
+        "type": "int",
+        "default": 600,
+        "hint": "官方错误不返回禁言时长，这里按默认时长保留状态；期间每次失败会刷新。发送一旦成功立即解除。"
+      },
+      "notice_interval": {
+        "name": "提示最小间隔（秒）",
+        "type": "int",
+        "default": 120,
+        "hint": "同一群禁言期间，最多每隔这么久往消息链里注入一次提示，避免刷屏占上下文。"
+      }
+    }
   }
 }

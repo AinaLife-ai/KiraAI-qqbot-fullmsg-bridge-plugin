@@ -205,6 +205,31 @@ class ApiSendPatcher:
             v = args[0]
         return str(v or "")
 
+    async def _call_orig(self, orig: Any, args: tuple, kwargs: dict,
+                         target_id: str, is_group: bool):
+        """调用底层 API，并把「被禁言 / 已解除」状态回写插件（不吞异常）。
+
+        官方 bot 没有 group_ban notice；`40054002（机器人被禁言）` 只会以
+        发送异常的形式出现 —— 这里是唯一能可靠拿到它的地方。
+        """
+        try:
+            result = await orig(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                note = getattr(self.plugin, "_note_send_failure", None)
+                if callable(note):
+                    note(target_id, is_group, exc)
+            except Exception:
+                pass
+            raise
+        try:
+            note = getattr(self.plugin, "_note_send_success", None)
+            if callable(note):
+                note(target_id, is_group)
+        except Exception:
+            pass
+        return result
+
     async def _send(self, adapter: Any, orig: Any, is_group: bool, flags: dict,
                     *args, _client: Any = None, **kwargs):
         # 作用域由 install 时的白名单（id(api)）保证 —— 补丁只挂在登记过的 api 上。
@@ -411,11 +436,12 @@ class ApiSendPatcher:
                 self.logger.debug("[QQBOT-BRIDGE] 流式消息接管失败（回退普通发送）: %s", exc)
 
         # ④ 发送（markdown 失败 → 退纯文本）
+        _target = self._target_of(args, kwargs, is_group)
         if not target_md:
-            result = await orig(*args, **kwargs)
+            result = await self._call_orig(orig, args, kwargs, _target, is_group)
         else:
             try:
-                result = await orig(*args, **kwargs)
+                result = await self._call_orig(orig, args, kwargs, _target, is_group)
             except Exception as exc:
                 if not looks_like_md_reject(exc):
                     raise
@@ -432,7 +458,7 @@ class ApiSendPatcher:
                         str(exc)[:120],
                         "并剥掉 @ 标记" if auto_md else "",
                     )
-                result = await orig(*args, **fallback)
+                result = await self._call_orig(orig, args, fallback, _target, is_group)
 
         # ⑤ 记住"机器人自己发的这条"的 ref_idx（以后才能引用它）
         try:

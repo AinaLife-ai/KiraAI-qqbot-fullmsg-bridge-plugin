@@ -89,11 +89,14 @@ if not _HOOKS_AVAILABLE:
 
     class _OnStub:
         llm_request = staticmethod(_noop_hook)
+        im_message = staticmethod(_noop_hook)
 
     on = _OnStub()  # type: ignore
 
     class _PriorityStub:
+        LOW = -100
         MEDIUM = 0
+        HIGH = 100
         SYS_HIGH = 100
 
     Priority = _PriorityStub  # type: ignore
@@ -871,6 +874,25 @@ class QQOfficialGroupBridge(BasePlugin):
         self._intents_patched_at = 0.0
         self._intents_reverted = False
 
+        # ---- 禁言感知（官方 bot 没有 group_ban notice ⇒ 从发送错误推断） ----
+        mute_cfg = cfg.get("section_mute", {}) or {}
+        if isinstance(mute_cfg.get("fields"), dict):
+            mute_cfg = mute_cfg["fields"]
+        self.mute_perception = bool(mute_cfg.get("enabled", True))
+        try:
+            self.mute_ttl = max(30.0, float(mute_cfg.get("ttl", 600) or 600))
+        except (TypeError, ValueError):
+            self.mute_ttl = 600.0
+        try:
+            self.mute_notice_interval = max(
+                10.0, float(mute_cfg.get("notice_interval", 120) or 120))
+        except (TypeError, ValueError):
+            self.mute_notice_interval = 120.0
+        #: group_openid -> {"until": monotonic, "notified": monotonic, "logged": bool}
+        self._mute_state: dict = {}
+        #: 曾禁言、最近一次发送成功 ⇒ 下一条消息提示"已解除"
+        self._mute_lifted: set = set()
+
         # ★ 立刻装 `botpy.Client.start` 补丁（**早于任何 await**）。
         #   核心的启动顺序是「适配器先连、插件后加载」（lifecycle.py:153-233），
         #   等到 initialize() 里的巡检才装就已经晚了 —— 首连拿不到额外订阅位。
@@ -880,6 +902,98 @@ class QQOfficialGroupBridge(BasePlugin):
                 self._install_intent_patches()
             except Exception as exc:  # pragma: no cover
                 logger.debug("[QQBOT-BRIDGE] 预装 intent 补丁失败（忽略）: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # 禁言感知（官方 bot 没有 group_ban notice ⇒ 从发送错误 40054002 推断）
+    # ------------------------------------------------------------------ #
+    _MUTE_CODE = "40054002"
+
+    def _note_send_failure(self, target_id, is_group, exc):
+        """发送抛异常时调用：识别「机器人被禁言」并记录状态。"""
+        if not self.mute_perception or not is_group or not target_id:
+            return
+        try:
+            code = getattr(exc, "code", None)
+            if code is None:
+                code = getattr(exc, "err_code", None)
+            text = str(exc)
+            if str(code) != self._MUTE_CODE and "被禁言" not in text:
+                return
+            gid = str(target_id)
+            now = time.monotonic()
+            st = self._mute_state.get(gid) or {"notified": 0.0}
+            st["until"] = now + self.mute_ttl
+            st["reason"] = text[:160]
+            first = not st.get("logged")
+            st["logged"] = True
+            self._mute_state[gid] = st
+            if first:
+                logger.warning(
+                    "[QQBOT-BRIDGE] 检测到机器人被禁言（%s，错误码 %s）：已记录；"
+                    "下一条群消息会提示模型，发送成功或超时后自动解除",
+                    gid[:12], code or "?")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] 禁言状态记录失败（忽略）: %s", exc)
+
+    def _note_send_success(self, target_id, is_group):
+        """发送成功时调用：若之前记录过禁言，说明已解除。"""
+        if not self.mute_perception or not is_group or not target_id:
+            return
+        try:
+            gid = str(target_id)
+            st = self._mute_state.pop(gid, None)
+            if st:
+                self._mute_lifted.add(gid)
+                logger.info(
+                    "[QQBOT-BRIDGE] 机器人已能正常发送（%s），禁言状态解除",
+                    gid[:12])
+        except Exception:
+            pass
+
+    def _mute_hint(self, gid: str):
+        """返回要注入的 `[System …]` 文本（按间隔限频；解除时只提示一次）。"""
+        now = time.monotonic()
+        st = self._mute_state.get(gid)
+        if st and st.get("until", 0.0) > now:
+            if now - st.get("notified", 0.0) >= self.mute_notice_interval:
+                st["notified"] = now
+                left = max(0, int(st["until"] - now))
+                return (
+                    "[System 你被管理员禁言了，暂时无法发送消息"
+                    f"（官方错误码 {self._MUTE_CODE}）。禁言期间不要反复尝试发送；"
+                    f"等解除后再回复（约 {left} 秒后重试）。]")
+            return None
+        if gid in self._mute_lifted:
+            self._mute_lifted.discard(gid)
+            return "[System 你的禁言已解除，可以正常发言了。]"
+        if st:  # 过期
+            self._mute_state.pop(gid, None)
+        return None
+
+    @on.im_message(priority=Priority.HIGH + 1)
+    async def perceive_bot_mute(self, event: KiraMessageEvent):
+        """把禁言状态注入入站消息链（对齐 NapCat 的 group_ban 通知）。"""
+        if not self.mute_perception:
+            return
+        try:
+            msg = getattr(event, "message", None)
+            group = getattr(msg, "group", None) if msg is not None else None
+            if group is None:
+                return
+            gid = str(getattr(group, "group_id", "") or "")
+            if not gid:
+                return
+            hint = self._mute_hint(gid)
+            if not hint:
+                return
+            chain = getattr(msg, "chain", None)
+            if chain is not None and hasattr(chain, "text"):
+                chain.text(hint)
+            # 不强制唤醒：只把状态挂在消息链上。模型下次被触发时自然看到。
+            logger.info(
+                "[QQBOT-BRIDGE] 已在入站消息注入禁言状态提示（%s）", gid[:12])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[QQBOT-BRIDGE] 禁言感知注入失败（忽略）: %s", exc)
 
     # ------------------------------------------------------------------ #
     # 生命周期
